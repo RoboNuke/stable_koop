@@ -1,0 +1,41 @@
+# Environment
+env_name: "Pendulum-v1"
+num_trajectories: 200
+max_episode_steps: 200
+
+# Model
+state_dim: 3
+action_dim: 1
+latent_dim: 32
+k_type: "caylay"           # matches spelling in autoencoder.py
+rho: 0.95
+encoder_spec_norm: false
+encoder_latent: 64
+
+# Policy
+kp: 6.0
+kd: 1.0
+
+# Training
+horizon: 20
+batch_size: 256
+lr: 1.0e-3
+weight_decay: 1.0e-5
+num_epochs: 200
+recon_weight: 1.0
+pred_weight: 1.0
+scheduler_step: 50
+scheduler_gamma: 0.5
+
+# Eval
+eval_num_trajectories: 200
+eval_max_steps: 200
+eval_seed: 42
+success_angle_deg: 15.0
+success_max_thdot: 1.0
+success_hold_steps: 20
+
+# Logging / checkpointing
+log_interval: 10
+checkpoint_dir: "checkpoints/pendulum_h20"
+seed: 42
