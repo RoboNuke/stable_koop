@@ -46,7 +46,7 @@ class SchurK(nn.Module):
 
 class KoopmanAutoencoder(nn.Module):
     def __init__(self, state_dim=2, latent_dim=32, action_dim=1, 
-                 k_type="unbounded", rho=0.95, 
+                 k_type="cayley", rho=0.95, 
                  encoder_spec_norm=False, encoder_latent=64):
         super().__init__()
         self.encoder = nn.Sequential(
@@ -69,7 +69,7 @@ class KoopmanAutoencoder(nn.Module):
             nn.Linear(64, 64),         nn.Tanh(),
             nn.Linear(64, state_dim)
         )
-        if k_type == "caylay":
+        if k_type == "cayley":
             self.K_module = CayleyK(latent_dim, rho)
         elif k_type == "schur":
             self.K_module = SchurK(latent_dim, rho)
@@ -85,3 +85,41 @@ class KoopmanAutoencoder(nn.Module):
     def encode(self, x):    return self.encoder(x)
     def decode(self, z):    return self.decoder(z)
     def predict(self, z, u): return self.K_module(z) + self.B(u)
+    @property
+    def A(self):
+        return self.K_module.K if hasattr(self.K_module, 'K') else self.K_module.weight
+
+    @property  
+    def B_matrix(self):
+        return self.B.weight
+    
+    def prediction_error(self, z_t, u_t, z_next):
+        """Compute the Koopman one-step prediction error in latent space.
+            Note this is only for a single sample and met to be used online to verify 
+            model validity
+        Args:
+            z_t: (..., latent_dim) current latent state
+            u_t: (..., action_dim) control input
+            z_next: (..., latent_dim) actual next latent state
+
+        Returns:
+            error: float, ||z_next - (K z_t + B u_t)||
+        """
+        z_pred = self.predict(z_t, u_t)
+        return torch.linalg.norm(z_next - z_pred).item()
+
+    def verify_koopman(self, held_out_data, delta_max):
+        """Verify Koopman prediction accuracy on held-out data.
+
+        Args:
+            held_out_data: iterable of (z_t, u_t, z_next) tuples
+            delta_max: maximum allowable prediction error
+
+        Returns:
+            max_error: float, worst-case prediction error
+            is_valid: bool, True if max_error <= delta_max
+        """
+        errors = [self.prediction_error(z_t, u_t, z_next)
+                  for z_t, u_t, z_next in held_out_data]
+        max_err = max(errors)
+        return max_err, max_err <= delta_max

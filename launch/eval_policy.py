@@ -12,6 +12,7 @@ from launch.train_pendulum import pd_policy
 def make_policy(cfg):
     """Build the policy callable from config. Extension point for residual policies."""
     kp, kd = cfg["kp"], cfg["kd"]
+    print(f"Using kp={kp} and kd={kd}")
     return lambda obs: pd_policy(obs, kp, kd)
 
 
@@ -23,8 +24,9 @@ def check_success(states, cfg):
 
     tail = np.array(states[-hold:])
     cos_th, sin_th, thdot = tail[:, 0], tail[:, 1], tail[:, 2]
-    theta = np.abs(np.arctan2(sin_th, cos_th))
-    angle_ok = np.all(theta < np.radians(cfg["success_angle_deg"]))
+    theta = np.arctan2(sin_th, cos_th)  # [-pi, pi], upright = +-pi
+    angle_from_upright = np.abs(np.abs(theta) - np.pi)  # 0 when upright
+    angle_ok = np.all(angle_from_upright < np.radians(cfg["success_angle_deg"]))
     vel_ok = np.all(np.abs(thdot) < cfg["success_max_thdot"])
     return bool(angle_ok and vel_ok)
 

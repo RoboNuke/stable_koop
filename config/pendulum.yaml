@@ -13,11 +13,11 @@ encoder_spec_norm: false
 encoder_latent: 64
 
 # Policy
-kp: 6.0
-kd: 1.0
+kp: 10.0
+kd: 2.0
 
 # Training
-horizon: 20
+horizon: 5
 batch_size: 256
 lr: 1.0e-3
 weight_decay: 1.0e-5
