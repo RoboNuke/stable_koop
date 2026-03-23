@@ -1,3 +1,6 @@
+# Run
+run_name: "pendulum_pd"
+
 # Environment
 env_name: "Pendulum-v1"
 num_trajectories: 200
@@ -7,8 +10,8 @@ max_episode_steps: 200
 state_dim: 3
 action_dim: 1
 latent_dim: 32
-k_type: "caylay"           # matches spelling in autoencoder.py
-rho: 0.95
+k_type: "cayley"
+rho: 0.8
 encoder_spec_norm: false
 encoder_latent: 64
 
@@ -16,8 +19,17 @@ encoder_latent: 64
 kp: 10.0
 kd: 2.0
 
+# Perturbation
+perturb_scale: 1.0
+
+# LQR / Stability
+action_scaling: 0.05 #0.1
+q_scale: 1.0
+r_scale: 1.0
+max_z_space_error: 10.0
+
 # Training
-horizon: 5
+horizon: 10
 batch_size: 256
 lr: 1.0e-3
 weight_decay: 1.0e-5

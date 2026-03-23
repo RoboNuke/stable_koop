@@ -25,9 +25,8 @@ def pd_policy(obs, kp=6.0, kd=1.0):
 #    return np.array([np.clip(u, -2.0, 2.0)])
 
 
-def collect_data(env_name, num_trajectories, max_steps, seed, policy=None):
+def collect_data(env, num_trajectories, max_steps, seed, policy=None):
     """Collect trajectories using the given policy (random if None)."""
-    env = gym.make(env_name)
     env.seed(seed)
     np.random.seed(seed)
 
@@ -48,7 +47,6 @@ def collect_data(env_name, num_trajectories, max_steps, seed, policy=None):
             np.array(actions, dtype=np.float32).reshape(-1, 1),
         ))
 
-    env.close()
     print(f"Collected {len(trajectories)} trajectories "
           f"({sum(len(a) for _, a in trajectories)} transitions)")
     return trajectories
@@ -105,26 +103,21 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight):
     return total_loss, recon_loss, pred_loss
 
 
-def train(cfg):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train(model, trajectories, cfg):
+    """Train a KoopmanAutoencoder on pre-collected trajectories.
+
+    Args:
+        model: KoopmanAutoencoder (already on device)
+        trajectories: list of (states, actions) numpy arrays
+        cfg: config dict with training hyperparameters
+
+    Returns:
+        The trained model.
+    """
+    device = next(model.parameters()).device
     torch.manual_seed(cfg["seed"])
-    print(f"Using device: {device}")
 
-    # 1. Collect data
-    if cfg.get("random_policy", False):
-        policy = None
-        print("Using random policy")
-    else:
-        kp, kd = cfg["kp"], cfg["kd"]
-        policy = lambda obs: pd_policy(obs, kp, kd)
-        print(f"Using PD policy (kp={kp}, kd={kd})")
-
-    trajectories = collect_data(
-        cfg["env_name"], cfg["num_trajectories"],
-        cfg["max_episode_steps"], cfg["seed"], policy=policy,
-    )
-
-    # 2. Build dataset and dataloader
+    # 1. Build dataset and dataloader
     dataset = TrajectoryDataset(trajectories, cfg["horizon"])
     print(f"Dataset size: {len(dataset)} windows")
     loader = DataLoader(
@@ -132,19 +125,7 @@ def train(cfg):
         shuffle=True, drop_last=True, pin_memory=True,
     )
 
-    # 3. Build model
-    model = KoopmanAutoencoder(
-        state_dim=cfg["state_dim"],
-        latent_dim=cfg["latent_dim"],
-        action_dim=cfg["action_dim"],
-        k_type=cfg["k_type"],
-        rho=cfg["rho"],
-        encoder_spec_norm=cfg["encoder_spec_norm"],
-        encoder_latent=cfg["encoder_latent"],
-    ).to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # 4. Optimizer and scheduler
+    # 2. Optimizer and scheduler
     optimizer = torch.optim.Adam(
         model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
     )
@@ -152,9 +133,7 @@ def train(cfg):
         optimizer, step_size=cfg["scheduler_step"], gamma=cfg["scheduler_gamma"],
     )
 
-    # 5. Training loop
-    os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
-
+    # 3. Training loop
     for epoch in range(1, cfg["num_epochs"] + 1):
         model.train()
         epoch_total, epoch_recon, epoch_pred, n_batches = 0.0, 0.0, 0.0, 0
@@ -191,10 +170,7 @@ def train(cfg):
                 f"LR: {scheduler.get_last_lr()[0]:.2e}"
             )
 
-    # 6. Save final checkpoint
-    ckpt_path = os.path.join(cfg["checkpoint_dir"], "final.pt")
-    torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
-    print(f"Saved checkpoint to {ckpt_path}")
+    return model
 
 
 if __name__ == "__main__":
@@ -207,5 +183,42 @@ if __name__ == "__main__":
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    cfg["random_policy"] = args.random_policy
-    train(cfg)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Collect data
+    env = gym.make(cfg["env_name"])
+    if args.random_policy:
+        policy = None
+        print("Using random policy")
+    else:
+        kp, kd = cfg["kp"], cfg["kd"]
+        policy = lambda obs: pd_policy(obs, kp, kd)
+        print(f"Using PD policy (kp={kp}, kd={kd})")
+
+    trajectories = collect_data(
+        env, cfg["num_trajectories"],
+        cfg["max_episode_steps"], cfg["seed"], policy=policy,
+    )
+    env.close()
+
+    # Build model
+    model = KoopmanAutoencoder(
+        state_dim=cfg["state_dim"],
+        latent_dim=cfg["latent_dim"],
+        action_dim=cfg["action_dim"],
+        k_type=cfg["k_type"],
+        rho=cfg["rho"],
+        encoder_spec_norm=cfg["encoder_spec_norm"],
+        encoder_latent=cfg["encoder_latent"],
+    ).to(device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Train
+    model = train(model, trajectories, cfg)
+
+    # Save checkpoint
+    os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
+    ckpt_path = os.path.join(cfg["checkpoint_dir"], "final.pt")
+    torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
+    print(f"Saved checkpoint to {ckpt_path}")

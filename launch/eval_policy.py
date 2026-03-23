@@ -100,12 +100,8 @@ def print_stats_table(results):
     print()
 
 
-def evaluate(cfg, output_path, save_trajectories_path=None):
-    env = gym.make(cfg["env_name"])
-    env.seed(cfg["eval_seed"])
-    np.random.seed(cfg["eval_seed"])
-
-    policy = make_policy(cfg)
+def evaluate(env, policy, cfg):
+    """Run policy evaluation. Prints summary table. Returns (results, all_states, all_actions)."""
     num_traj = cfg["eval_num_trajectories"]
     max_steps = cfg["eval_max_steps"]
 
@@ -128,9 +124,6 @@ def evaluate(cfg, output_path, save_trajectories_path=None):
         else:
             failure_metrics.append(metrics)
 
-    env.close()
-
-    # Build results
     results = {
         "num_trajectories": num_traj,
         "num_success": len(success_metrics),
@@ -141,22 +134,8 @@ def evaluate(cfg, output_path, save_trajectories_path=None):
         "combined": group_stats(all_metrics),
     }
 
-    # Write stats YAML
-    with open(output_path, "w") as f:
-        yaml.dump(results, f, default_flow_style=False, sort_keys=False)
-    print(f"Stats saved to {output_path}")
-
-    # Print summary
     print_stats_table(results)
-
-    # Optionally save trajectories
-    if save_trajectories_path:
-        save_dict = {}
-        for i, (s, a) in enumerate(zip(all_states, all_actions)):
-            save_dict[f"states_{i}"] = s
-            save_dict[f"actions_{i}"] = a
-        np.savez(save_trajectories_path, **save_dict)
-        print(f"Trajectories saved to {save_trajectories_path}")
+    return results, all_states, all_actions
 
 
 if __name__ == "__main__":
@@ -171,4 +150,22 @@ if __name__ == "__main__":
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    evaluate(cfg, args.output, args.save_trajectories)
+    env = gym.make(cfg["env_name"])
+    env.seed(cfg["eval_seed"])
+    np.random.seed(cfg["eval_seed"])
+    policy = make_policy(cfg)
+
+    results, all_states, all_actions = evaluate(env, policy, cfg)
+    env.close()
+
+    with open(args.output, "w") as f:
+        yaml.dump(results, f, default_flow_style=False, sort_keys=False)
+    print(f"Stats saved to {args.output}")
+
+    if args.save_trajectories:
+        save_dict = {}
+        for i, (s, a) in enumerate(zip(all_states, all_actions)):
+            save_dict[f"states_{i}"] = s
+            save_dict[f"actions_{i}"] = a
+        np.savez(args.save_trajectories, **save_dict)
+        print(f"Trajectories saved to {args.save_trajectories}")
