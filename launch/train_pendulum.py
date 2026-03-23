@@ -134,6 +134,7 @@ def train(model, trajectories, cfg):
     )
 
     # 3. Training loop
+    loss_threshold = cfg.get("loss_threshold", 0.001)
     for epoch in range(1, cfg["num_epochs"] + 1):
         model.train()
         epoch_total, epoch_recon, epoch_pred, n_batches = 0.0, 0.0, 0.0, 0
@@ -161,14 +162,19 @@ def train(model, trajectories, cfg):
 
         scheduler.step()
 
+        avg_total = epoch_total / n_batches
         if epoch % cfg["log_interval"] == 0 or epoch == 1:
             print(
                 f"Epoch {epoch:4d} | "
-                f"Total: {epoch_total / n_batches:.6f} | "
+                f"Total: {avg_total:.6f} | "
                 f"Recon: {epoch_recon / n_batches:.6f} | "
                 f"Pred:  {epoch_pred / n_batches:.6f} | "
                 f"LR: {scheduler.get_last_lr()[0]:.2e}"
             )
+
+        if avg_total < loss_threshold:
+            print(f"Early stop: total loss {avg_total:.6f} < threshold {loss_threshold}")
+            break
 
     return model
 

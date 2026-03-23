@@ -34,6 +34,7 @@ batch_size: 256
 lr: 1.0e-3
 weight_decay: 1.0e-5
 num_epochs: 200
+loss_threshold: 0.001
 recon_weight: 1.0
 pred_weight: 1.0
 scheduler_step: 50
