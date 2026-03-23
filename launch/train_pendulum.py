@@ -10,19 +10,19 @@ from torch.utils.data import Dataset, DataLoader
 
 from model.autoencoder import KoopmanAutoencoder
 
-def pd_policy(obs, kp=6.0, kd=1.0):
-    cos_th, sin_th, thdot = obs
-    theta = np.arctan2(sin_th, cos_th)      # in [-π, π], 0=down, ±π=up
-    error = np.arctan2(np.sin(theta - np.pi), np.cos(theta - np.pi))  # deviation from upright
-    u = -kp * error - kd * thdot
-    return np.array([np.clip(u, -2.0, 2.0)])
-
-#def pd_policy(obs, kp, kd):
-#    """PD controller targeting the upright position (theta=0)."""
+#def pd_policy(obs, kp=6.0, kd=1.0):
 #    cos_th, sin_th, thdot = obs
-#    theta = np.arctan2(sin_th, cos_th)
-#    u = -kp * theta - kd * thdot
+#    theta = np.arctan2(sin_th, cos_th)      # in [-π, π], 0=down, ±π=up
+#    error = np.arctan2(np.sin(theta - np.pi), np.cos(theta - np.pi))  # deviation from upright
+#    u = -kp * error - kd * thdot
 #    return np.array([np.clip(u, -2.0, 2.0)])
+
+def pd_policy(obs, kp, kd):
+    """PD controller targeting the upright position (theta=0)."""
+    cos_th, sin_th, thdot = obs
+    theta = np.arctan2(sin_th, cos_th)
+    u = -kp * theta - kd * thdot
+    return np.array([np.clip(u, -2.0, 2.0)])
 
 
 def collect_data(env, num_trajectories, max_steps, seed, policy=None):

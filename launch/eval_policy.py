@@ -24,9 +24,8 @@ def check_success(states, cfg):
 
     tail = np.array(states[-hold:])
     cos_th, sin_th, thdot = tail[:, 0], tail[:, 1], tail[:, 2]
-    theta = np.arctan2(sin_th, cos_th)  # [-pi, pi], upright = +-pi
-    angle_from_upright = np.abs(np.abs(theta) - np.pi)  # 0 when upright
-    angle_ok = np.all(angle_from_upright < np.radians(cfg["success_angle_deg"]))
+    theta = np.abs(np.arctan2(sin_th, cos_th))  # 0 = upright
+    angle_ok = np.all(theta < np.radians(cfg["success_angle_deg"]))
     vel_ok = np.all(np.abs(thdot) < cfg["success_max_thdot"])
     return bool(angle_ok and vel_ok)
 
@@ -145,6 +144,8 @@ if __name__ == "__main__":
                         help="Path for output stats YAML")
     parser.add_argument("--save-trajectories", type=str, default=None,
                         help="Path to save trajectories as .npz")
+    parser.add_argument("--render", action="store_true", default=False,
+                        help="Visualize each rollout one at a time")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -155,17 +156,41 @@ if __name__ == "__main__":
     np.random.seed(cfg["eval_seed"])
     policy = make_policy(cfg)
 
-    results, all_states, all_actions = evaluate(env, policy, cfg)
-    env.close()
+    if args.render:
+        import time
+        num_traj = cfg["eval_num_trajectories"]
+        max_steps = cfg["eval_max_steps"]
+        for i in range(num_traj):
+            obs = env.reset()
+            states = [obs]
+            success = False
+            for t in range(max_steps):
+                env.render(mode="human")
+                action = policy(obs)
+                obs, _, done, _ = env.step(action)
+                states.append(obs)
+                if not success and check_success(states, cfg):
+                    success = True
+                if done:
+                    break
+            status = "SUCCESS" if success else "FAIL"
+            theta = np.degrees(np.arctan2(obs[1], obs[0]))
+            print(f"Trajectory {i+1}/{num_traj}: {status} | "
+                  f"steps={len(states)-1} | final_theta={theta:.1f} deg")
+            time.sleep(0.5)
+        env.close()
+    else:
+        results, all_states, all_actions = evaluate(env, policy, cfg)
+        env.close()
 
-    with open(args.output, "w") as f:
-        yaml.dump(results, f, default_flow_style=False, sort_keys=False)
-    print(f"Stats saved to {args.output}")
+        with open(args.output, "w") as f:
+            yaml.dump(results, f, default_flow_style=False, sort_keys=False)
+        print(f"Stats saved to {args.output}")
 
-    if args.save_trajectories:
-        save_dict = {}
-        for i, (s, a) in enumerate(zip(all_states, all_actions)):
-            save_dict[f"states_{i}"] = s
-            save_dict[f"actions_{i}"] = a
-        np.savez(args.save_trajectories, **save_dict)
-        print(f"Trajectories saved to {args.save_trajectories}")
+        if args.save_trajectories:
+            save_dict = {}
+            for i, (s, a) in enumerate(zip(all_states, all_actions)):
+                save_dict[f"states_{i}"] = s
+                save_dict[f"actions_{i}"] = a
+            np.savez(args.save_trajectories, **save_dict)
+            print(f"Trajectories saved to {args.save_trajectories}")
