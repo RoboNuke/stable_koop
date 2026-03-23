@@ -1,0 +1,458 @@
+"""
+Runner script -- single entry point for the Koopman pipeline.
+
+Usage:
+    python -m launch.run --config config/pendulum.yaml
+"""
+import argparse
+import os
+from datetime import datetime
+
+import gym
+import numpy as np
+import torch
+import yaml
+
+from launch.eval_policy import evaluate as evaluate_policy, make_policy
+from launch.eval_pendulum import evaluate_model
+from launch.train_pendulum import collect_data, train
+from model.autoencoder import KoopmanAutoencoder
+
+
+def make_run_dir(cfg):
+    """Create and return output/{run_name}_{datetime}/."""
+    run_name = cfg.get("run_name", "run")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = os.path.join("output", f"{run_name}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def save_config(cfg, run_dir):
+    """Dump the full resolved config into the run directory."""
+    path = os.path.join(run_dir, "config.yaml")
+    with open(path, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+    print(f"Config saved to {path}")
+
+
+def make_env(cfg):
+    """Create and seed the environment."""
+    env = gym.make(cfg["env_name"])
+    env.seed(cfg["eval_seed"])
+    np.random.seed(cfg["eval_seed"])
+    return env
+
+
+def compute_obs_scale(env, augment):
+    """Compute observation scaling factors from env spaces.
+
+    Returns scale vector where each element is the max absolute value for that
+    dimension. When augment=True, action space bounds are appended.
+
+    Args:
+        env: gym environment
+        augment: whether base policy action is part of the Koopman state
+
+    Returns:
+        obs_scale: (koopman_state_dim,) numpy array
+    """
+    obs_scale = np.maximum(np.abs(env.observation_space.high),
+                           np.abs(env.observation_space.low))
+    if augment:
+        act_scale = np.maximum(np.abs(env.action_space.high),
+                               np.abs(env.action_space.low))
+        obs_scale = np.concatenate([obs_scale, act_scale])
+    return obs_scale.astype(np.float32)
+
+
+def make_base_policy(cfg):
+    """Build the base PD policy from config."""
+    return make_policy(cfg)
+
+
+def save_eval_results(results, all_states, all_actions, phase_dir):
+    """Save evaluation stats and trajectories to a phase directory."""
+    os.makedirs(phase_dir, exist_ok=True)
+
+    stats_path = os.path.join(phase_dir, "eval_stats.yaml")
+    with open(stats_path, "w") as f:
+        yaml.dump(results, f, default_flow_style=False, sort_keys=False)
+    print(f"Stats saved to {stats_path}")
+
+    traj_path = os.path.join(phase_dir, "traj.npz")
+    save_dict = {}
+    for i, (s, a) in enumerate(zip(all_states, all_actions)):
+        save_dict[f"states_{i}"] = s
+        save_dict[f"actions_{i}"] = a
+    np.savez(traj_path, **save_dict)
+    print(f"Trajectories saved to {traj_path}")
+
+
+def augment_trajectories(trajectories, augment=True, obs_scale=None):
+    """Prepare trajectories for autonomous Koopman training.
+
+    If augment=True, concatenates base policy actions into states so the base
+    policy is treated as part of the environment.
+    If augment=False, uses original states only (base policy actions are ignored).
+    In both cases, zero actions are passed to the model so B has no influence.
+
+    Args:
+        trajectories: list of (states: (T+1, S), actions: (T, A))
+        augment: whether to append base policy actions to state
+        obs_scale: if provided, divide koopman states by this scale vector
+
+    Returns:
+        list of (koopman_states, zero_actions)
+    """
+    result = []
+    for states, actions in trajectories:
+        if augment:
+            koopman_states = np.concatenate([states[:-1], actions], axis=-1)
+        else:
+            koopman_states = states[:-1]
+        if obs_scale is not None:
+            koopman_states = koopman_states / obs_scale
+        zero_actions = np.zeros((len(koopman_states) - 1, actions.shape[-1]),
+                                dtype=np.float32)
+        result.append((koopman_states, zero_actions))
+    return result
+
+
+def collect_perturbed_data(env, policy, num_trajectories, max_steps, seed,
+                          perturb_scale=None):
+    """Collect trajectories with base policy + uniform random perturbation.
+
+    The total action applied to the env is base_action + perturbation, clipped
+    to the action space. Returns states, base_actions, and perturbation_actions
+    separately so they can be used differently in the Koopman model.
+
+    Args:
+        perturb_scale: max magnitude of perturbation. If None, uses action space bounds.
+
+    Returns:
+        list of (states: (T+1, S), base_actions: (T, A), perturbations: (T, A))
+    """
+    env.seed(seed)
+    np.random.seed(seed)
+    if perturb_scale is not None:
+        perturb_low = -np.ones_like(env.action_space.low) * perturb_scale
+        perturb_high = np.ones_like(env.action_space.high) * perturb_scale
+    else:
+        perturb_low = env.action_space.low
+        perturb_high = env.action_space.high
+    action_low = env.action_space.low
+    action_high = env.action_space.high
+
+    trajectories = []
+    for i in range(num_trajectories):
+        obs = env.reset()
+        states = [obs]
+        base_actions = []
+        perturbations = []
+        for t in range(max_steps):
+            base_action = policy(obs)
+            perturbation = np.random.uniform(perturb_low, perturb_high).astype(np.float32)
+            total_action = np.clip(base_action + perturbation, action_low, action_high)
+            obs, _, done, _ = env.step(total_action)
+            states.append(obs)
+            base_actions.append(base_action)
+            perturbations.append(perturbation)
+            if done:
+                break
+        trajectories.append((
+            np.array(states, dtype=np.float32),
+            np.array(base_actions, dtype=np.float32).reshape(-1, 1),
+            np.array(perturbations, dtype=np.float32).reshape(-1, 1),
+        ))
+
+    print(f"Collected {len(trajectories)} perturbed trajectories "
+          f"({sum(len(p) for _, _, p in trajectories)} transitions)")
+    return trajectories
+
+
+def augment_perturbed_trajectories(trajectories, augment=True, obs_scale=None):
+    """Prepare perturbed trajectories for Koopman B training.
+
+    If augment=True, base policy actions are appended to states.
+    If augment=False, original states only. In both cases, perturbations
+    are the control input for the B matrix.
+
+    Args:
+        trajectories: list of (states: (T+1, S), base_actions: (T, A), perturbations: (T, A))
+        augment: whether to append base policy actions to state
+        obs_scale: if provided, divide koopman states by this scale vector
+
+    Returns:
+        list of (koopman_states, perturbations)
+    """
+    result = []
+    for states, base_actions, perturbations in trajectories:
+        if augment:
+            koopman_states = np.concatenate([states[:-1], base_actions], axis=-1)
+        else:
+            koopman_states = states[:-1]
+        if obs_scale is not None:
+            koopman_states = koopman_states / obs_scale
+        result.append((koopman_states, perturbations[:-1]))
+    return result
+
+
+def phase_0_base_eval(env, policy, cfg, run_dir):
+    """Phase 0: evaluate the base PD policy and save results."""
+    print("\n=== Phase 0: Base Policy Benchmark ===")
+    phase_dir = os.path.join(run_dir, "base_eval")
+
+    results, all_states, all_actions = evaluate_policy(env, policy, cfg)
+    save_eval_results(results, all_states, all_actions, phase_dir)
+
+    print(f"Phase 0 complete. Results in {phase_dir}")
+
+
+def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_scale=None):
+    """Phase 1: train Koopman model with base policy as part of environment."""
+    print("\n=== Phase 1: Train Koopman Model ===")
+    phase_dir = os.path.join(run_dir, "koopman_train")
+    os.makedirs(phase_dir, exist_ok=True)
+
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # 1. Collect data with base policy
+    trajectories = collect_data(
+        env, cfg["num_trajectories"],
+        cfg["max_episode_steps"], cfg["seed"], policy=policy,
+    )
+
+    # 2. Prepare for Koopman training
+    aug_trajectories = augment_trajectories(trajectories, augment=augment,
+                                            obs_scale=obs_scale)
+
+    # 3. Train
+    model = train(model, aug_trajectories, cfg)
+
+    # 4. Save checkpoint
+    ckpt_path = os.path.join(phase_dir, "checkpoint.pt")
+    torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
+    print(f"Checkpoint saved to {ckpt_path}")
+
+    # 5. Evaluate on training data
+    fig, max_pred_error_latent, max_pred_error_state, heatmap_data = evaluate_model(
+        model, aug_trajectories, cfg["horizon"], eval_horizon=25)
+
+    # 6. Save heatmap
+    plot_path = os.path.join(phase_dir, "prediction_error.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    print(f"Heatmap saved to {plot_path}")
+
+    # 7. Save eval stats
+    eval_stats = {
+        "max_prediction_error_latent": float(max_pred_error_latent),
+        "max_prediction_error_state": float(max_pred_error_state),
+        "heatmap": heatmap_data,
+    }
+    stats_path = os.path.join(phase_dir, "eval_stats.yaml")
+    with open(stats_path, "w") as f:
+        yaml.dump(eval_stats, f, default_flow_style=False, sort_keys=False)
+    print(f"Eval stats saved to {stats_path}")
+
+    print(f"Phase 1 complete. Results in {phase_dir}")
+
+
+def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=None):
+    """Phase 2: train A and B with random perturbations on top of base policy."""
+    print("\n=== Phase 2: Train B Matrix (Perturbed Policy) ===")
+    phase_dir = os.path.join(run_dir, "koopman_train_B")
+    os.makedirs(phase_dir, exist_ok=True)
+
+    # 1. Reinitialize B with random weights, keep everything else from Phase 1
+    import torch.nn as nn
+    nn.init.kaiming_uniform_(model.B.weight)
+    print("Reinitialized B matrix with random weights")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # 2. Collect data with base policy + random perturbations
+    trajectories = collect_perturbed_data(
+        env, policy, cfg["num_trajectories"],
+        cfg["max_episode_steps"], cfg["seed"],
+        perturb_scale=cfg.get("perturb_scale", None),
+    )
+
+    # 3. Prepare for Koopman training
+    aug_trajectories = augment_perturbed_trajectories(trajectories, augment=augment,
+                                                      obs_scale=obs_scale)
+
+    # 4. Train (both A and B update)
+    model = train(model, aug_trajectories, cfg)
+
+    # 5. Save checkpoint
+    ckpt_path = os.path.join(phase_dir, "checkpoint.pt")
+    torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
+    print(f"Checkpoint saved to {ckpt_path}")
+
+    # 6. Evaluate on training data
+    fig, max_pred_error_latent, max_pred_error_state, heatmap_data = evaluate_model(
+        model, aug_trajectories, cfg["horizon"], eval_horizon=25)
+
+    # 7. Save heatmap
+    plot_path = os.path.join(phase_dir, "prediction_error.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    print(f"Heatmap saved to {plot_path}")
+
+    # 8. Save eval stats
+    eval_stats = {
+        "max_prediction_error_latent": float(max_pred_error_latent),
+        "max_prediction_error_state": float(max_pred_error_state),
+        "heatmap": heatmap_data,
+    }
+    stats_path = os.path.join(phase_dir, "eval_stats.yaml")
+    with open(stats_path, "w") as f:
+        yaml.dump(eval_stats, f, default_flow_style=False, sort_keys=False)
+    print(f"Eval stats saved to {stats_path}")
+
+    print(f"Phase 2 complete. Results in {phase_dir}")
+    return aug_trajectories
+
+
+def phase_3_compute_variables(model, cfg, run_dir, aug_trajectories):
+    """Phase 3: compute stability and control variables from trained model."""
+    print("\n=== Phase 3: Compute Stability Variables ===")
+    phase_dir = os.path.join(run_dir, "stability")
+    os.makedirs(phase_dir, exist_ok=True)
+
+    from controllers.lqr import LQR
+    from model.utils import (spectral_radius, transient_constant,
+                             compute_lower_lipschitz, max_tolerable_model_error,
+                             latent_error_to_state_error)
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    # Extract A and B from trained model
+    A = model.A.detach().cpu()
+    B_mat = model.B_matrix.detach().cpu()
+
+    # Build LQR
+    latent_dim = cfg["latent_dim"]
+    action_dim = cfg["action_dim"]
+    Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
+    R = torch.eye(action_dim) * cfg["r_scale"]
+    lqr = LQR(A, B_mat, Q, R)
+
+    F = lqr.F
+    gain_norm = lqr.gain_norm.item()
+    closed_loop = lqr.closed_loop
+
+    # Computed quantities
+    rho = spectral_radius(closed_loop)
+    C = transient_constant(closed_loop)
+
+    # Encoder lower Lipschitz bound from Phase 2 training data
+    # Move model to CPU for jacrev/vmap compatibility
+    model_cpu = model.cpu()
+    training_states = []
+    for states, actions in aug_trajectories:
+        for s in states:
+            training_states.append(s)
+    m = compute_lower_lipschitz(model_cpu.encode, training_states)
+    model.to(device)
+
+    # Derived quantities
+    epsilon_max = cfg["max_z_space_error"]
+    eta = cfg["action_scaling"]
+    delta_max = max_tolerable_model_error(rho, C, epsilon_max, eta)
+    u_res_max = gain_norm * epsilon_max
+    eps_x = latent_error_to_state_error(epsilon_max, m)
+    delta_x = latent_error_to_state_error(delta_max, m)
+
+    # Print results
+    print(f"  Spectral radius (rho):       {rho:.6f}")
+    print(f"  Transient constant (C):      {C:.6f}")
+    print(f"  Encoder lower Lipschitz (m): {m:.6f}")
+    print(f"  LQR gain norm (||F||):       {gain_norm:.6f}")
+    print(f"  Max tolerable model error (delta_max): {delta_max:.6f}")
+    print(f"  Max residual action (u_res_max):       {u_res_max:.6f}")
+    print(f"  x-space tracking error (eps_x):        {eps_x:.6f}")
+    print(f"  x-space model error (delta_x):         {delta_x:.6f}")
+
+    # Save
+    variables = {
+        "A": A.numpy().tolist(),
+        "B": B_mat.numpy().tolist(),
+        "rho": float(rho),
+        "C": float(C),
+        "m": float(m),
+        "gain_norm": float(gain_norm),
+        "epsilon_max": float(epsilon_max),
+        "action_scaling": float(eta),
+        "delta_max": float(delta_max),
+        "u_res_max": float(u_res_max),
+        "eps_x": float(eps_x),
+        "delta_x": float(delta_x),
+    }
+    stats_path = os.path.join(phase_dir, "variables.yaml")
+    with open(stats_path, "w") as f:
+        yaml.dump(variables, f, default_flow_style=False, sort_keys=False)
+    print(f"Variables saved to {stats_path}")
+
+    print(f"Phase 3 complete. Results in {phase_dir}")
+    return variables
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Koopman pipeline runner")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to YAML config file")
+    parser.add_argument("--no-augment", action="store_true", default=False,
+                        help="Do not append base policy action to the Koopman state")
+    parser.add_argument("--skip-pretrain", action="store_true", default=False,
+                        help="Skip Phase 1 (A-only training), go straight to joint A+B training")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    augment = not args.no_augment
+    cfg["augment_state"] = augment
+
+    run_dir = make_run_dir(cfg)
+    print(f"Run directory: {run_dir}")
+    print(f"Augment state with base policy action: {augment}")
+    save_config(cfg, run_dir)
+
+    env = make_env(cfg)
+    policy = make_base_policy(cfg)
+
+    # Compute observation scaling
+    obs_scale = compute_obs_scale(env, augment)
+    cfg["obs_scale"] = obs_scale.tolist()
+    print(f"Observation scale: {obs_scale}")
+
+    # Build Koopman model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    koopman_state_dim = cfg["state_dim"] + cfg["action_dim"] if augment else cfg["state_dim"]
+    model = KoopmanAutoencoder(
+        state_dim=koopman_state_dim,
+        latent_dim=cfg["latent_dim"],
+        action_dim=cfg["action_dim"],
+        k_type=cfg["k_type"],
+        rho=cfg["rho"],
+        encoder_spec_norm=cfg["encoder_spec_norm"],
+        encoder_latent=cfg["encoder_latent"],
+    ).to(device)
+    print(f"Koopman model: state_dim={koopman_state_dim}, action_dim={cfg['action_dim']}, "
+          f"latent_dim={cfg['latent_dim']}")
+
+    # --- Execute phases ---
+    phase_0_base_eval(env, policy, cfg, run_dir)
+    if not args.skip_pretrain:
+        phase_1_train_koopman(model, env, policy, cfg, run_dir, augment, obs_scale)
+    aug_trajectories = phase_2_train_B(model, env, policy, cfg, run_dir, augment, obs_scale)
+    variables = phase_3_compute_variables(model, cfg, run_dir, aug_trajectories)
+
+    env.close()
+    print(f"\n=== Pipeline complete. All outputs in {run_dir} ===")
+
+
+if __name__ == "__main__":
+    main()
