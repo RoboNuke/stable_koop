@@ -1,0 +1,7 @@
+name: rlgpu_py38
+channels:
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - python=3.8
+prefix: /home/hunter/miniconda3/envs/rlgpu_py38
