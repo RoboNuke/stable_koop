@@ -23,7 +23,7 @@ kd: 2.0
 perturb_scale: 1.0
 
 # LQR / Stability
-action_scaling: 0.05 #0.1
+action_scaling: 0.05 #0.1 (eta)
 q_scale: 1.0
 r_scale: 1.0
 max_z_space_error: 10.0
