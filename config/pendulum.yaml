@@ -11,7 +11,7 @@ state_dim: 3
 action_dim: 1
 latent_dim: 32
 k_type: "cayley"
-rho: 0.8
+rho: 0.80
 encoder_spec_norm: false
 encoder_latent: 64
 
