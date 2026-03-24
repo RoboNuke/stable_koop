@@ -139,7 +139,8 @@ def augment_trajectories(trajectories, augment=True, obs_scale=None,
 
 
 def collect_perturbed_data(env, policy, num_trajectories, max_steps, seed,
-                          perturb_scale=None, fix_perturb_range=False):
+                          perturb_scale=None, fix_perturb_range=False,
+                          hold_steps=1):
     """Collect trajectories with base policy + uniform random perturbation.
 
     The total action applied to the env is base_action + perturbation, clipped
@@ -150,6 +151,8 @@ def collect_perturbed_data(env, policy, num_trajectories, max_steps, seed,
         perturb_scale: max magnitude of perturbation. If None, uses action space bounds.
         fix_perturb_range: if True, sample perturbations only in the range that
             doesn't saturate the controller given the current base action.
+        hold_steps: number of steps to hold each sampled perturbation before
+            resampling a new one. Default 1 (resample every step).
 
     Returns:
         list of (states: (T+1, S), base_actions: (T, A), perturbations: (T, A))
@@ -170,14 +173,17 @@ def collect_perturbed_data(env, policy, num_trajectories, max_steps, seed,
         states = [obs]
         base_actions = []
         perturbations = []
+        perturbation = None
         for t in range(max_steps):
             base_action = policy(obs)
-            if fix_perturb_range:
-                p_low = np.clip(action_low - base_action, -perturb_scale, 0)
-                p_high = np.clip(action_high - base_action, 0, perturb_scale)
-                perturbation = np.random.uniform(p_low, p_high).astype(np.float32)
-            else:
-                perturbation = np.random.uniform(perturb_low_default, perturb_high_default).astype(np.float32)
+            # Resample perturbation every hold_steps
+            if t % hold_steps == 0:
+                if fix_perturb_range:
+                    p_low = np.clip(action_low - base_action, -perturb_scale, 0)
+                    p_high = np.clip(action_high - base_action, 0, perturb_scale)
+                    perturbation = np.random.uniform(p_low, p_high).astype(np.float32)
+                else:
+                    perturbation = np.random.uniform(perturb_low_default, perturb_high_default).astype(np.float32)
             total_action = np.clip(base_action + perturbation, action_low, action_high)
             obs, _, terminated, truncated, _ = env.step(total_action)
             done = terminated or truncated
@@ -310,6 +316,7 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
         cfg["max_episode_steps"], cfg["seed"],
         perturb_scale=cfg.get("perturb_scale", None),
         fix_perturb_range=cfg.get("fix_perturb_range", False),
+        hold_steps=cfg.get("hold_steps", 1),
     )
 
     # 3. Prepare for Koopman training

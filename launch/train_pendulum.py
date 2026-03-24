@@ -92,14 +92,81 @@ def controllability_loss(A, B, horizon=4):
     return -sigma_min
 
 
+def _pred_loss_sequential(model, states_seq, actions_seq):
+    """Original sequential multi-step prediction loss."""
+    z = model.encode(states_seq[:, 0])
+    H = actions_seq.shape[1]
+    pred_loss = torch.tensor(0.0, device=z.device)
+    for t in range(H):
+        z = model.predict(z, actions_seq[:, t])
+        x_pred = model.decode(z)
+        pred_loss = pred_loss + F.mse_loss(x_pred, states_seq[:, t + 1])
+    return pred_loss / H
+
+
+def _pred_loss_vectorized(model, states_seq, actions_seq):
+    """Vectorized multi-step prediction loss using closed-form linear recurrence.
+
+    Since predict is z_{t+1} = K z_t + B u_t, we have:
+        z_t = K^t z_0 + sum_{k=0}^{t-1} K^{t-1-k} B u_k
+
+    This builds K powers and uses a causal matmul to compute all z_t at once.
+    """
+    B_batch, H, _ = actions_seq.shape
+    device = actions_seq.device
+
+    # Get K and B matrices
+    K = model.A  # (L, L)
+    B_mat = model.B_matrix  # (L, A)
+    L = K.shape[0]
+
+    # Precompute K powers: K^0, K^1, ..., K^H
+    K_powers = [torch.eye(L, device=device)]
+    for _ in range(H):
+        K_powers.append(K_powers[-1] @ K)
+    K_powers = torch.stack(K_powers)  # (H+1, L, L)
+
+    # z_0
+    z0 = model.encode(states_seq[:, 0])  # (B_batch, L)
+
+    # Free evolution: K^t z_0 for t=1..H
+    # K_powers[1:H+1] is (H, L, L), z0 is (B_batch, L)
+    z_free = torch.einsum('hij,bj->bhi', K_powers[1:H+1], z0)  # (B_batch, H, L)
+
+    # Forced response: Bu for all timesteps
+    Bu = actions_seq @ B_mat.T  # (B_batch, H, L)
+
+    # Build causal convolution matrix from K powers
+    # conv[t, k] = K^{t-k} for k <= t, else 0  (t=0..H-1, k=0..H-1)
+    # For target step t+1, we need sum_{k=0}^{t} K^{t-k} Bu_k
+    conv = torch.zeros(H, H, L, L, device=device)
+    for t in range(H):
+        for k in range(t + 1):
+            conv[t, k] = K_powers[t - k]
+
+    # Apply convolution: z_forced[t] = sum_k conv[t,k] @ Bu[k]
+    z_forced = torch.einsum('tklm,bkm->btl', conv, Bu)  # (B_batch, H, L)
+
+    # All predicted latent states for t=1..H
+    z_all = z_free + z_forced  # (B_batch, H, L)
+
+    # Decode all at once
+    x_pred = model.decode(z_all.reshape(B_batch * H, L)).reshape(B_batch, H, -1)
+    x_target = states_seq[:, 1:]  # (B_batch, H, S)
+
+    return F.mse_loss(x_pred, x_target)
+
+
 def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
                  ctrl_weight=0.0, ctrl_horizon=4,
-                 bilip_weight=0.0, bilip_m_target=0.5):
+                 bilip_weight=0.0, bilip_m_target=0.5,
+                 vectorize_rollout=False):
     """
     Args:
         model: KoopmanAutoencoder
         states_seq: (B, H+1, state_dim)
         actions_seq: (B, H, action_dim)
+        vectorize_rollout: if True, use closed-form vectorized prediction
     Returns:
         total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss
     """
@@ -112,14 +179,11 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
     all_recon = model.decode(all_z)
     recon_loss = F.mse_loss(all_recon, all_states)
 
-    # Multi-step prediction loss: roll forward in latent space, decode, compare
-    z = model.encode(states_seq[:, 0])
-    pred_loss = torch.tensor(0.0, device=z.device)
-    for t in range(H):
-        z = model.predict(z, actions_seq[:, t])
-        x_pred = model.decode(z)
-        pred_loss = pred_loss + F.mse_loss(x_pred, states_seq[:, t + 1])
-    pred_loss = pred_loss / H
+    # Multi-step prediction loss
+    if vectorize_rollout:
+        pred_loss = _pred_loss_vectorized(model, states_seq, actions_seq)
+    else:
+        pred_loss = _pred_loss_sequential(model, states_seq, actions_seq)
 
     total_loss = recon_weight * recon_loss + pred_weight * pred_loss
 
@@ -127,13 +191,13 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
         ctrl_loss = controllability_loss(model.A, model.B_matrix, horizon=ctrl_horizon)
         total_loss = total_loss + ctrl_weight * ctrl_loss
     else:
-        ctrl_loss = torch.tensor(0.0, device=z.device)
+        ctrl_loss = torch.tensor(0.0, device=all_states.device)
 
     if bilip_weight > 0:
         bilip_loss_val = bi_lipschitz_loss(model.encode, all_states.detach(), m_target=bilip_m_target)
         total_loss = total_loss + bilip_weight * bilip_loss_val
     else:
-        bilip_loss_val = torch.tensor(0.0, device=z.device)
+        bilip_loss_val = torch.tensor(0.0, device=all_states.device)
 
     return total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss_val
 
@@ -168,6 +232,11 @@ def train(model, trajectories, cfg):
         optimizer, step_size=cfg["scheduler_step"], gamma=cfg["scheduler_gamma"],
     )
 
+    # 2b. Optional torch.compile
+    if cfg.get("torch_compile", False):
+        model = torch.compile(model)
+        print("Model compiled with torch.compile")
+
     # 3. Training loop
     loss_threshold = cfg.get("loss_threshold", 0.001)
     for epoch in range(1, cfg["num_epochs"] + 1):
@@ -186,6 +255,7 @@ def train(model, trajectories, cfg):
                 cfg["recon_weight"], cfg["pred_weight"],
                 ctrl_weight=ctrl_weight, ctrl_horizon=cfg["horizon"],
                 bilip_weight=bilip_weight, bilip_m_target=bilip_m_target,
+                vectorize_rollout=cfg.get("vectorize_rollout", False),
             )
 
             optimizer.zero_grad()

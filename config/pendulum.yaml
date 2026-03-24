@@ -22,6 +22,7 @@ kd: 2.0
 # Perturbation (random actions to excite the system that represent possible residual actions)
 perturb_scale: 2.0
 fix_perturb_range: true
+hold_steps: 5  # number of steps to hold each sampled perturbation before resampling
 
 # LQR / Stability
 q_scale: 1
@@ -31,22 +32,24 @@ max_displacement_x: 0.57 # define as maximum possible displacement of system (0.
 
 # Training
 horizon: 10
-batch_size: 256
+batch_size: 4096
 lr: 1.0e-3
 weight_decay: 1.0e-5
 num_epochs: 200
 loss_threshold: 0.003 #0.003 works with pred_weight=10
 scheduler_step: 50
 scheduler_gamma: 0.5
+vectorize_rollout: true  # use closed-form vectorized prediction rollout (faster but more memory)
+torch_compile: false  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)
 
 # losses
 recon_weight: 1.0
 pred_weight: 10.0
 
-controllability_loss: true
+controllability_loss: false
 ctrl_weight: 0.01
 
-bi_lipschitz_loss: true
+bi_lipschitz_loss: false
 bilip_weight: 2
 bilip_m_target: 1.0
 
