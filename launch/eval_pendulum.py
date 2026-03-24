@@ -1,6 +1,6 @@
 import argparse
 
-import gym
+import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -12,17 +12,17 @@ from model.autoencoder import KoopmanAutoencoder
 def collect_eval_trajectories(env_name, num_trajectories, min_steps, seed):
     """Collect trajectories with at least min_steps steps."""
     env = gym.make(env_name)
-    env.seed(seed)
     np.random.seed(seed)
 
     trajectories = []
     for _ in range(num_trajectories):
-        obs = env.reset()
+        obs, _ = env.reset()
         states = [obs]
         actions = []
         for t in range(min_steps):
             action = env.action_space.sample()
-            obs, _, done, _ = env.step(action)
+            obs, _, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
             states.append(obs)
             actions.append(action)
             if done:

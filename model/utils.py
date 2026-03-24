@@ -1,9 +1,6 @@
 import torch
 import warnings
-try:
-    from functorch import jacrev, vmap
-except:
-    from torch.func import jacrev, vmap  # correct
+from torch.func import jacrev, vmap
 
 def spectral_radius(M):
     """Compute the spectral radius (largest eigenvalue magnitude) of a matrix.
@@ -49,7 +46,7 @@ def compute_lower_lipschitz(encoder, training_data):
     X = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in training_data])
     J_batch = vmap(jacrev(encoder))(X)  # (N, latent_dim, state_dim)
     sigma_mins = torch.linalg.svdvals(J_batch)[:, -1]
-    return float(sigma_mins.min())
+    return float(sigma_mins.min().detach())
 
 
 def max_tolerable_model_error(rho, C, epsilon_max, eta):

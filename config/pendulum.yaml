@@ -9,24 +9,25 @@ max_episode_steps: 200
 # Model
 state_dim: 3
 action_dim: 1
-latent_dim: 32
-k_type: "cayley"
+latent_dim: 8
+k_type: "unbounded" #"cayley"
 rho: 0.80
 encoder_spec_norm: false
-encoder_latent: 64
+encoder_latent: 16
 
 # Policy
 kp: 10.0
 kd: 2.0
 
-# Perturbation
-perturb_scale: 1.0
+# Perturbation (random actions to excite the system that represent possible residual actions)
+perturb_scale: 2.0
+fix_perturb_range: true
 
 # LQR / Stability
-action_scaling: 0.05 #0.1 (eta)
-q_scale: 1.0
-r_scale: 1.0
-max_z_space_error: 10.0
+q_scale: 1
+r_scale: 1
+max_tracking_error_x: 0.3 # define by success bounds (1-cos(15), sin(15), 1)
+max_displacement_x: 0.57 # define as maximum possible displacement of system (0.4, 0.4, 0.8)
 
 # Training
 horizon: 10
@@ -34,11 +35,21 @@ batch_size: 256
 lr: 1.0e-3
 weight_decay: 1.0e-5
 num_epochs: 200
-loss_threshold: 0.001
-recon_weight: 1.0
-pred_weight: 1.0
+loss_threshold: 0.003 #0.003 works with pred_weight=10
 scheduler_step: 50
 scheduler_gamma: 0.5
+
+# losses
+recon_weight: 1.0
+pred_weight: 10.0
+
+controllability_loss: true
+ctrl_weight: 0.01
+
+bi_lipschitz_loss: true
+bilip_weight: 2
+bilip_m_target: 1.0
+
 
 # Eval
 eval_num_trajectories: 200

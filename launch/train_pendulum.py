@@ -1,10 +1,11 @@
 import os
 import argparse
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.func import jacrev, vmap
 import yaml
 from torch.utils.data import Dataset, DataLoader
 
@@ -27,17 +28,17 @@ def pd_policy(obs, kp, kd):
 
 def collect_data(env, num_trajectories, max_steps, seed, policy=None):
     """Collect trajectories using the given policy (random if None)."""
-    env.seed(seed)
     np.random.seed(seed)
 
     trajectories = []
     for i in range(num_trajectories):
-        obs = env.reset()
+        obs, _ = env.reset()
         states = [obs]
         actions = []
         for t in range(max_steps):
             action = policy(obs) if policy else env.action_space.sample()
-            obs, _, done, _ = env.step(action)
+            obs, _, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
             states.append(obs)
             actions.append(action)
             if done:
@@ -72,14 +73,35 @@ class TrajectoryDataset(Dataset):
         return self.windows[idx]
 
 
-def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight):
+def bi_lipschitz_loss(encoder, x_batch, m_target=0.5):
+    """Penalize encoder Jacobian singular values below m_target."""
+    J = vmap(jacrev(encoder))(x_batch)
+    sigma_mins = torch.linalg.svdvals(J)[:, -1]
+    return torch.relu(m_target - sigma_mins).mean()
+
+
+def controllability_loss(A, B, horizon=4):
+    """Negative minimum singular value of the controllability matrix [B, AB, ..., A^{h-1}B]."""
+    cols = [B]
+    Ak = A
+    for _ in range(horizon - 1):
+        cols.append(Ak @ B)
+        Ak = Ak @ A
+    C_mat = torch.cat(cols, dim=1)
+    sigma_min = torch.linalg.svdvals(C_mat)[-1]
+    return -sigma_min
+
+
+def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
+                 ctrl_weight=0.0, ctrl_horizon=4,
+                 bilip_weight=0.0, bilip_m_target=0.5):
     """
     Args:
         model: KoopmanAutoencoder
         states_seq: (B, H+1, state_dim)
         actions_seq: (B, H, action_dim)
     Returns:
-        total_loss, recon_loss, pred_loss
+        total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss
     """
     B, Hp1, S = states_seq.shape
     H = Hp1 - 1
@@ -100,7 +122,20 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight):
     pred_loss = pred_loss / H
 
     total_loss = recon_weight * recon_loss + pred_weight * pred_loss
-    return total_loss, recon_loss, pred_loss
+
+    if ctrl_weight > 0:
+        ctrl_loss = controllability_loss(model.A, model.B_matrix, horizon=ctrl_horizon)
+        total_loss = total_loss + ctrl_weight * ctrl_loss
+    else:
+        ctrl_loss = torch.tensor(0.0, device=z.device)
+
+    if bilip_weight > 0:
+        bilip_loss_val = bi_lipschitz_loss(model.encode, all_states.detach(), m_target=bilip_m_target)
+        total_loss = total_loss + bilip_weight * bilip_loss_val
+    else:
+        bilip_loss_val = torch.tensor(0.0, device=z.device)
+
+    return total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss_val
 
 
 def train(model, trajectories, cfg):
@@ -137,15 +172,20 @@ def train(model, trajectories, cfg):
     loss_threshold = cfg.get("loss_threshold", 0.001)
     for epoch in range(1, cfg["num_epochs"] + 1):
         model.train()
-        epoch_total, epoch_recon, epoch_pred, n_batches = 0.0, 0.0, 0.0, 0
+        epoch_total, epoch_recon, epoch_pred, epoch_ctrl, epoch_bilip, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        ctrl_weight = cfg.get("ctrl_weight", 0.0) if cfg.get("controllability_loss", False) else 0.0
+        bilip_weight = cfg.get("bilip_weight", 0.0) if cfg.get("bi_lipschitz_loss", False) else 0.0
+        bilip_m_target = cfg.get("bilip_m_target", 0.5)
 
         for states_seq, actions_seq in loader:
             states_seq = states_seq.to(device)
             actions_seq = actions_seq.to(device)
 
-            total_loss, recon_loss, pred_loss = compute_loss(
+            total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss = compute_loss(
                 model, states_seq, actions_seq,
                 cfg["recon_weight"], cfg["pred_weight"],
+                ctrl_weight=ctrl_weight, ctrl_horizon=cfg["horizon"],
+                bilip_weight=bilip_weight, bilip_m_target=bilip_m_target,
             )
 
             optimizer.zero_grad()
@@ -158,19 +198,26 @@ def train(model, trajectories, cfg):
             epoch_total += total_loss.item()
             epoch_recon += recon_loss.item()
             epoch_pred += pred_loss.item()
+            epoch_ctrl += ctrl_loss.item()
+            epoch_bilip += bilip_loss.item()
             n_batches += 1
 
         scheduler.step()
 
         avg_total = epoch_total / n_batches
         if epoch % cfg["log_interval"] == 0 or epoch == 1:
-            print(
+            msg = (
                 f"Epoch {epoch:4d} | "
                 f"Total: {avg_total:.6f} | "
                 f"Recon: {epoch_recon / n_batches:.6f} | "
-                f"Pred:  {epoch_pred / n_batches:.6f} | "
-                f"LR: {scheduler.get_last_lr()[0]:.2e}"
+                f"Pred:  {epoch_pred / n_batches:.6f}"
             )
+            if ctrl_weight > 0:
+                msg += f" | Ctrl: {epoch_ctrl / n_batches:.6f}"
+            if bilip_weight > 0:
+                msg += f" | BiLip: {epoch_bilip / n_batches:.6f}"
+            msg += f" | LR: {scheduler.get_last_lr()[0]:.2e}"
+            print(msg)
 
         if avg_total < loss_threshold:
             print(f"Early stop: total loss {avg_total:.6f} < threshold {loss_threshold}")

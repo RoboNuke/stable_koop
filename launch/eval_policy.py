@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-import gym
+import gymnasium as gym
 import numpy as np
 import yaml
 
@@ -32,13 +32,14 @@ def check_success(states, cfg):
 
 def rollout(env, policy, max_steps, cfg):
     """Run one episode, terminating early on success. Returns (states, actions, success)."""
-    obs = env.reset()
+    obs, _ = env.reset()
     states = [obs]
     actions = []
     success = False
     for _ in range(max_steps):
         action = policy(obs)
-        obs, _, done, _ = env.step(action)
+        obs, _, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
         states.append(obs)
         actions.append(action)
         if check_success(states, cfg):
@@ -152,7 +153,6 @@ if __name__ == "__main__":
         cfg = yaml.safe_load(f)
 
     env = gym.make(cfg["env_name"])
-    env.seed(cfg["eval_seed"])
     np.random.seed(cfg["eval_seed"])
     policy = make_policy(cfg)
 
@@ -161,13 +161,14 @@ if __name__ == "__main__":
         num_traj = cfg["eval_num_trajectories"]
         max_steps = cfg["eval_max_steps"]
         for i in range(num_traj):
-            obs = env.reset()
+            obs, _ = env.reset()
             states = [obs]
             success = False
             for t in range(max_steps):
                 env.render(mode="human")
                 action = policy(obs)
-                obs, _, done, _ = env.step(action)
+                obs, _, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
                 states.append(obs)
                 if not success and check_success(states, cfg):
                     success = True
