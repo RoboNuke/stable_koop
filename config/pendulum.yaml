@@ -18,11 +18,12 @@ encoder_latent: 16
 init_b_in_a: True  # initialize B in A eigenbasis (only effective with two-step training)
 
 # Policy
+no_base_policy: true  # if true, use random actions instead of PD policy
 kp: 10.0
 kd: 2.0
 
 # Perturbation (random actions to excite the system that represent possible residual actions)
-perturb_scale: 2.0
+perturb_scale: 1.0 # multiplier on max action
 fix_perturb_range: false
 hold_steps: 5  # number of steps to hold each sampled perturbation before resampling
 
@@ -50,10 +51,10 @@ recon_weight: 1.0
 pred_weight: 1.0
 
 controllability_loss: false
-ctrl_weight: 0.05 
+ctrl_weight: 0.1 #0.05 
 
-bi_lipschitz_loss: false
-bilip_weight: 1.0
+bi_lipschitz_loss: true
+bilip_weight: 2.0
 bilip_m_target: 1.0
 
 spectral_loss: false
@@ -65,9 +66,13 @@ normality_weight: 2.0
 cl_normality_loss: false
 cl_normality_weight: 1.0
 
-b_eigen_loss: true
+b_eigen_loss: False
 b_eigen_weight: 1.0
-b_eigen_min_scale: 0.1
+b_eigen_min_scale: 0.3
+
+eig_spread_loss: True
+eig_spread_weight: 1.0
+eig_spread_min_gap: 0.1
 
 upper_lipschitz_loss: false
 upper_lip_weight: 1.0

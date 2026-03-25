@@ -50,7 +50,7 @@ class NormalK(nn.Module):
         super().__init__()
         self.Q_upper = nn.Parameter(torch.randn(latent_dim, latent_dim) * 0.01)
         self.log_d = nn.Parameter(torch.zeros(latent_dim))
-        self.b_eigen = nn.Parameter(torch.randn(latent_dim, action_dim) * 0.1)
+        self.b_eigen = nn.Parameter(torch.randn(latent_dim, action_dim) )
         self.latent_dim = latent_dim
         self.rho = rho
 
@@ -82,8 +82,10 @@ class KoopmanAutoencoder(nn.Module):
         if encoder_type == "cayley":
             self.encoder = nn.Sequential(
                 SemiOrthogonalLinear(state_dim, encoder_latent),
+                #nn.ReLU(),
                 GroupSort(2),
                 OrthogonalLinear(encoder_latent, encoder_latent),
+                #nn.ReLU(),
                 GroupSort(2),
                 SemiOrthogonalLinear(encoder_latent, latent_dim)
             )

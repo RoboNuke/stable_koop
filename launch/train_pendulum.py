@@ -102,6 +102,13 @@ def b_eigen_loss(b_eigen, min_scale=0.1):
     return torch.relu(min_scale - b_eigen.abs()).mean()
 
 
+def eigenvalue_spread_loss(log_d, min_gap=0.1):
+    """Penalize eigenvalue gaps smaller than min_gap to encourage spread."""
+    d = torch.sort(log_d).values
+    gaps = d[1:] - d[:-1]
+    return torch.relu(min_gap - gaps).sum()
+
+
 def controllability_loss(A, B, horizon=4):
     """Negative minimum singular value of the controllability matrix [B, AB, ..., A^{h-1}B]."""
     cols = [B]
@@ -191,25 +198,22 @@ def _pred_loss_vectorized(model, states_seq, actions_seq):
 
 
 def closed_loop_normality_loss(A, B, Q, R):
-    """Normality loss on the closed-loop matrix A - B_norm @ F.
+    """Normality loss on the closed-loop matrix A - B @ F.
 
     F is computed via LQR with no_grad so gradients flow only through
     A and B in the closed-loop construction.
     """
-    B_scale = torch.norm(B, p=2)
-    B_norm = B / B_scale
-
     with torch.no_grad():
         A_np = A.detach().cpu().numpy()
-        B_norm_np = B_norm.detach().cpu().numpy()
-        P = solve_discrete_are(A_np, B_norm_np, Q.numpy(), R.numpy())
+        B_np = B.detach().cpu().numpy()
+        P = solve_discrete_are(A_np, B_np, Q.numpy(), R.numpy())
         P = torch.from_numpy(P).to(A.dtype).to(A.device)
         F_current = torch.linalg.solve(
-            R.to(A.device) + B_norm.detach().T @ P @ B_norm.detach(),
-            B_norm.detach().T @ P @ A.detach(),
+            R.to(A.device) + B.detach().T @ P @ B.detach(),
+            B.detach().T @ P @ A.detach(),
         )
 
-    cl = A - B_norm @ F_current
+    cl = A - B @ F_current
     return normality_loss(cl)
 
 
@@ -219,6 +223,7 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
                  spectral_weight=0.0, normality_weight=0.0,
                  cl_normality_weight=0.0, cl_norm_Q=None, cl_norm_R=None,
                  b_eigen_weight=0.0, b_eigen_min_scale=0.1,
+                 eig_spread_weight=0.0, eig_spread_min_gap=0.1,
                  upper_lip_weight=0.0, upper_lip_m_max=1.0,
                  vectorize_rollout=False):
     """
@@ -284,13 +289,19 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
     else:
         beig_loss_val = torch.tensor(0.0, device=all_states.device)
 
+    if eig_spread_weight > 0 and hasattr(model.K_module, 'log_d'):
+        espread_loss_val = eigenvalue_spread_loss(model.K_module.log_d, min_gap=eig_spread_min_gap)
+        total_loss = total_loss + eig_spread_weight * espread_loss_val
+    else:
+        espread_loss_val = torch.tensor(0.0, device=all_states.device)
+
     if upper_lip_weight > 0:
         ulip_loss_val = upper_lipschitz_loss(model.encode, all_states.detach(), m_max=upper_lip_m_max)
         total_loss = total_loss + upper_lip_weight * ulip_loss_val
     else:
         ulip_loss_val = torch.tensor(0.0, device=all_states.device)
 
-    return total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss_val, spec_loss_val, norm_loss_val, cl_norm_loss_val, beig_loss_val, ulip_loss_val
+    return total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss_val, spec_loss_val, norm_loss_val, cl_norm_loss_val, beig_loss_val, espread_loss_val, ulip_loss_val
 
 
 def train(model, trajectories, cfg):
@@ -339,7 +350,7 @@ def train(model, trajectories, cfg):
     loss_threshold = cfg.get("loss_threshold", 0.001)
     for epoch in range(1, cfg["num_epochs"] + 1):
         model.train()
-        epoch_total, epoch_recon, epoch_pred, epoch_ctrl, epoch_bilip, epoch_spec, epoch_norm, epoch_cl_norm, epoch_beig, epoch_ulip, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        epoch_total, epoch_recon, epoch_pred, epoch_ctrl, epoch_bilip, epoch_spec, epoch_norm, epoch_cl_norm, epoch_beig, epoch_espread, epoch_ulip, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
         ctrl_weight = cfg.get("ctrl_weight", 0.0) if cfg.get("controllability_loss", False) else 0.0
         bilip_weight = cfg.get("bilip_weight", 0.0) if cfg.get("bi_lipschitz_loss", False) else 0.0
         bilip_m_target = cfg.get("bilip_m_target", 0.5)
@@ -348,6 +359,8 @@ def train(model, trajectories, cfg):
         cl_normality_weight = cfg.get("cl_normality_weight", 0.0) if cfg.get("cl_normality_loss", False) else 0.0
         b_eigen_weight = cfg.get("b_eigen_weight", 0.0) if cfg.get("b_eigen_loss", False) else 0.0
         b_eigen_min_scale = cfg.get("b_eigen_min_scale", 0.1)
+        eig_spread_weight = cfg.get("eig_spread_weight", 0.0) if cfg.get("eig_spread_loss", False) else 0.0
+        eig_spread_min_gap = cfg.get("eig_spread_min_gap", 0.1)
         upper_lip_weight = cfg.get("upper_lip_weight", 0.0) if cfg.get("upper_lipschitz_loss", False) else 0.0
         upper_lip_m_max = cfg.get("upper_lip_m_max", 1.0)
 
@@ -364,7 +377,7 @@ def train(model, trajectories, cfg):
             states_seq = states_seq.to(device)
             actions_seq = actions_seq.to(device)
 
-            total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss, norm_loss, cl_norm_loss, beig_loss, ulip_loss = compute_loss(
+            total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss, norm_loss, cl_norm_loss, beig_loss, espread_loss, ulip_loss = compute_loss(
                 model, states_seq, actions_seq,
                 cfg["recon_weight"], cfg["pred_weight"],
                 ctrl_weight=ctrl_weight, ctrl_horizon=cfg["horizon"],
@@ -372,6 +385,7 @@ def train(model, trajectories, cfg):
                 spectral_weight=spectral_weight, normality_weight=normality_weight,
                 cl_normality_weight=cl_normality_weight, cl_norm_Q=cl_norm_Q, cl_norm_R=cl_norm_R,
                 b_eigen_weight=b_eigen_weight, b_eigen_min_scale=b_eigen_min_scale,
+                eig_spread_weight=eig_spread_weight, eig_spread_min_gap=eig_spread_min_gap,
                 upper_lip_weight=upper_lip_weight, upper_lip_m_max=upper_lip_m_max,
                 vectorize_rollout=cfg.get("vectorize_rollout", False),
             )
@@ -392,6 +406,7 @@ def train(model, trajectories, cfg):
             epoch_norm += norm_loss.item()
             epoch_cl_norm += cl_norm_loss.item()
             epoch_beig += beig_loss.item()
+            epoch_espread += espread_loss.item()
             epoch_ulip += ulip_loss.item()
             n_batches += 1
 
@@ -415,6 +430,8 @@ def train(model, trajectories, cfg):
                 msg += f" | CLNorm: {epoch_cl_norm / n_batches:.6f}"
             if b_eigen_weight > 0:
                 msg += f" | BEig: {epoch_beig / n_batches:.6f}"
+            if eig_spread_weight > 0:
+                msg += f" | ESprd: {epoch_espread / n_batches:.6f}"
             if bilip_weight > 0:
                 msg += f" | BiLip: {epoch_bilip / n_batches:.6f}"
             if upper_lip_weight > 0:
@@ -441,6 +458,8 @@ def train(model, trajectories, cfg):
         print(f"  CLNorm: {epoch_cl_norm / n_batches:.6f}")
     if b_eigen_weight > 0:
         print(f"  BEig:  {epoch_beig / n_batches:.6f}")
+    if eig_spread_weight > 0:
+        print(f"  ESprd: {epoch_espread / n_batches:.6f}")
     if bilip_weight > 0:
         print(f"  BiLip: {epoch_bilip / n_batches:.6f}")
     if upper_lip_weight > 0:

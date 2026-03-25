@@ -37,7 +37,7 @@ def rollout(env, policy, max_steps, cfg):
     actions = []
     success = False
     for _ in range(max_steps):
-        action = policy(obs)
+        action = policy(obs) if policy is not None else env.action_space.sample()
         obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
         states.append(obs)

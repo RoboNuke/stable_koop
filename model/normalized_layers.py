@@ -16,6 +16,7 @@ class OrthogonalLinear(nn.Module):
     
     def forward(self, x):
         return x @ self.W.T
+    
 import geoopt
 
 class SemiOrthogonalLinear(nn.Module):

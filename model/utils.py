@@ -31,23 +31,31 @@ def transient_constant(M):
         warnings.warn("V is poorly conditioned, M may not be diagonalizable")
     return cond
 
-
 def compute_lower_lipschitz(encoder, training_data):
-    """Compute the lower Lipschitz constant of the encoder via minimum singular
-    value of the Jacobian across training data.
+    X = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in training_data])
+    def encode_single(x):
+        return encoder(x.unsqueeze(0)).squeeze(0)
+    J_batch = vmap(jacrev(encode_single))(X)
+    sigma_mins = torch.linalg.svdvals(J_batch)[:, -1]
+    return float(sigma_mins.min().detach())
 
-    Args:
-        encoder: callable mapping (state_dim,) -> (latent_dim,)
-        training_data: iterable of state vectors (numpy arrays or tensors)
+"""
+def compute_lower_lipschitz(encoder, training_data):
+    #Compute the lower Lipschitz constant of the encoder via minimum singular
+    #value of the Jacobian across training data.
 
-    Returns:
-        m: float, the lower Lipschitz constant
-    """
+    #Args:
+    #    encoder: callable mapping (state_dim,) -> (latent_dim,)
+    #    training_data: iterable of state vectors (numpy arrays or tensors)
+
+    #Returns:
+    #    m: float, the lower Lipschitz constant
+    
     X = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in training_data])
     J_batch = vmap(jacrev(encoder))(X)  # (N, latent_dim, state_dim)
     sigma_mins = torch.linalg.svdvals(J_batch)[:, -1]
     return float(sigma_mins.min().detach())
-
+"""
 
 def max_tolerable_model_error(rho, C, epsilon_max, eta):
     """Compute the maximum tolerable model error for stability.

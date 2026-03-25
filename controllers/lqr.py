@@ -19,17 +19,14 @@ class LQR:
 
     def __init__(self, A, B, Q, R):
         self.A = A
-        self.B_raw = B
-        self.B_scale = torch.norm(B, p=2)
-        B_norm = B / self.B_scale
-        self.B = B_norm
+        self.B = B
         self.Q = Q
         self.R = R
 
-        P = solve_discrete_are(A.numpy(), B_norm.numpy(), Q.numpy(), R.numpy())
+        P = solve_discrete_are(A.numpy(), B.numpy(), Q.numpy(), R.numpy())
         P = torch.from_numpy(P).to(A.dtype)
         self.P = P
-        self.F = torch.linalg.solve(R + B_norm.T @ P @ B_norm, B_norm.T @ P @ A)
+        self.F = torch.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
         self.gain_norm = torch.linalg.norm(self.F, ord=2)
 
     @property

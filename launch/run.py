@@ -175,7 +175,7 @@ def collect_perturbed_data(env, policy, num_trajectories, max_steps, seed,
         perturbations = []
         perturbation = None
         for t in range(max_steps):
-            base_action = policy(obs)
+            base_action = policy(obs) if policy is not None else np.zeros_like(action_low)
             # Resample perturbation every hold_steps
             if t % hold_steps == 0:
                 if fix_perturb_range:
@@ -405,7 +405,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
     ctrl_rank = np.linalg.matrix_rank(C_mat)
     print(f"  Controllability rank:                  {ctrl_rank} / {A_np.shape[0]}")
 
-    if cfg.get("k_type") == "unbounded":
+    if cfg.get("k_type") in ["unbounded","normalized"]:
         eigenvalues, V = torch.linalg.eig(A)
         unstable_mask = eigenvalues.abs() > 1.0
         for i, (ev, unstable) in enumerate(zip(eigenvalues, unstable_mask)):
@@ -429,12 +429,11 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
     Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
     R = torch.eye(action_dim) * cfg["r_scale"]
     lqr = LQR(A, B_mat, Q, R)
-    B_norm = lqr.B
     F = lqr.F
     gain_norm = lqr.gain_norm.item()
     print(f"  Q scale:                               {cfg.get('q_scale', 1.0)}")
     print(f"  R scale:                               {cfg['r_scale']}")
-    BtPB = (B_norm.T @ lqr.P @ B_norm).item()
+    BtPB = (B_mat.T @ lqr.P @ B_mat).item()
     print(f"  B^T P B:                               {BtPB:.6f}")
     print(f"  LQR gain norm (||F||):                 {gain_norm:.6f}")
 
@@ -452,8 +451,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
     max_tracking_error_latent = state_error_to_latent_error(max_tracking_error_x, m)
     eta = state_error_to_latent_error(max_displacement_x, m)
     max_runtime_error_latent = max_tolerable_model_error(rho, C, max_tracking_error_latent, eta)
-    B_scale = lqr.B_scale.item()
-    residual_ctrl_budget = max_tracking_error_latent * gain_norm / B_scale
+    residual_ctrl_budget = max_tracking_error_latent * gain_norm
 
     print(f"  max_tracking_error_x:                  {max_tracking_error_x:.6f}")
     print(f"  max_displacement_x:                    {max_displacement_x:.6f}")
@@ -514,7 +512,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
         "max_runtime_error_latent": float(max_runtime_error_latent),
         "residual_ctrl_budget": float(residual_ctrl_budget),
         "A": A.numpy().tolist(),
-        "B": B_norm.numpy().tolist(),
+        "B": B_mat.numpy().tolist(),
     }
     stats_path = os.path.join(phase_dir, "variables.yaml")
     with open(stats_path, "w") as f:
@@ -547,7 +545,11 @@ def main():
     save_config(cfg, run_dir)
 
     env = make_env(cfg)
-    policy = make_base_policy(cfg)
+    if cfg.get("no_base_policy", False):
+        policy = None
+        print("No base policy — using random actions only")
+    else:
+        policy = make_base_policy(cfg)
 
     # Compute observation and action scaling
     obs_scale = compute_obs_scale(env, augment)
