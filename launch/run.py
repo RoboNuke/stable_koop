@@ -622,7 +622,13 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     action_dim = cfg["action_dim"]
     Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
     R = torch.eye(action_dim) * cfg["r_scale"]
-    lqr = LQR(A, B_mat, Q, R)
+    scale_B=True
+    if scale_B:
+        B_scale = torch.norm(B_mat, p=2)
+        B_norm = B_mat / B_scale
+        lqr = LQR(A, B_norm, Q, R)
+    else:
+        lqr = LQR(A, B_mat, Q, R)
     gain_norm = lqr.gain_norm.item()
     P = lqr.P
 
@@ -641,6 +647,8 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     print(f"  R scale:                               {cfg['r_scale']}")
     print(f"  LQR gain norm (||F||):                 {gain_norm:.6f}")
     residual_ctrl_budget = max_tracking_error_latent * gain_norm
+    if scale_B:
+        residual_ctrl_budget /= B_scale
     print(f"  Residual ctrl budget:                  {residual_ctrl_budget:.6f} N-m")
     print(f"  κ(P) = λ_max(P)/λ_min(P):             {kappa_P:.6f}")
     print(f"  ρ² (Lyapunov):                         {rho_sq:.6f}")
