@@ -37,7 +37,7 @@ horizon: 5
 batch_size: 2048 #1024
 lr: 1.0e-2
 weight_decay: 1.0e-5
-num_epochs: 200
+num_epochs: 100
 loss_threshold: 0.003 #0.003 works with pred_weight=10
 scheduler_step: 100
 scheduler_gamma: 0.5
@@ -50,10 +50,10 @@ recon_weight: 1.0
 pred_weight: 1.0
 
 controllability_loss: false
-ctrl_weight: 1.0 
+ctrl_weight: 0.05 
 
 bi_lipschitz_loss: false
-bilip_weight: 1
+bilip_weight: 1.0
 bilip_m_target: 1.0
 
 spectral_loss: false
@@ -64,6 +64,10 @@ normality_weight: 2.0
 
 cl_normality_loss: false
 cl_normality_weight: 1.0
+
+b_eigen_loss: true
+b_eigen_weight: 1.0
+b_eigen_min_scale: 0.1
 
 upper_lipschitz_loss: false
 upper_lip_weight: 1.0

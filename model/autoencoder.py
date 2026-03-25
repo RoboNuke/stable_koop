@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from model.normalized_layers import SemiOrthogonalLinear, OrthogonalLinear
+from model.normalized_layers import SemiOrthogonalLinear, OrthogonalLinear, GroupSort
 
 class CayleyK(nn.Module):
     """Cayley parameterization: K is Schur-stable by construction."""
@@ -46,20 +46,28 @@ class SchurK(nn.Module):
 
 
 class NormalK(nn.Module):
-    def __init__(self, latent_dim, rho=1.2):
+    def __init__(self, latent_dim, action_dim, rho=1.2):
         super().__init__()
         self.Q_upper = nn.Parameter(torch.randn(latent_dim, latent_dim) * 0.01)
-        self.log_d = nn.Parameter(torch.zeros(latent_dim))  # log eigenvalue magnitudes
+        self.log_d = nn.Parameter(torch.zeros(latent_dim))
+        self.b_eigen = nn.Parameter(torch.randn(latent_dim, action_dim) * 0.1)
         self.latent_dim = latent_dim
         self.rho = rho
 
     @property
-    def K(self):
+    def Q(self):
         A = self.Q_upper - self.Q_upper.T
         I = torch.eye(self.latent_dim, device=A.device)
-        Q = torch.linalg.solve(I + A, I - A)  # orthogonal
-        d = torch.tanh(self.log_d) * self.rho  # eigenvalues in (-rho, rho)
-        return Q @ torch.diag(d) @ Q.T  # normal matrix, C=1 by construction
+        return torch.linalg.solve(I + A, I - A)
+
+    @property
+    def K(self):
+        d = torch.tanh(self.log_d) * self.rho
+        return self.Q @ torch.diag(d) @ self.Q.T
+
+    @property
+    def B_from_eigen(self):
+        return self.Q @ self.b_eigen  # (latent_dim, action_dim)
 
     def forward(self, z):
         return z @ self.K.T
@@ -72,12 +80,11 @@ class KoopmanAutoencoder(nn.Module):
         super().__init__()
 
         if encoder_type == "cayley":
-            # Final layer: SemiOrthogonal if expanding, plain linear if contracting
             self.encoder = nn.Sequential(
                 SemiOrthogonalLinear(state_dim, encoder_latent),
-                nn.ReLU(),
+                GroupSort(2),
                 OrthogonalLinear(encoder_latent, encoder_latent),
-                nn.ReLU(),
+                GroupSort(2),
                 SemiOrthogonalLinear(encoder_latent, latent_dim)
             )
         elif encoder_type == "linear":
@@ -101,6 +108,7 @@ class KoopmanAutoencoder(nn.Module):
             nn.Linear(64, 64),         nn.Tanh(),
             nn.Linear(64, state_dim)
         )
+        self.b_from_k_mod = False
         if k_type == "cayley":
             self.K_module = CayleyK(latent_dim, rho)
         elif k_type == "schur":
@@ -108,7 +116,8 @@ class KoopmanAutoencoder(nn.Module):
         elif k_type == "unbounded":
             self.K_module = nn.Linear(latent_dim, latent_dim, bias=False)
         elif k_type == "normalized":
-            self.K_module = NormalK(latent_dim, rho)
+            self.b_from_k_mod = True
+            self.K_module = NormalK(latent_dim, action_dim, rho)
         else:
             raise NotImplementedError
         
@@ -118,14 +127,20 @@ class KoopmanAutoencoder(nn.Module):
 
     def encode(self, x):    return self.encoder(x)
     def decode(self, z):    return self.decoder(z)
-    def predict(self, z, u): return self.K_module(z) + self.B(u)
+    def predict(self, z, u):
+        if self.b_from_k_mod:
+            return self.K_module(z) + u @ self.K_module.B_from_eigen.T
+        return self.K_module(z) + self.B(u)
     @property
     def A(self):
         return self.K_module.K if hasattr(self.K_module, 'K') else self.K_module.weight
 
     @property  
     def B_matrix(self):
-        return self.B.weight
+        if self.b_from_k_mod:
+            return self.K_module.B_from_eigen
+        else:
+            return self.B.weight
     
     def prediction_error(self, z_t, u_t, z_next):
         """Compute the Koopman one-step prediction error in latent space.
@@ -166,4 +181,4 @@ class KoopmanAutoencoder(nn.Module):
             # Project current B onto eigenvector space
             B = self.B_matrix  # (latent_dim, action_dim)
             B_proj = V_real @ (V_real.T @ B)  # project onto eigenbasis
-            self.B.weight.copy_(B_proj)
+            self.B.weight.copy_(B_proj )

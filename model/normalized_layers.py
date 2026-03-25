@@ -53,5 +53,17 @@ class SemiOrthogonalLinear(nn.Module):
 
     def forward(self, x):
         return self.linear(x)
-"""         
-    
+"""
+
+
+class GroupSort(nn.Module):
+    def __init__(self, group_size=2):
+        super().__init__()
+        self.group_size = group_size
+
+    def forward(self, x):
+        shape = x.shape
+        x = x.reshape(*shape[:-1], -1, self.group_size)
+        x, _ = x.sort(dim=-1)
+        return x.reshape(shape)
+

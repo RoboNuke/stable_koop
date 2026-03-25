@@ -462,7 +462,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
     if max_runtime_error_latent < 0:
         print(f"\033[91m  max_runtime_error_latent:              {max_runtime_error_latent:.6f}\033[0m")
     else:
-        print(f"  max_runtime_error_latent:              {max_runtime_error_latent:.6f}")
+        print(f"\033[92m  max_runtime_error_latent:              {max_runtime_error_latent:.6f}\033[0m")
     print(f"  residual_ctrl_budget:                  {residual_ctrl_budget:.6f}")
 
     # Heatmap: max_runtime_error_latent over (max_tracking_error_x, max_displacement_x)
