@@ -304,10 +304,14 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
     phase_dir = os.path.join(run_dir, "koopman_train_B")
     os.makedirs(phase_dir, exist_ok=True)
 
-    # 1. Reinitialize B with random weights, keep everything else from Phase 1
+    # 1. Reinitialize B
     import torch.nn as nn
-    nn.init.kaiming_uniform_(model.B.weight)
-    print("Reinitialized B matrix with random weights")
+    if cfg.get("init_b_in_a", False):
+        model.initialize_B_in_eigenbasis()
+        print("Initialized B matrix in A eigenbasis")
+    else:
+        nn.init.kaiming_uniform_(model.B.weight)
+        print("Reinitialized B matrix with random weights")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # 2. Collect data with base policy + random perturbations
@@ -449,7 +453,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
     eta = state_error_to_latent_error(max_displacement_x, m)
     max_runtime_error_latent = max_tolerable_model_error(rho, C, max_tracking_error_latent, eta)
     B_scale = lqr.B_scale.item()
-    residual_ctrl_budget = max_tracking_error_latent * gain_norm * B_scale
+    residual_ctrl_budget = max_tracking_error_latent * gain_norm / B_scale
 
     print(f"  max_tracking_error_x:                  {max_tracking_error_x:.6f}")
     print(f"  max_displacement_x:                    {max_displacement_x:.6f}")
@@ -562,6 +566,7 @@ def main():
         latent_dim=cfg["latent_dim"],
         action_dim=cfg["action_dim"],
         k_type=cfg["k_type"],
+        encoder_type=cfg.get("encoder_type", "linear"),
         rho=cfg["rho"],
         encoder_spec_norm=cfg["encoder_spec_norm"],
         encoder_latent=cfg["encoder_latent"],

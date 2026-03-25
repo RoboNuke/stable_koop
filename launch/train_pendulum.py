@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.func import jacrev, vmap
+from scipy.linalg import solve_discrete_are
 import yaml
 from torch.utils.data import Dataset, DataLoader
 
@@ -78,6 +79,13 @@ def bi_lipschitz_loss(encoder, x_batch, m_target=0.5):
     J = vmap(jacrev(encoder))(x_batch)
     sigma_mins = torch.linalg.svdvals(J)[:, -1]
     return torch.relu(m_target - sigma_mins).mean()
+
+
+def upper_lipschitz_loss(encoder, x_batch, m_max=1.0):
+    """Penalize encoder Jacobian singular values above m_max."""
+    J = vmap(jacrev(encoder))(x_batch)
+    sigma_maxs = torch.linalg.svdvals(J)[:, 0]
+    return torch.relu(sigma_maxs - m_max).mean()
 
 
 def controllability_loss(A, B, horizon=4):
@@ -168,10 +176,35 @@ def _pred_loss_vectorized(model, states_seq, actions_seq):
     return F.mse_loss(x_pred, x_target)
 
 
+def closed_loop_normality_loss(A, B, Q, R):
+    """Normality loss on the closed-loop matrix A - B_norm @ F.
+
+    F is computed via LQR with no_grad so gradients flow only through
+    A and B in the closed-loop construction.
+    """
+    B_scale = torch.norm(B, p=2)
+    B_norm = B / B_scale
+
+    with torch.no_grad():
+        A_np = A.detach().cpu().numpy()
+        B_norm_np = B_norm.detach().cpu().numpy()
+        P = solve_discrete_are(A_np, B_norm_np, Q.numpy(), R.numpy())
+        P = torch.from_numpy(P).to(A.dtype).to(A.device)
+        F_current = torch.linalg.solve(
+            R.to(A.device) + B_norm.detach().T @ P @ B_norm.detach(),
+            B_norm.detach().T @ P @ A.detach(),
+        )
+
+    cl = A - B_norm @ F_current
+    return normality_loss(cl)
+
+
 def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
                  ctrl_weight=0.0, ctrl_horizon=4,
                  bilip_weight=0.0, bilip_m_target=0.5,
                  spectral_weight=0.0, normality_weight=0.0,
+                 cl_normality_weight=0.0, cl_norm_Q=None, cl_norm_R=None,
+                 upper_lip_weight=0.0, upper_lip_m_max=1.0,
                  vectorize_rollout=False):
     """
     Args:
@@ -180,7 +213,8 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
         actions_seq: (B, H, action_dim)
         vectorize_rollout: if True, use closed-form vectorized prediction
     Returns:
-        total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss, norm_loss
+        total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss,
+        norm_loss, cl_norm_loss, ulip_loss
     """
     B, Hp1, S = states_seq.shape
     H = Hp1 - 1
@@ -223,7 +257,19 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
     else:
         norm_loss_val = torch.tensor(0.0, device=all_states.device)
 
-    return total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss_val, spec_loss_val, norm_loss_val
+    if cl_normality_weight > 0:
+        cl_norm_loss_val = closed_loop_normality_loss(model.A, model.B_matrix, cl_norm_Q, cl_norm_R)
+        total_loss = total_loss + cl_normality_weight * cl_norm_loss_val
+    else:
+        cl_norm_loss_val = torch.tensor(0.0, device=all_states.device)
+
+    if upper_lip_weight > 0:
+        ulip_loss_val = upper_lipschitz_loss(model.encode, all_states.detach(), m_max=upper_lip_m_max)
+        total_loss = total_loss + upper_lip_weight * ulip_loss_val
+    else:
+        ulip_loss_val = torch.tensor(0.0, device=all_states.device)
+
+    return total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss_val, spec_loss_val, norm_loss_val, cl_norm_loss_val, ulip_loss_val
 
 
 def train(model, trajectories, cfg):
@@ -249,9 +295,16 @@ def train(model, trajectories, cfg):
     )
 
     # 2. Optimizer and scheduler
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
-    )
+    if cfg.get("riemannian_optimizer", False):
+        import geoopt
+        optimizer = geoopt.optim.RiemannianAdam(
+            model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
+        )
+        print("Using RiemannianAdam optimizer")
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
+        )
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=cfg["scheduler_step"], gamma=cfg["scheduler_gamma"],
     )
@@ -265,23 +318,37 @@ def train(model, trajectories, cfg):
     loss_threshold = cfg.get("loss_threshold", 0.001)
     for epoch in range(1, cfg["num_epochs"] + 1):
         model.train()
-        epoch_total, epoch_recon, epoch_pred, epoch_ctrl, epoch_bilip, epoch_spec, epoch_norm, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        epoch_total, epoch_recon, epoch_pred, epoch_ctrl, epoch_bilip, epoch_spec, epoch_norm, epoch_cl_norm, epoch_ulip, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
         ctrl_weight = cfg.get("ctrl_weight", 0.0) if cfg.get("controllability_loss", False) else 0.0
         bilip_weight = cfg.get("bilip_weight", 0.0) if cfg.get("bi_lipschitz_loss", False) else 0.0
         bilip_m_target = cfg.get("bilip_m_target", 0.5)
         spectral_weight = cfg.get("spectral_weight", 0.0) if cfg.get("spectral_loss", False) else 0.0
         normality_weight = cfg.get("normality_weight", 0.0) if cfg.get("normality_loss", False) else 0.0
+        cl_normality_weight = cfg.get("cl_normality_weight", 0.0) if cfg.get("cl_normality_loss", False) else 0.0
+        upper_lip_weight = cfg.get("upper_lip_weight", 0.0) if cfg.get("upper_lipschitz_loss", False) else 0.0
+        upper_lip_m_max = cfg.get("upper_lip_m_max", 1.0)
+
+        # Precompute Q and R for closed-loop normality loss
+        if cl_normality_weight > 0:
+            latent_dim = cfg["latent_dim"]
+            action_dim = cfg["action_dim"]
+            cl_norm_Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
+            cl_norm_R = torch.eye(action_dim) * cfg.get("r_scale", 1.0)
+        else:
+            cl_norm_Q, cl_norm_R = None, None
 
         for states_seq, actions_seq in loader:
             states_seq = states_seq.to(device)
             actions_seq = actions_seq.to(device)
 
-            total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss, norm_loss = compute_loss(
+            total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss, norm_loss, cl_norm_loss, ulip_loss = compute_loss(
                 model, states_seq, actions_seq,
                 cfg["recon_weight"], cfg["pred_weight"],
                 ctrl_weight=ctrl_weight, ctrl_horizon=cfg["horizon"],
                 bilip_weight=bilip_weight, bilip_m_target=bilip_m_target,
                 spectral_weight=spectral_weight, normality_weight=normality_weight,
+                cl_normality_weight=cl_normality_weight, cl_norm_Q=cl_norm_Q, cl_norm_R=cl_norm_R,
+                upper_lip_weight=upper_lip_weight, upper_lip_m_max=upper_lip_m_max,
                 vectorize_rollout=cfg.get("vectorize_rollout", False),
             )
 
@@ -299,6 +366,8 @@ def train(model, trajectories, cfg):
             epoch_bilip += bilip_loss.item()
             epoch_spec += spec_loss.item()
             epoch_norm += norm_loss.item()
+            epoch_cl_norm += cl_norm_loss.item()
+            epoch_ulip += ulip_loss.item()
             n_batches += 1
 
         scheduler.step()
@@ -313,12 +382,16 @@ def train(model, trajectories, cfg):
             )
             if ctrl_weight > 0:
                 msg += f" | Ctrl: {epoch_ctrl / n_batches:.6f}"
-            if bilip_weight > 0:
-                msg += f" | BiLip: {epoch_bilip / n_batches:.6f}"
             if spectral_weight > 0:
                 msg += f" | Spec: {epoch_spec / n_batches:.6f}"
             if normality_weight > 0:
                 msg += f" | Norm: {epoch_norm / n_batches:.6f}"
+            if cl_normality_weight > 0:
+                msg += f" | CLNorm: {epoch_cl_norm / n_batches:.6f}"
+            if bilip_weight > 0:
+                msg += f" | BiLip: {epoch_bilip / n_batches:.6f}"
+            if upper_lip_weight > 0:
+                msg += f" | ULip: {epoch_ulip / n_batches:.6f}"
             msg += f" | LR: {scheduler.get_last_lr()[0]:.2e}"
             print(msg)
 
@@ -333,12 +406,16 @@ def train(model, trajectories, cfg):
     print(f"  Pred:  {epoch_pred / n_batches:.6f}")
     if ctrl_weight > 0:
         print(f"  Ctrl:  {epoch_ctrl / n_batches:.6f}")
-    if bilip_weight > 0:
-        print(f"  BiLip: {epoch_bilip / n_batches:.6f}")
     if spectral_weight > 0:
         print(f"  Spec:  {epoch_spec / n_batches:.6f}")
     if normality_weight > 0:
-        print(f"  Norm:  {epoch_norm / n_batches:.6f}")
+        print(f"  Norm:   {epoch_norm / n_batches:.6f}")
+    if cl_normality_weight > 0:
+        print(f"  CLNorm: {epoch_cl_norm / n_batches:.6f}")
+    if bilip_weight > 0:
+        print(f"  BiLip: {epoch_bilip / n_batches:.6f}")
+    if upper_lip_weight > 0:
+        print(f"  ULip:  {epoch_ulip / n_batches:.6f}")
     print(f"  Epochs: {epoch}/{cfg['num_epochs']}")
 
     return model
@@ -379,6 +456,7 @@ if __name__ == "__main__":
         latent_dim=cfg["latent_dim"],
         action_dim=cfg["action_dim"],
         k_type=cfg["k_type"],
+        encoder_type=cfg.get("encoder_type", "linear"),
         rho=cfg["rho"],
         encoder_spec_norm=cfg["encoder_spec_norm"],
         encoder_latent=cfg["encoder_latent"],

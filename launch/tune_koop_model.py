@@ -78,6 +78,7 @@ def main():
         latent_dim=cfg["latent_dim"],
         action_dim=cfg["action_dim"],
         k_type=cfg["k_type"],
+        encoder_type=cfg.get("encoder_type", "linear"),
         rho=cfg["rho"],
         encoder_spec_norm=cfg["encoder_spec_norm"],
         encoder_latent=cfg["encoder_latent"],

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from model.normalized_layers import SemiOrthogonalLinear, OrthogonalLinear
 
 class CayleyK(nn.Module):
     """Cayley parameterization: K is Schur-stable by construction."""
@@ -44,20 +45,51 @@ class SchurK(nn.Module):
         return z @ self.K.T
 
 
+class NormalK(nn.Module):
+    def __init__(self, latent_dim, rho=1.2):
+        super().__init__()
+        self.Q_upper = nn.Parameter(torch.randn(latent_dim, latent_dim) * 0.01)
+        self.log_d = nn.Parameter(torch.zeros(latent_dim))  # log eigenvalue magnitudes
+        self.latent_dim = latent_dim
+        self.rho = rho
+
+    @property
+    def K(self):
+        A = self.Q_upper - self.Q_upper.T
+        I = torch.eye(self.latent_dim, device=A.device)
+        Q = torch.linalg.solve(I + A, I - A)  # orthogonal
+        d = torch.tanh(self.log_d) * self.rho  # eigenvalues in (-rho, rho)
+        return Q @ torch.diag(d) @ Q.T  # normal matrix, C=1 by construction
+
+    def forward(self, z):
+        return z @ self.K.T
+    
+    
 class KoopmanAutoencoder(nn.Module):
     def __init__(self, state_dim=2, latent_dim=32, action_dim=1, 
-                 k_type="cayley", rho=0.95, 
+                 k_type="cayley", encoder_type="linear", rho=0.95, 
                  encoder_spec_norm=False, encoder_latent=64):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(state_dim, encoder_latent), 
-            #nn.Tanh(),
-            nn.ReLU(),
-            nn.Linear(encoder_latent, encoder_latent),        
-            #nn.Tanh(),
-            nn.ReLU(),
-            nn.Linear(encoder_latent, latent_dim)
-        )
+
+        if encoder_type == "cayley":
+            # Final layer: SemiOrthogonal if expanding, plain linear if contracting
+            self.encoder = nn.Sequential(
+                SemiOrthogonalLinear(state_dim, encoder_latent),
+                nn.ReLU(),
+                OrthogonalLinear(encoder_latent, encoder_latent),
+                nn.ReLU(),
+                SemiOrthogonalLinear(encoder_latent, latent_dim)
+            )
+        elif encoder_type == "linear":
+            self.encoder = nn.Sequential(
+                nn.Linear(state_dim, encoder_latent), 
+                #nn.Tanh(),
+                nn.ReLU(),
+                nn.Linear(encoder_latent, encoder_latent),        
+                #nn.Tanh(),
+                nn.ReLU(),
+                nn.Linear(encoder_latent, latent_dim)
+            )
 
         if encoder_spec_norm:
             for layer in self.encoder:
@@ -75,6 +107,8 @@ class KoopmanAutoencoder(nn.Module):
             self.K_module = SchurK(latent_dim, rho)
         elif k_type == "unbounded":
             self.K_module = nn.Linear(latent_dim, latent_dim, bias=False)
+        elif k_type == "normalized":
+            self.K_module = NormalK(latent_dim, rho)
         else:
             raise NotImplementedError
         
@@ -123,3 +157,13 @@ class KoopmanAutoencoder(nn.Module):
                   for z_t, u_t, z_next in held_out_data]
         max_err = max(errors)
         return max_err, max_err <= delta_max
+    
+    def initialize_B_in_eigenbasis(self):
+        with torch.no_grad():
+            A = self.A.detach()
+            _, V = torch.linalg.eig(A)
+            V_real = V.real  # (latent_dim, latent_dim)
+            # Project current B onto eigenvector space
+            B = self.B_matrix  # (latent_dim, action_dim)
+            B_proj = V_real @ (V_real.T @ B)  # project onto eigenbasis
+            self.B.weight.copy_(B_proj)

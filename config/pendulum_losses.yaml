@@ -1,5 +1,5 @@
 # Run
-run_name: "construct_pendulum"
+run_name: "pendulum_pd"
 
 # Environment
 env_name: "Pendulum-v1"
@@ -10,12 +10,12 @@ max_episode_steps: 200
 state_dim: 3
 action_dim: 1
 latent_dim: 8
-k_type: "normalized" #"cayley", "schur", "normalized"
-rho: 1.2
-encoder_type: "cayley"  # "linear" or "cayley"
+k_type: "unbounded" #"cayley", "schur", "normalized"
+rho: 0.80
+encoder_type: "linear"  # "linear" or "cayley"
 encoder_spec_norm: false
 encoder_latent: 16
-init_b_in_a: True  # initialize B in A eigenbasis (only effective with two-step training)
+init_b_in_a: false  # initialize B in A eigenbasis (only effective with two-step training)
 
 # Policy
 kp: 10.0
@@ -34,14 +34,13 @@ max_displacement_x: 0.57 # define as maximum possible displacement of system (0.
 
 # Training
 horizon: 5
-batch_size: 2048 #1024
-lr: 1.0e-2
+batch_size: 1024
+lr: 1.0e-3
 weight_decay: 1.0e-5
 num_epochs: 200
-loss_threshold: 0.003 #0.003 works with pred_weight=10
-scheduler_step: 100
+loss_threshold: -100000 #0.003 #0.003 works with pred_weight=10
+scheduler_step: 50
 scheduler_gamma: 0.5
-riemannian_optimizer: true  # use geoopt RiemannianAdam instead of Adam
 vectorize_rollout: true  # use closed-form vectorized prediction rollout (faster but more memory)
 torch_compile: false  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)
 
@@ -49,17 +48,17 @@ torch_compile: false  # use torch.compile to fuse GPU kernels (slower first epoc
 recon_weight: 1.0
 pred_weight: 1.0
 
-controllability_loss: false
-ctrl_weight: 1.0 
+controllability_loss: true
+ctrl_weight: 0.05 
 
-bi_lipschitz_loss: false
+bi_lipschitz_loss: true
 bilip_weight: 1
 bilip_m_target: 1.0
 
-spectral_loss: false
+spectral_loss: true
 spectral_weight: 0.01
 
-normality_loss: false
+normality_loss: true
 normality_weight: 2.0
 
 cl_normality_loss: false
