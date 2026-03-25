@@ -92,6 +92,17 @@ def controllability_loss(A, B, horizon=4):
     return -sigma_min
 
 
+def spectral_loss(A):
+    """Penalize sum of eigenvalue magnitudes of A to encourage stability."""
+    eigenvalues = torch.linalg.eigvals(A)
+    return eigenvalues.abs().sum()
+
+
+def normality_loss(A):
+    """Penalize non-normality of A: ||A^T A - A A^T||_F."""
+    return torch.norm(A.T @ A - A @ A.T, p='fro')
+
+
 def _pred_loss_sequential(model, states_seq, actions_seq):
     """Original sequential multi-step prediction loss."""
     z = model.encode(states_seq[:, 0])
@@ -160,6 +171,7 @@ def _pred_loss_vectorized(model, states_seq, actions_seq):
 def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
                  ctrl_weight=0.0, ctrl_horizon=4,
                  bilip_weight=0.0, bilip_m_target=0.5,
+                 spectral_weight=0.0, normality_weight=0.0,
                  vectorize_rollout=False):
     """
     Args:
@@ -168,7 +180,7 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
         actions_seq: (B, H, action_dim)
         vectorize_rollout: if True, use closed-form vectorized prediction
     Returns:
-        total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss
+        total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss, norm_loss
     """
     B, Hp1, S = states_seq.shape
     H = Hp1 - 1
@@ -199,7 +211,19 @@ def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
     else:
         bilip_loss_val = torch.tensor(0.0, device=all_states.device)
 
-    return total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss_val
+    if spectral_weight > 0:
+        spec_loss_val = spectral_loss(model.A)
+        total_loss = total_loss + spectral_weight * spec_loss_val
+    else:
+        spec_loss_val = torch.tensor(0.0, device=all_states.device)
+
+    if normality_weight > 0:
+        norm_loss_val = normality_loss(model.A)
+        total_loss = total_loss + normality_weight * norm_loss_val
+    else:
+        norm_loss_val = torch.tensor(0.0, device=all_states.device)
+
+    return total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss_val, spec_loss_val, norm_loss_val
 
 
 def train(model, trajectories, cfg):
@@ -241,20 +265,23 @@ def train(model, trajectories, cfg):
     loss_threshold = cfg.get("loss_threshold", 0.001)
     for epoch in range(1, cfg["num_epochs"] + 1):
         model.train()
-        epoch_total, epoch_recon, epoch_pred, epoch_ctrl, epoch_bilip, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        epoch_total, epoch_recon, epoch_pred, epoch_ctrl, epoch_bilip, epoch_spec, epoch_norm, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
         ctrl_weight = cfg.get("ctrl_weight", 0.0) if cfg.get("controllability_loss", False) else 0.0
         bilip_weight = cfg.get("bilip_weight", 0.0) if cfg.get("bi_lipschitz_loss", False) else 0.0
         bilip_m_target = cfg.get("bilip_m_target", 0.5)
+        spectral_weight = cfg.get("spectral_weight", 0.0) if cfg.get("spectral_loss", False) else 0.0
+        normality_weight = cfg.get("normality_weight", 0.0) if cfg.get("normality_loss", False) else 0.0
 
         for states_seq, actions_seq in loader:
             states_seq = states_seq.to(device)
             actions_seq = actions_seq.to(device)
 
-            total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss = compute_loss(
+            total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss, norm_loss = compute_loss(
                 model, states_seq, actions_seq,
                 cfg["recon_weight"], cfg["pred_weight"],
                 ctrl_weight=ctrl_weight, ctrl_horizon=cfg["horizon"],
                 bilip_weight=bilip_weight, bilip_m_target=bilip_m_target,
+                spectral_weight=spectral_weight, normality_weight=normality_weight,
                 vectorize_rollout=cfg.get("vectorize_rollout", False),
             )
 
@@ -270,6 +297,8 @@ def train(model, trajectories, cfg):
             epoch_pred += pred_loss.item()
             epoch_ctrl += ctrl_loss.item()
             epoch_bilip += bilip_loss.item()
+            epoch_spec += spec_loss.item()
+            epoch_norm += norm_loss.item()
             n_batches += 1
 
         scheduler.step()
@@ -286,12 +315,31 @@ def train(model, trajectories, cfg):
                 msg += f" | Ctrl: {epoch_ctrl / n_batches:.6f}"
             if bilip_weight > 0:
                 msg += f" | BiLip: {epoch_bilip / n_batches:.6f}"
+            if spectral_weight > 0:
+                msg += f" | Spec: {epoch_spec / n_batches:.6f}"
+            if normality_weight > 0:
+                msg += f" | Norm: {epoch_norm / n_batches:.6f}"
             msg += f" | LR: {scheduler.get_last_lr()[0]:.2e}"
             print(msg)
 
         if avg_total < loss_threshold:
             print(f"Early stop: total loss {avg_total:.6f} < threshold {loss_threshold}")
             break
+
+    # Final loss summary
+    print("\n--- Training Complete ---")
+    print(f"  Total: {epoch_total / n_batches:.6f}")
+    print(f"  Recon: {epoch_recon / n_batches:.6f}")
+    print(f"  Pred:  {epoch_pred / n_batches:.6f}")
+    if ctrl_weight > 0:
+        print(f"  Ctrl:  {epoch_ctrl / n_batches:.6f}")
+    if bilip_weight > 0:
+        print(f"  BiLip: {epoch_bilip / n_batches:.6f}")
+    if spectral_weight > 0:
+        print(f"  Spec:  {epoch_spec / n_batches:.6f}")
+    if normality_weight > 0:
+        print(f"  Norm:  {epoch_norm / n_batches:.6f}")
+    print(f"  Epochs: {epoch}/{cfg['num_epochs']}")
 
     return model
 
