@@ -102,11 +102,22 @@ def b_eigen_loss(b_eigen, min_scale=0.1):
     return torch.relu(min_scale - b_eigen.abs()).mean()
 
 
-def eigenvalue_spread_loss(log_d, min_gap=0.1):
-    """Penalize eigenvalue gaps smaller than min_gap to encourage spread."""
-    d = torch.sort(log_d).values
+def eigenvalue_spread_loss(log_d, rho, min_gap=0.1):
+    d = torch.sort(torch.tanh(log_d) * rho).values
     gaps = d[1:] - d[:-1]
     return torch.relu(min_gap - gaps).sum()
+
+
+def unstable_controllability_loss(A, B_matrix, threshold=1.0):
+    eigenvalues, V = torch.linalg.eig(A)
+    unstable_mask = eigenvalues.abs() > threshold
+    if not unstable_mask.any():
+        return torch.tensor(0.0, device=A.device)
+    V_unstable = V[:, unstable_mask]
+    B_complex = B_matrix.to(torch.cfloat)
+    projections = (V_unstable.conj().T @ B_complex).abs()
+    # Normalize: sigmoid drives projections toward 1, saturates naturally
+    return -torch.sigmoid(projections - 1.0).sum()
 
 
 def controllability_loss(A, B, horizon=4):
@@ -217,91 +228,139 @@ def closed_loop_normality_loss(A, B, Q, R):
     return normality_loss(cl)
 
 
-def compute_loss(model, states_seq, actions_seq, recon_weight, pred_weight,
-                 ctrl_weight=0.0, ctrl_horizon=4,
-                 bilip_weight=0.0, bilip_m_target=0.5,
-                 spectral_weight=0.0, normality_weight=0.0,
-                 cl_normality_weight=0.0, cl_norm_Q=None, cl_norm_R=None,
-                 b_eigen_weight=0.0, b_eigen_min_scale=0.1,
-                 eig_spread_weight=0.0, eig_spread_min_gap=0.1,
-                 upper_lip_weight=0.0, upper_lip_m_max=1.0,
-                 vectorize_rollout=False):
+def latent_consistency_loss(model, states_seq, actions_seq):
+    """Enforce z_{t+1} ≈ A*z_t + B*u_t directly in latent space (vectorized)."""
+    B_batch, Hp1, S = states_seq.shape
+    H = Hp1 - 1
+
+    all_states = states_seq.reshape(B_batch * Hp1, S)
+    all_z = model.encode(all_states).reshape(B_batch, Hp1, -1)
+
+    z_t = all_z[:, :H].reshape(B_batch * H, -1)       # (B*H, L)
+    u_t = actions_seq.reshape(B_batch * H, -1)          # (B*H, A)
+    z_pred = model.predict(z_t, u_t)                    # (B*H, L)
+
+    z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)  # (B*H, L)
+    return F.mse_loss(z_pred, z_target)
+
+
+def build_loss_fns(cfg, model):
+    """Build a dict of {name: (loss_fn, weight)} from config.
+
+    Each loss_fn has signature: fn(model, states_seq, actions_seq, all_states) -> scalar tensor.
+    The all_states arg is the pre-flattened (B*(H+1), S) tensor for losses that need it.
+
+    Returns:
+        dict of {name: (fn, weight)}
     """
+    losses = {}
+
+    # --- Always-on core losses ---
+    recon_w = cfg["recon_weight"]
+    pred_w = cfg["pred_weight"]
+    lc_w = cfg.get("latent_consistency_weight", 1.0)
+    vectorize = cfg.get("vectorize_rollout", False)
+
+    def _recon(model, states_seq, actions_seq, all_states):
+        all_z = model.encode(all_states)
+        return F.mse_loss(model.decode(all_z), all_states)
+    losses["Recon"] = (_recon, recon_w)
+
+    def _pred(model, states_seq, actions_seq, all_states):
+        if vectorize:
+            return _pred_loss_vectorized(model, states_seq, actions_seq)
+        return _pred_loss_sequential(model, states_seq, actions_seq)
+    losses["Pred"] = (_pred, pred_w)
+
+    def _lc(model, states_seq, actions_seq, all_states):
+        return latent_consistency_loss(model, states_seq, actions_seq)
+    losses["LC"] = (_lc, lc_w)
+
+    # --- Optional losses (enabled by config bool + weight) ---
+
+    if cfg.get("controllability_loss", False):
+        horizon = cfg["horizon"]
+        def _ctrl(model, states_seq, actions_seq, all_states):
+            return controllability_loss(model.A, model.B_matrix, horizon=horizon)
+        losses["Ctrl"] = (_ctrl, cfg["ctrl_weight"])
+
+    if cfg.get("bi_lipschitz_loss", False):
+        m_target = cfg.get("bilip_m_target", 0.5)
+        def _bilip(model, states_seq, actions_seq, all_states):
+            return bi_lipschitz_loss(model.encode, all_states.detach(), m_target=m_target)
+        losses["BiLip"] = (_bilip, cfg["bilip_weight"])
+
+    if cfg.get("spectral_loss", False):
+        def _spec(model, states_seq, actions_seq, all_states):
+            return spectral_loss(model.A)
+        losses["Spec"] = (_spec, cfg["spectral_weight"])
+
+    if cfg.get("normality_loss", False):
+        def _norm(model, states_seq, actions_seq, all_states):
+            return normality_loss(model.A)
+        losses["Norm"] = (_norm, cfg["normality_weight"])
+
+    if cfg.get("cl_normality_loss", False):
+        latent_dim = cfg["latent_dim"]
+        action_dim = cfg["action_dim"]
+        cl_Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
+        cl_R = torch.eye(action_dim) * cfg.get("r_scale", 1.0)
+        def _cl_norm(model, states_seq, actions_seq, all_states):
+            return closed_loop_normality_loss(model.A, model.B_matrix, cl_Q, cl_R)
+        losses["CLNorm"] = (_cl_norm, cfg["cl_normality_weight"])
+
+    if cfg.get("b_eigen_loss", False) and hasattr(model.K_module, 'b_eigen'):
+        min_scale = cfg.get("b_eigen_min_scale", 0.1)
+        def _beig(model, states_seq, actions_seq, all_states):
+            return b_eigen_loss(model.K_module.b_eigen, min_scale=min_scale)
+        losses["BEig"] = (_beig, cfg["b_eigen_weight"])
+
+    if cfg.get("eig_spread_loss", False) and hasattr(model.K_module, 'log_d'):
+        min_gap = cfg.get("eig_spread_min_gap", 0.1)
+        rho = cfg.get("rho", 1.0)
+        def _espread(model, states_seq, actions_seq, all_states):
+            return eigenvalue_spread_loss(model.K_module.log_d, rho, min_gap=min_gap)
+        losses["ESprd"] = (_espread, cfg["eig_spread_weight"])
+
+    if cfg.get("unstable_ctrl_loss", False):
+        uc_threshold = cfg.get("unstable_ctrl_threshold", 1.0)
+        def _uctrl(model, states_seq, actions_seq, all_states):
+            return unstable_controllability_loss(model.A, model.B_matrix, threshold=uc_threshold)
+        losses["UCtrl"] = (_uctrl, cfg["unstable_ctrl_weight"])
+
+    if cfg.get("upper_lipschitz_loss", False):
+        m_max = cfg.get("upper_lip_m_max", 1.0)
+        def _ulip(model, states_seq, actions_seq, all_states):
+            return upper_lipschitz_loss(model.encode, all_states.detach(), m_max=m_max)
+        losses["ULip"] = (_ulip, cfg["upper_lip_weight"])
+
+    return losses
+
+
+def compute_loss(model, states_seq, actions_seq, loss_fns):
+    """Compute all losses and return total + individual values.
+
     Args:
         model: KoopmanAutoencoder
         states_seq: (B, H+1, state_dim)
         actions_seq: (B, H, action_dim)
-        vectorize_rollout: if True, use closed-form vectorized prediction
+        loss_fns: dict from build_loss_fns
+
     Returns:
-        total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss,
-        norm_loss, cl_norm_loss, beig_loss, ulip_loss
+        total_loss: scalar tensor
+        losses: dict of {name: scalar tensor}
     """
     B, Hp1, S = states_seq.shape
-    H = Hp1 - 1
-
-    # Reconstruction loss: encode + decode all states in the window
     all_states = states_seq.reshape(B * Hp1, S)
-    all_z = model.encode(all_states)
-    all_recon = model.decode(all_z)
-    recon_loss = F.mse_loss(all_recon, all_states)
 
-    # Multi-step prediction loss
-    if vectorize_rollout:
-        pred_loss = _pred_loss_vectorized(model, states_seq, actions_seq)
-    else:
-        pred_loss = _pred_loss_sequential(model, states_seq, actions_seq)
+    total_loss = torch.tensor(0.0, device=states_seq.device)
+    losses = {}
+    for name, (fn, weight) in loss_fns.items():
+        val = fn(model, states_seq, actions_seq, all_states)
+        losses[name] = val
+        total_loss = total_loss + weight * val
 
-    total_loss = recon_weight * recon_loss + pred_weight * pred_loss
-
-    if ctrl_weight > 0:
-        ctrl_loss = controllability_loss(model.A, model.B_matrix, horizon=ctrl_horizon)
-        total_loss = total_loss + ctrl_weight * ctrl_loss
-    else:
-        ctrl_loss = torch.tensor(0.0, device=all_states.device)
-
-    if bilip_weight > 0:
-        bilip_loss_val = bi_lipschitz_loss(model.encode, all_states.detach(), m_target=bilip_m_target)
-        total_loss = total_loss + bilip_weight * bilip_loss_val
-    else:
-        bilip_loss_val = torch.tensor(0.0, device=all_states.device)
-
-    if spectral_weight > 0:
-        spec_loss_val = spectral_loss(model.A)
-        total_loss = total_loss + spectral_weight * spec_loss_val
-    else:
-        spec_loss_val = torch.tensor(0.0, device=all_states.device)
-
-    if normality_weight > 0:
-        norm_loss_val = normality_loss(model.A)
-        total_loss = total_loss + normality_weight * norm_loss_val
-    else:
-        norm_loss_val = torch.tensor(0.0, device=all_states.device)
-
-    if cl_normality_weight > 0:
-        cl_norm_loss_val = closed_loop_normality_loss(model.A, model.B_matrix, cl_norm_Q, cl_norm_R)
-        total_loss = total_loss + cl_normality_weight * cl_norm_loss_val
-    else:
-        cl_norm_loss_val = torch.tensor(0.0, device=all_states.device)
-
-    if b_eigen_weight > 0 and hasattr(model.K_module, 'b_eigen'):
-        beig_loss_val = b_eigen_loss(model.K_module.b_eigen, min_scale=b_eigen_min_scale)
-        total_loss = total_loss + b_eigen_weight * beig_loss_val
-    else:
-        beig_loss_val = torch.tensor(0.0, device=all_states.device)
-
-    if eig_spread_weight > 0 and hasattr(model.K_module, 'log_d'):
-        espread_loss_val = eigenvalue_spread_loss(model.K_module.log_d, min_gap=eig_spread_min_gap)
-        total_loss = total_loss + eig_spread_weight * espread_loss_val
-    else:
-        espread_loss_val = torch.tensor(0.0, device=all_states.device)
-
-    if upper_lip_weight > 0:
-        ulip_loss_val = upper_lipschitz_loss(model.encode, all_states.detach(), m_max=upper_lip_m_max)
-        total_loss = total_loss + upper_lip_weight * ulip_loss_val
-    else:
-        ulip_loss_val = torch.tensor(0.0, device=all_states.device)
-
-    return total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss_val, spec_loss_val, norm_loss_val, cl_norm_loss_val, beig_loss_val, espread_loss_val, ulip_loss_val
+    return total_loss, losses
 
 
 def train(model, trajectories, cfg):
@@ -346,49 +405,24 @@ def train(model, trajectories, cfg):
         model = torch.compile(model)
         print("Model compiled with torch.compile")
 
-    # 3. Training loop
+    # 3. Build loss functions from config
+    loss_fns = build_loss_fns(cfg, model)
+    active_names = list(loss_fns.keys())
+    print(f"Active losses: {', '.join(f'{n} (w={loss_fns[n][1]})' for n in active_names)}")
+
+    # 4. Training loop
     loss_threshold = cfg.get("loss_threshold", 0.001)
     for epoch in range(1, cfg["num_epochs"] + 1):
         model.train()
-        epoch_total, epoch_recon, epoch_pred, epoch_ctrl, epoch_bilip, epoch_spec, epoch_norm, epoch_cl_norm, epoch_beig, epoch_espread, epoch_ulip, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
-        ctrl_weight = cfg.get("ctrl_weight", 0.0) if cfg.get("controllability_loss", False) else 0.0
-        bilip_weight = cfg.get("bilip_weight", 0.0) if cfg.get("bi_lipschitz_loss", False) else 0.0
-        bilip_m_target = cfg.get("bilip_m_target", 0.5)
-        spectral_weight = cfg.get("spectral_weight", 0.0) if cfg.get("spectral_loss", False) else 0.0
-        normality_weight = cfg.get("normality_weight", 0.0) if cfg.get("normality_loss", False) else 0.0
-        cl_normality_weight = cfg.get("cl_normality_weight", 0.0) if cfg.get("cl_normality_loss", False) else 0.0
-        b_eigen_weight = cfg.get("b_eigen_weight", 0.0) if cfg.get("b_eigen_loss", False) else 0.0
-        b_eigen_min_scale = cfg.get("b_eigen_min_scale", 0.1)
-        eig_spread_weight = cfg.get("eig_spread_weight", 0.0) if cfg.get("eig_spread_loss", False) else 0.0
-        eig_spread_min_gap = cfg.get("eig_spread_min_gap", 0.1)
-        upper_lip_weight = cfg.get("upper_lip_weight", 0.0) if cfg.get("upper_lipschitz_loss", False) else 0.0
-        upper_lip_m_max = cfg.get("upper_lip_m_max", 1.0)
-
-        # Precompute Q and R for closed-loop normality loss
-        if cl_normality_weight > 0:
-            latent_dim = cfg["latent_dim"]
-            action_dim = cfg["action_dim"]
-            cl_norm_Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
-            cl_norm_R = torch.eye(action_dim) * cfg.get("r_scale", 1.0)
-        else:
-            cl_norm_Q, cl_norm_R = None, None
+        epoch_accum = {name: 0.0 for name in active_names}
+        epoch_total = 0.0
+        n_batches = 0
 
         for states_seq, actions_seq in loader:
             states_seq = states_seq.to(device)
             actions_seq = actions_seq.to(device)
 
-            total_loss, recon_loss, pred_loss, ctrl_loss, bilip_loss, spec_loss, norm_loss, cl_norm_loss, beig_loss, espread_loss, ulip_loss = compute_loss(
-                model, states_seq, actions_seq,
-                cfg["recon_weight"], cfg["pred_weight"],
-                ctrl_weight=ctrl_weight, ctrl_horizon=cfg["horizon"],
-                bilip_weight=bilip_weight, bilip_m_target=bilip_m_target,
-                spectral_weight=spectral_weight, normality_weight=normality_weight,
-                cl_normality_weight=cl_normality_weight, cl_norm_Q=cl_norm_Q, cl_norm_R=cl_norm_R,
-                b_eigen_weight=b_eigen_weight, b_eigen_min_scale=b_eigen_min_scale,
-                eig_spread_weight=eig_spread_weight, eig_spread_min_gap=eig_spread_min_gap,
-                upper_lip_weight=upper_lip_weight, upper_lip_m_max=upper_lip_m_max,
-                vectorize_rollout=cfg.get("vectorize_rollout", False),
-            )
+            total_loss, losses = compute_loss(model, states_seq, actions_seq, loss_fns)
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -398,46 +432,19 @@ def train(model, trajectories, cfg):
                 model.K_module.project()
 
             epoch_total += total_loss.item()
-            epoch_recon += recon_loss.item()
-            epoch_pred += pred_loss.item()
-            epoch_ctrl += ctrl_loss.item()
-            epoch_bilip += bilip_loss.item()
-            epoch_spec += spec_loss.item()
-            epoch_norm += norm_loss.item()
-            epoch_cl_norm += cl_norm_loss.item()
-            epoch_beig += beig_loss.item()
-            epoch_espread += espread_loss.item()
-            epoch_ulip += ulip_loss.item()
+            for name in active_names:
+                epoch_accum[name] += losses[name].item()
             n_batches += 1
 
         scheduler.step()
 
         avg_total = epoch_total / n_batches
         if epoch % cfg["log_interval"] == 0 or epoch == 1:
-            msg = (
-                f"Epoch {epoch:4d} | "
-                f"Total: {avg_total:.6f} | "
-                f"Recon: {epoch_recon / n_batches:.6f} | "
-                f"Pred:  {epoch_pred / n_batches:.6f}"
-            )
-            if ctrl_weight > 0:
-                msg += f" | Ctrl: {epoch_ctrl / n_batches:.6f}"
-            if spectral_weight > 0:
-                msg += f" | Spec: {epoch_spec / n_batches:.6f}"
-            if normality_weight > 0:
-                msg += f" | Norm: {epoch_norm / n_batches:.6f}"
-            if cl_normality_weight > 0:
-                msg += f" | CLNorm: {epoch_cl_norm / n_batches:.6f}"
-            if b_eigen_weight > 0:
-                msg += f" | BEig: {epoch_beig / n_batches:.6f}"
-            if eig_spread_weight > 0:
-                msg += f" | ESprd: {epoch_espread / n_batches:.6f}"
-            if bilip_weight > 0:
-                msg += f" | BiLip: {epoch_bilip / n_batches:.6f}"
-            if upper_lip_weight > 0:
-                msg += f" | ULip: {epoch_ulip / n_batches:.6f}"
-            msg += f" | LR: {scheduler.get_last_lr()[0]:.2e}"
-            print(msg)
+            parts = [f"Epoch {epoch:4d} | Total: {avg_total:.6f}"]
+            for name in active_names:
+                parts.append(f"{name}: {epoch_accum[name] / n_batches:.6f}")
+            parts.append(f"LR: {scheduler.get_last_lr()[0]:.2e}")
+            print(" | ".join(parts))
 
         if avg_total < loss_threshold:
             print(f"Early stop: total loss {avg_total:.6f} < threshold {loss_threshold}")
@@ -446,24 +453,8 @@ def train(model, trajectories, cfg):
     # Final loss summary
     print("\n--- Training Complete ---")
     print(f"  Total: {epoch_total / n_batches:.6f}")
-    print(f"  Recon: {epoch_recon / n_batches:.6f}")
-    print(f"  Pred:  {epoch_pred / n_batches:.6f}")
-    if ctrl_weight > 0:
-        print(f"  Ctrl:  {epoch_ctrl / n_batches:.6f}")
-    if spectral_weight > 0:
-        print(f"  Spec:  {epoch_spec / n_batches:.6f}")
-    if normality_weight > 0:
-        print(f"  Norm:   {epoch_norm / n_batches:.6f}")
-    if cl_normality_weight > 0:
-        print(f"  CLNorm: {epoch_cl_norm / n_batches:.6f}")
-    if b_eigen_weight > 0:
-        print(f"  BEig:  {epoch_beig / n_batches:.6f}")
-    if eig_spread_weight > 0:
-        print(f"  ESprd: {epoch_espread / n_batches:.6f}")
-    if bilip_weight > 0:
-        print(f"  BiLip: {epoch_bilip / n_batches:.6f}")
-    if upper_lip_weight > 0:
-        print(f"  ULip:  {epoch_ulip / n_batches:.6f}")
+    for name in active_names:
+        print(f"  {name:>6s}: {epoch_accum[name] / n_batches:.6f}")
     print(f"  Epochs: {epoch}/{cfg['num_epochs']}")
 
     return model

@@ -32,7 +32,7 @@ hold_steps: 5  # number of steps to hold each sampled perturbation before resamp
 use_eigen_bound: false  # spectral radius / transient constant bound
 use_lyapunov_bound: true  # Lyapunov-based bound
 q_scale: 100
-r_scale: 0.001
+r_scale: 0.01
 max_tracking_error_x: 0.5 #0.3 # define by success bounds (1-cos(15), sin(15), 1)
 max_displacement_x: 0.1 #0.57 # define as maximum possible displacement of system (0.4, 0.4, 0.8)
 

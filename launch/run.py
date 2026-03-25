@@ -494,7 +494,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
              transform=ax3.transAxes, ha='center', fontsize=9)
     fig3.tight_layout()
     folder_name = os.path.basename(os.path.normpath(phase_dir))
-    heatmap_name = f"{folder_name}_heatmap.png"
+    heatmap_name = f"eigen_heatmap.png"
     fig3.savefig(os.path.join(phase_dir, heatmap_name), dpi=150)
     plt.close(fig3)
     print(f"Saved {heatmap_name}")
@@ -514,12 +514,195 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
         "A": A.numpy().tolist(),
         "B": B_mat.numpy().tolist(),
     }
-    stats_path = os.path.join(phase_dir, "variables.yaml")
+    stats_path = os.path.join(phase_dir, "eigen_variables.yaml")
     with open(stats_path, "w") as f:
         yaml.dump(variables, f, default_flow_style=False, sort_keys=False)
     print(f"Variables saved to {stats_path}")
 
     print(f"Phase 3 complete. Results in {phase_dir}")
+    return variables
+
+
+def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
+                     tuning_config=None):
+    """Phase 3 (Lyapunov): compute stability variables using Lyapunov bound."""
+    import math
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm, LinearSegmentedColormap
+
+    print("\n" + "=" * 60)
+    print("  Phase 3: Lyapunov Stability Analysis")
+    print("=" * 60)
+    os.makedirs(phase_dir, exist_ok=True)
+
+    from controllers.lqr import LQR
+    from model.utils import (compute_lower_lipschitz,
+                             state_error_to_latent_error)
+
+    # Override tuning parameters from external config if provided
+    if tuning_config is not None:
+        with open(tuning_config) as f:
+            tune_cfg = yaml.safe_load(f)
+        for key in ("q_scale", "r_scale", "max_tracking_error_x", "max_displacement_x"):
+            if key in tune_cfg:
+                cfg[key] = tune_cfg[key]
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    # Extract A and B from trained model
+    A = model.A.detach().cpu()
+    B_mat = model.B_matrix.detach().cpu()
+
+    # =====================================================================
+    #  Control Analysis
+    # =====================================================================
+    print("\n" + "=" * 50)
+    print("  Control Analysis")
+    print("=" * 50)
+
+    A_np = A.numpy()
+    B_np = B_mat.numpy()
+    C_mat = np.hstack([np.linalg.matrix_power(A_np, i) @ B_np
+                       for i in range(A_np.shape[0])])
+    ctrl_rank = np.linalg.matrix_rank(C_mat)
+    print(f"  Controllability rank:                  {ctrl_rank} / {A_np.shape[0]}")
+
+    eigenvalues, V = torch.linalg.eig(A)
+    unstable_mask = eigenvalues.abs() > 1.0
+    if unstable_mask.any():
+        for i, (ev, unstable) in enumerate(zip(eigenvalues, unstable_mask)):
+            if unstable:
+                proj = (V[:, i].conj() @ B_mat.to(torch.cfloat)).abs()
+                print(f"      Unstable mode λ={ev.abs():.4f}, B projection={proj.item():.4f}")
+    else:
+        print("      No unstable modes detected")
+
+    # =====================================================================
+    #  Latent / X-Space Relations
+    # =====================================================================
+    print("\n" + "=" * 50)
+    print("  Latent / X-Space Relations")
+    print("=" * 50)
+
+    # Encoder lower Lipschitz bound (m)
+    model_cpu = model.cpu()
+    training_states = []
+    for states, actions in aug_trajectories:
+        for s in states:
+            training_states.append(s)
+    m = compute_lower_lipschitz(model_cpu.encode, training_states)
+    model.to(device)
+
+    max_tracking_error_x = cfg["max_tracking_error_x"]
+    max_displacement_x = cfg["max_displacement_x"]
+
+    max_tracking_error_latent = state_error_to_latent_error(max_tracking_error_x, m)
+    eta = state_error_to_latent_error(max_displacement_x, m)
+
+    print(f"  max_tracking_error_x:                  {max_tracking_error_x:.6f}")
+    print(f"  max_tracking_error_latent (ε_max):     {max_tracking_error_latent:.6f}")
+    print(f"  max_displacement_x:                    {max_displacement_x:.6f}")
+    print("  " + "-" * 48)
+    # Color m: red if <0.5 or >1.5
+    if m < 0.5 or m > 1.5:
+        print(f"\033[91m  Encoder lower Lipschitz (m):           {m:.6f}\033[0m")
+    else:
+        print(f"  Encoder lower Lipschitz (m):           {m:.6f}")
+    print(f"  eta (m * max_displacement_x):          {eta:.6f}")
+
+    # =====================================================================
+    #  LQR Stability
+    # =====================================================================
+    print("\n" + "=" * 50)
+    print("  LQR Stability")
+    print("=" * 50)
+
+    latent_dim = cfg["latent_dim"]
+    action_dim = cfg["action_dim"]
+    Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
+    R = torch.eye(action_dim) * cfg["r_scale"]
+    lqr = LQR(A, B_mat, Q, R)
+    gain_norm = lqr.gain_norm.item()
+    P = lqr.P
+
+    # Condition number of P
+    P_eigvals = torch.linalg.eigvalsh(P)
+    kappa_P = (P_eigvals.max() / P_eigvals.min()).item()
+
+    # Lyapunov contraction rate
+    Q_eigvals = torch.linalg.eigvalsh(Q)
+    rho_sq = 1.0 - Q_eigvals.min().item() / P_eigvals.max().item()
+
+    # Lyapunov delta_max
+    delta_max_lyap = math.sqrt(max(max_tracking_error_latent**2 * (1.0 - rho_sq) / kappa_P, 0.0)) - eta
+
+    print(f"  Q scale:                               {cfg.get('q_scale', 1.0)}")
+    print(f"  R scale:                               {cfg['r_scale']}")
+    print(f"  LQR gain norm (||F||):                 {gain_norm:.6f}")
+    residual_ctrl_budget = max_tracking_error_latent * gain_norm
+    print(f"  Residual ctrl budget:                  {residual_ctrl_budget:.6f} N-m")
+    print(f"  κ(P) = λ_max(P)/λ_min(P):             {kappa_P:.6f}")
+    print(f"  ρ² (Lyapunov):                         {rho_sq:.6f}")
+    if delta_max_lyap < 0:
+        print(f"\033[91m  δ_max (Lyapunov):                      {delta_max_lyap:.6f}\033[0m")
+    else:
+        print(f"\033[92m  δ_max (Lyapunov):                      {delta_max_lyap:.6f}\033[0m")
+
+    # Heatmap: delta_max_lyap over (max_tracking_error_x, max_displacement_x)
+    n_heatmap = 200
+    track_sweep = np.linspace(0.0, 1.0, n_heatmap)
+    disp_sweep = np.linspace(0.0, 1.0, n_heatmap)
+    Z = np.zeros((n_heatmap, n_heatmap))
+    for i, d in enumerate(disp_sweep):
+        for j, t in enumerate(track_sweep):
+            eps_lat = state_error_to_latent_error(t, m)
+            eta_lat = state_error_to_latent_error(d, m)
+            Z[i, j] = math.sqrt(max(eps_lat**2 * (1.0 - rho_sq) / kappa_P, 0.0)) - eta_lat
+
+    norm = TwoSlopeNorm(vmin=Z.min(), vcenter=0, vmax=max(Z.max(), 1e-6))
+    fig, ax = plt.subplots(figsize=(8, 6))
+    cmap = LinearSegmentedColormap.from_list("RdWtGn", ["red", "white", "green"])
+    im = ax.imshow(Z, origin='lower', aspect='auto',
+                   extent=[0, 1, 0, 1], norm=norm, cmap=cmap)
+    cbar = fig.colorbar(im, ax=ax, label="δ_max (Lyapunov)")
+    cbar.set_ticks([Z.min(), 0, Z.max()])
+    cbar.set_ticklabels([f"{Z.min():.4f}", "0", f"{Z.max():.4f}"])
+    ax.plot(max_tracking_error_x, max_displacement_x, 'bx', markersize=10, markeredgewidth=2)
+    ax.set_xlabel("max_tracking_error_x")
+    ax.set_ylabel("max_displacement_x")
+    ax.set_title("Lyapunov δ_max Heatmap")
+    ax.text(0.5, -0.12,
+            f"κ(P)={kappa_P:.4f}  ρ²={rho_sq:.4f}  m={m:.4f}  Q={cfg.get('q_scale', 1.0)}  R={cfg['r_scale']}",
+            transform=ax.transAxes, ha='center', fontsize=9)
+    fig.tight_layout()
+    folder_name = os.path.basename(os.path.normpath(phase_dir))
+    heatmap_name = "lyapunov_heatmap.png"
+    fig.savefig(os.path.join(phase_dir, heatmap_name), dpi=150)
+    plt.close(fig)
+    print(f"Saved {heatmap_name}")
+
+    # Save
+    variables = {
+        "m": float(m),
+        "gain_norm": float(gain_norm),
+        "kappa_P": float(kappa_P),
+        "rho_sq_lyapunov": float(rho_sq),
+        "max_tracking_error_x": float(max_tracking_error_x),
+        "max_displacement_x": float(max_displacement_x),
+        "max_tracking_error_latent": float(max_tracking_error_latent),
+        "eta": float(eta),
+        "delta_max_lyapunov": float(delta_max_lyap),
+        "ctrl_rank": int(ctrl_rank),
+        "A": A.numpy().tolist(),
+        "B": B_mat.numpy().tolist(),
+    }
+    stats_path = os.path.join(phase_dir, "lyapunov_variables.yaml")
+    with open(stats_path, "w") as f:
+        yaml.dump(variables, f, default_flow_style=False, sort_keys=False)
+    print(f"Variables saved to {stats_path}")
+
+    print(f"Phase 3 (Lyapunov) complete. Results in {phase_dir}")
     return variables
 
 
@@ -584,7 +767,11 @@ def main():
     aug_trajectories = phase_2_train_B(model, env, policy, cfg, run_dir, augment, obs_scale,
                                        act_scale)
     stability_dir = os.path.join(run_dir, "stability")
-    variables = phase_3_compute_variables(model, cfg, stability_dir, aug_trajectories)
+    variables = {}
+    if cfg.get("use_eigen_bound", False):
+        variables.update(phase_3_compute_variables(model, cfg, stability_dir, aug_trajectories))
+    if cfg.get("use_lyapunov_bound", False):
+        variables.update(phase_3_lyapunov(model, cfg, stability_dir, aug_trajectories))
 
     env.close()
     print(f"\n=== Pipeline complete. All outputs in {run_dir} ===")

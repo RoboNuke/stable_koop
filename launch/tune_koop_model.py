@@ -21,6 +21,7 @@ from launch.run import (
     collect_perturbed_data,
     augment_perturbed_trajectories,
     phase_3_compute_variables,
+    phase_3_lyapunov,
     save_config,
 )
 from model.autoencoder import KoopmanAutoencoder
@@ -100,9 +101,22 @@ def main():
     aug_trajectories = augment_perturbed_trajectories(
         trajectories, augment=augment, obs_scale=obs_scale)
 
+    # Override tuning parameters from the --config file
+    with open(args.config) as f:
+        tune_cfg = yaml.safe_load(f)
+    for key in ("use_eigen_bound", "use_lyapunov_bound",
+                "q_scale", "r_scale", "max_tracking_error_x", "max_displacement_x"):
+        if key in tune_cfg:
+            cfg[key] = tune_cfg[key]
+
     # Phase 3: compute stability variables
-    variables = phase_3_compute_variables(model, cfg, run_dir, aug_trajectories,
-                                          tuning_config=args.config)
+    variables = {}
+    if cfg.get("use_eigen_bound", False):
+        variables.update(phase_3_compute_variables(model, cfg, run_dir, aug_trajectories,
+                                                   tuning_config=args.config))
+    if cfg.get("use_lyapunov_bound", False):
+        variables.update(phase_3_lyapunov(model, cfg, run_dir, aug_trajectories,
+                                          tuning_config=args.config))
 
     env.close()
     print(f"\n=== Done. All outputs in {run_dir} ===")
