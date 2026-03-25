@@ -73,6 +73,10 @@ b_eigen_loss: True
 b_eigen_weight: 1.0
 b_eigen_min_scale: 0.3
 
+b_scale_loss: false
+b_scale_weight: 1.0
+b_scale_target: 1.0
+
 eig_spread_loss: True
 eig_spread_weight: 1.0
 eig_spread_min_gap: 0.1
@@ -93,6 +97,24 @@ eval_seed: 42
 success_angle_deg: 15.0
 success_max_thdot: 1.0
 success_hold_steps: 20
+
+# Residual Policy (SAC)
+residual_z_ref_limit: 1.0
+residual_num_envs: 8
+residual_total_timesteps: 100000
+residual_eval_interval: 5000
+residual_batch_size: 256
+residual_lr: 3.0e-4
+residual_actor_hidden_size: 64
+residual_actor_hidden_layers: 2
+residual_critic_hidden_size: 256
+residual_critic_hidden_layers: 2
+residual_gamma: 0.99
+residual_tau: 0.005
+residual_initial_entropy_value: 1.0
+residual_random_timesteps: 1000
+residual_learning_starts: 1000
+residual_memory_size: 100000
 
 # Logging / checkpointing
 log_interval: 10

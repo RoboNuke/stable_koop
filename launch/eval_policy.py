@@ -6,14 +6,17 @@ import numpy as np
 import yaml
 
 sys.path.insert(0, ".")
-from launch.train_pendulum import pd_policy
+from launch.train_pendulum import pd_policy, energy_shaping_policy, bang_energy_policy
 
 
 def make_policy(cfg):
     """Build the policy callable from config. Extension point for residual policies."""
     kp, kd = cfg["kp"], cfg["kd"]
-    print(f"Using kp={kp} and kd={kd}")
-    return lambda obs: pd_policy(obs, kp, kd)
+    ke = cfg["ke"]
+    sa = cfg['sa'] * 3.14159/180
+    print(f"Using kp={kp} and kd={kd} and ke={ke} and switch_angle={sa}")
+    #return lambda obs: pd_policy(obs, kp, kd)
+    return lambda obs: bang_energy_policy(obs, kp, kd, ke, switch_angle=sa)
 
 
 def check_success(states, cfg):
@@ -31,17 +34,19 @@ def check_success(states, cfg):
 
 
 def rollout(env, policy, max_steps, cfg):
-    """Run one episode, terminating early on success. Returns (states, actions, success)."""
+    """Run one episode, terminating early on success. Returns (states, actions, success, total_reward)."""
     obs, _ = env.reset()
     states = [obs]
     actions = []
+    total_reward = 0.0
     success = False
     for _ in range(max_steps):
         action = policy(obs) if policy is not None else env.action_space.sample()
-        obs, _, terminated, truncated, _ = env.step(action)
+        obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
         states.append(obs)
         actions.append(action)
+        total_reward += reward
         if check_success(states, cfg):
             success = True
             break
@@ -49,7 +54,7 @@ def rollout(env, policy, max_steps, cfg):
             break
     return (np.array(states, dtype=np.float32),
             np.array(actions, dtype=np.float32).reshape(-1, 1),
-            success)
+            success, total_reward)
 
 
 def compute_trajectory_metrics(states, actions):
@@ -64,6 +69,7 @@ def compute_trajectory_metrics(states, actions):
         "energy": float(np.mean(energy)),
         "control_torque": float(np.mean(np.abs(actions))),
         "angular_velocity": float(np.mean(np.abs(thdot))),
+        "reward": 0.0,  # placeholder, filled by evaluate()
     }
 
 
@@ -71,7 +77,7 @@ def group_stats(metrics_list):
     """Compute mean and std for each metric across a list of per-trajectory dicts."""
     if not metrics_list:
         return {k: {"mean": 0.0, "std": 0.0}
-                for k in ["length", "energy", "control_torque", "angular_velocity"]}
+                for k in ["length", "energy", "control_torque", "angular_velocity", "reward"]}
     stats = {}
     for key in metrics_list[0]:
         vals = np.array([m[key] for m in metrics_list])
@@ -90,7 +96,7 @@ def print_stats_table(results):
     print(header)
     print("-" * len(header))
 
-    for key in ["length", "energy", "control_torque", "angular_velocity"]:
+    for key in ["length", "energy", "control_torque", "angular_velocity", "reward"]:
         parts = []
         for group in ["combined", "success", "failure"]:
             m = results[group][key]["mean"]
@@ -112,11 +118,12 @@ def evaluate(env, policy, cfg):
     all_metrics = []
 
     for i in range(num_traj):
-        states, actions, success = rollout(env, policy, max_steps, cfg)
+        states, actions, success, total_reward = rollout(env, policy, max_steps, cfg)
         all_states.append(states)
         all_actions.append(actions)
 
         metrics = compute_trajectory_metrics(states, actions)
+        metrics["reward"] = float(total_reward)
         all_metrics.append(metrics)
 
         if success:
@@ -152,7 +159,8 @@ if __name__ == "__main__":
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    env = gym.make(cfg["env_name"])
+    render_mode = "human" if args.render else None
+    env = gym.make(cfg["env_name"], render_mode=render_mode)
     np.random.seed(cfg["eval_seed"])
     policy = make_policy(cfg)
 
@@ -165,7 +173,7 @@ if __name__ == "__main__":
             states = [obs]
             success = False
             for t in range(max_steps):
-                env.render(mode="human")
+                env.render()
                 action = policy(obs)
                 obs, _, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated

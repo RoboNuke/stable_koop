@@ -244,6 +244,7 @@ def phase_0_base_eval(env, policy, cfg, run_dir):
     save_eval_results(results, all_states, all_actions, phase_dir)
 
     print(f"Phase 0 complete. Results in {phase_dir}")
+    return results
 
 
 def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_scale=None,
@@ -520,7 +521,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
     print(f"Variables saved to {stats_path}")
 
     print(f"Phase 3 complete. Results in {phase_dir}")
-    return variables
+    return variables, lqr
 
 
 def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
@@ -624,6 +625,7 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     R = torch.eye(action_dim) * cfg["r_scale"]
     scale_B=True
     if scale_B:
+        print("Scaling B")
         B_scale = torch.norm(B_mat, p=2)
         B_norm = B_mat / B_scale
         lqr = LQR(A, B_norm, Q, R)
@@ -645,11 +647,23 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
 
     print(f"  Q scale:                               {cfg.get('q_scale', 1.0)}")
     print(f"  R scale:                               {cfg['r_scale']}")
+    BtPB = (B_mat.T @ P @ B_mat).item()
+    print(f"  B^T P B:                               {BtPB:.6f}")
     print(f"  LQR gain norm (||F||):                 {gain_norm:.6f}")
     residual_ctrl_budget = max_tracking_error_latent * gain_norm
     if scale_B:
         residual_ctrl_budget /= B_scale
-    print(f"  Residual ctrl budget:                  {residual_ctrl_budget:.6f} N-m")
+    if residual_ctrl_budget > 0.5:
+        print(f"\033[92m  Residual ctrl budget:                  {residual_ctrl_budget:.6f} N-m\033[0m")
+    else:
+        print(f"  Residual ctrl budget:                  {residual_ctrl_budget:.6f} N-m")
+    # What max_tracking_error_x would give budget = 2 N-m?
+    if gain_norm > 0 and m > 0:
+        denom = m * gain_norm
+        if scale_B:
+            denom /= B_scale
+        tracking_x_for_2 = 2.0 / denom
+        print(f"  max_tracking_error_x for budget=2:     {tracking_x_for_2:.6f}")
     print(f"  κ(P) = λ_max(P)/λ_min(P):             {kappa_P:.6f}")
     print(f"  ρ² (Lyapunov):                         {rho_sq:.6f}")
     if delta_max_lyap < 0:
@@ -711,7 +725,72 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     print(f"Variables saved to {stats_path}")
 
     print(f"Phase 3 (Lyapunov) complete. Results in {phase_dir}")
-    return variables
+    return variables, lqr
+
+
+def phase_4_residual_policy(base_policy, lqr, cfg, run_dir):
+    """Phase 4: train residual policy with SAC. Returns trained actor model."""
+    print("\n=== Phase 4: Residual Policy Training ===")
+    from launch.train_residual import train_residual
+    return train_residual(base_policy, lqr, cfg, run_dir)
+
+
+def phase_5_final_eval(env, base_policy, residual_model, lqr, cfg, run_dir, baseline_results):
+    """Phase 5: evaluate combined policy and compare against Phase 0 baseline."""
+    print("\n=== Phase 5: Final Combined Policy Benchmark ===")
+    phase_dir = os.path.join(run_dir, "final_eval")
+
+    import torch
+
+    device = next(residual_model.parameters()).device
+    lqr_F_np = lqr.F.numpy().astype(np.float32)
+    residual_model.eval()
+
+    def composite_policy(obs):
+        base_action = base_policy(obs)
+        obs_aug = np.concatenate([obs, base_action]).astype(np.float32)
+        with torch.no_grad():
+            obs_t = torch.FloatTensor(obs_aug).unsqueeze(0).to(device)
+            z_ref = residual_model.act({"states": obs_t})[0]
+            z_ref_np = z_ref.cpu().numpy().flatten()
+        u_res = lqr_F_np @ z_ref_np
+        return np.clip(base_action + u_res, env.action_space.low, env.action_space.high)
+
+    results, all_states, all_actions = evaluate_policy(env, composite_policy, cfg)
+    save_eval_results(results, all_states, all_actions, phase_dir)
+
+    # Compare against baseline
+    # Green (improved) = lower for most metrics, higher for reward/success_rate
+    higher_is_better = {"reward", "success_rate"}
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    RESET = "\033[0m"
+
+    print(f"\n{'Metric':<25} {'Baseline':>12} {'Final':>12} {'Delta':>12}")
+    print("-" * 65)
+
+    # Success rate
+    base_sr = baseline_results["success_rate"]
+    final_sr = results["success_rate"]
+    delta_sr = final_sr - base_sr
+    color = GREEN if delta_sr >= 0 else RED
+    print(f"{'success_rate':<25} {base_sr:>11.1%} {final_sr:>11.1%} {color}{delta_sr:>+11.1%}{RESET}")
+
+    # Per-metric comparison
+    metrics = ["length", "energy", "control_torque", "angular_velocity", "reward"]
+    for key in metrics:
+        base_val = baseline_results["combined"][key]["mean"]
+        final_val = results["combined"][key]["mean"]
+        delta = final_val - base_val
+        if key in higher_is_better:
+            color = GREEN if delta >= 0 else RED
+        else:
+            color = GREEN if delta <= 0 else RED
+        print(f"{key:<25} {base_val:>12.3f} {final_val:>12.3f} {color}{delta:>+12.3f}{RESET}")
+
+    print()
+    print(f"Phase 5 complete. Results in {phase_dir}")
+    return results
 
 
 def main():
@@ -768,7 +847,7 @@ def main():
           f"latent_dim={cfg['latent_dim']}")
 
     # --- Execute phases ---
-    phase_0_base_eval(env, policy, cfg, run_dir)
+    baseline_results = phase_0_base_eval(env, policy, cfg, run_dir)
     if not args.skip_pretrain:
         phase_1_train_koopman(model, env, policy, cfg, run_dir, augment, obs_scale,
                               act_scale)
@@ -776,10 +855,23 @@ def main():
                                        act_scale)
     stability_dir = os.path.join(run_dir, "stability")
     variables = {}
+    lqr = None
     if cfg.get("use_eigen_bound", False):
-        variables.update(phase_3_compute_variables(model, cfg, stability_dir, aug_trajectories))
+        eigen_vars, lqr = phase_3_compute_variables(model, cfg, stability_dir, aug_trajectories)
+        variables.update(eigen_vars)
     if cfg.get("use_lyapunov_bound", False):
-        variables.update(phase_3_lyapunov(model, cfg, stability_dir, aug_trajectories))
+        lyap_vars, lyap_lqr = phase_3_lyapunov(model, cfg, stability_dir, aug_trajectories)
+        variables.update(lyap_vars)
+        if lqr is None:
+            lqr = lyap_lqr
+
+    # Phase 4: Residual policy training
+    # Phase 5: Final combined benchmark
+    if lqr is not None:
+        residual_model = phase_4_residual_policy(policy, lqr, cfg, run_dir)
+        phase_5_final_eval(env, policy, residual_model, lqr, cfg, run_dir, baseline_results)
+    else:
+        print("\nSkipping Phases 4-5: no LQR available (enable use_eigen_bound)")
 
     env.close()
     print(f"\n=== Pipeline complete. All outputs in {run_dir} ===")

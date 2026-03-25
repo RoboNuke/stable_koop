@@ -112,11 +112,13 @@ def main():
     # Phase 3: compute stability variables
     variables = {}
     if cfg.get("use_eigen_bound", False):
-        variables.update(phase_3_compute_variables(model, cfg, run_dir, aug_trajectories,
-                                                   tuning_config=args.config))
+        eigen_vars, _ = phase_3_compute_variables(model, cfg, run_dir, aug_trajectories,
+                                                   tuning_config=args.config)
+        variables.update(eigen_vars)
     if cfg.get("use_lyapunov_bound", False):
-        variables.update(phase_3_lyapunov(model, cfg, run_dir, aug_trajectories,
-                                          tuning_config=args.config))
+        lyap_vars, _ = phase_3_lyapunov(model, cfg, run_dir, aug_trajectories,
+                                         tuning_config=args.config)
+        variables.update(lyap_vars)
 
     env.close()
     print(f"\n=== Done. All outputs in {run_dir} ===")

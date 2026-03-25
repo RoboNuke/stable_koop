@@ -1,20 +1,43 @@
 import torch
 import torch.nn as nn
 
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 
-class ResidualMLP(nn.Module):
-    def __init__(self, obs_size=3, action_size=1, latent_size=16, num_layers=3):
-        super().__init__()
-        input_size = obs_size + action_size
-        layers = []
-        layers.append(nn.Linear(input_size, latent_size))
-        layers.append(nn.ReLU())
-        for _ in range(num_layers - 2):
-            layers.append(nn.Linear(latent_size, latent_size))
-            layers.append(nn.ReLU())
-        layers.append(nn.Linear(latent_size, action_size))
+
+class StochasticActor(GaussianMixin, Model):
+    def __init__(self, observation_space, action_space, device,
+                 clip_actions=False, clip_log_std=True,
+                 min_log_std=-20, max_log_std=2, reduction="sum",
+                 hidden_size=64, hidden_layers=2):
+        Model.__init__(self, observation_space, action_space, device)
+        GaussianMixin.__init__(self, clip_actions, clip_log_std,
+                               min_log_std, max_log_std, reduction)
+
+        layers = [nn.Linear(self.num_observations, hidden_size), nn.ReLU()]
+        for _ in range(hidden_layers - 1):
+            layers += [nn.Linear(hidden_size, hidden_size), nn.ReLU()]
+        self.net = nn.Sequential(*layers)
+        self.mean_layer = nn.Linear(hidden_size, self.num_actions)
+        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
+
+    def compute(self, inputs, role):
+        x = self.net(inputs["states"])
+        return self.mean_layer(x), self.log_std_parameter, {}
+
+
+class Critic(DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device,
+                 clip_actions=False, hidden_size=64, hidden_layers=2):
+        Model.__init__(self, observation_space, action_space, device)
+        DeterministicMixin.__init__(self, clip_actions)
+
+        input_size = self.num_observations + self.num_actions
+        layers = [nn.Linear(input_size, hidden_size), nn.ReLU()]
+        for _ in range(hidden_layers - 1):
+            layers += [nn.Linear(hidden_size, hidden_size), nn.ReLU()]
+        layers.append(nn.Linear(hidden_size, 1))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, obs, action):
-        x = torch.cat([obs, action], dim=-1)
-        return self.net(x)
+    def compute(self, inputs, role):
+        x = torch.cat([inputs["states"], inputs["taken_actions"]], dim=-1)
+        return self.net(x), {}

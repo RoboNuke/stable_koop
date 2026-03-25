@@ -26,6 +26,57 @@ def pd_policy(obs, kp, kd):
     u = -kp * theta - kd * thdot
     return np.array([np.clip(u, -2.0, 2.0)])
 
+def energy_shaping_policy(obs, kp=10.0, kd=3.0, k_e=2.0, switch_angle=0.7854): #0.9599):#1.0472):
+    """Energy-shaping swing-up + PD balance for Pendulum-v1.
+
+    Pendulum-v1 physics: m=1, l=1, g=10, I=ml^2/3=1/3, max_torque=2.
+    Energy: E = thdot^2/6 + 5*cos_th.  E_upright = 5 (theta=0, thdot=0).
+
+    Args:
+        switch_angle: radians, switch to PD balance when |theta| < this value.
+    """
+    cos_th, sin_th, thdot = obs
+    theta = np.arctan2(sin_th, cos_th)
+
+    E = thdot**2 / 6.0 + 5.0 * cos_th
+    E_target = 5.0  # energy at upright equilibrium
+
+    u_swing = k_e * thdot * (E_target - E)
+
+    # PD balance near upright
+    u_balance = -kp * theta - kd * thdot
+
+    near_top = abs(theta) < switch_angle
+    u = u_balance if near_top else u_swing
+    return np.array([np.clip(u, -2.0, 2.0)])
+
+def bang_energy_policy(obs, kp=10.0, kd=3.0, k_e=2.0, switch_angle=1.0472):
+    """Bang-bang energy shaping swing-up + PD balance for Pendulum-v1.
+
+    Uses sign-based energy pumping instead of continuous proportional control.
+    Pendulum-v1 physics: m=1, l=1, g=10, I=ml^2/3=1/3, max_torque=2.
+    Energy: E = thdot^2/6 + 5*cos_th.  E_upright = 5 (theta=0, thdot=0).
+
+    Args:
+        switch_angle: radians, switch to PD balance when |theta| < this value.
+    """
+    cos_th, sin_th, thdot = obs
+    theta = np.arctan2(sin_th, cos_th)
+
+    E = thdot**2 / 6.0 - 5.0 * cos_th
+    E_target = -5.0
+
+    if E < E_target:
+        u_swing = k_e * np.sign(thdot * cos_th)
+    else:
+        u_swing = -k_e * np.sign(thdot * cos_th) * 0.5
+
+    u_balance = -kp * theta - kd * thdot
+
+    near_top = abs(theta) < switch_angle
+    u = u_balance if near_top else u_swing
+    return np.array([np.clip(u, -2.0, 2.0)])
+
 
 def collect_data(env, num_trajectories, max_steps, seed, policy=None):
     """Collect trajectories using the given policy (random if None)."""
@@ -100,6 +151,12 @@ def upper_lipschitz_loss(encoder, x_batch, m_max=1.0):
 def b_eigen_loss(b_eigen, min_scale=0.1):
     """Penalize eigenbasis B components below min_scale."""
     return torch.relu(min_scale - b_eigen.abs()).mean()
+
+
+def b_scale_loss(B_matrix, target_scale=1.0):
+    """Penalize B spectral norm exceeding target_scale."""
+    current_scale = torch.norm(B_matrix, p=2)
+    return torch.relu(current_scale - target_scale)
 
 
 def eigenvalue_spread_loss(log_d, rho, min_gap=0.1):
@@ -314,6 +371,12 @@ def build_loss_fns(cfg, model):
         def _beig(model, states_seq, actions_seq, all_states):
             return b_eigen_loss(model.K_module.b_eigen, min_scale=min_scale)
         losses["BEig"] = (_beig, cfg["b_eigen_weight"])
+
+    if cfg.get("b_scale_loss", False):
+        target_scale = cfg.get("b_scale_target", 1.0)
+        def _bscale(model, states_seq, actions_seq, all_states):
+            return b_scale_loss(model.B_matrix, target_scale=target_scale)
+        losses["BScl"] = (_bscale, cfg["b_scale_weight"])
 
     if cfg.get("eig_spread_loss", False) and hasattr(model.K_module, 'log_d'):
         min_gap = cfg.get("eig_spread_min_gap", 0.1)

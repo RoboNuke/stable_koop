@@ -79,6 +79,10 @@ b_eigen_loss: false
 b_eigen_weight: 1.0
 b_eigen_min_scale: 0.3
 
+b_scale_loss: false
+b_scale_weight: 1.0
+b_scale_target: 1.0
+
 eig_spread_loss: false
 eig_spread_weight: 1.0
 eig_spread_min_gap: 0.1
