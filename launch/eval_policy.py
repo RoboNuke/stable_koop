@@ -106,26 +106,142 @@ def print_stats_table(results):
     print()
 
 
-def evaluate(env, policy, cfg):
-    """Run policy evaluation. Prints summary table. Returns (results, all_states, all_actions)."""
+def load_eval_stats(filepath):
+    """Load evaluation stats from a YAML file.
+
+    Args:
+        filepath: path to an eval_stats.yaml file
+
+    Returns:
+        results dict with the same structure as evaluate() returns
+    """
+    with open(filepath) as f:
+        return yaml.safe_load(f)
+
+
+def make_eval_env(cfg):
+    """Create eval env — vectorized if num_parallel_evals > 1, else single."""
+    env_name = cfg["env_name"]
+    num_envs = cfg.get("num_parallel_evals", 1)
+    if num_envs > 1:
+        return gym.vector.SyncVectorEnv(
+            [lambda en=env_name: gym.make(en) for _ in range(num_envs)]
+        )
+    return gym.make(env_name)
+
+
+def _vectorized_evaluate(vec_env, policy, cfg):
+    """Run evaluation using a vectorized env in waves.
+
+    Each wave resets all envs, runs up to max_steps, collects one trajectory
+    per env. Repeats until num_traj trajectories are collected.
+
+    Returns:
+        (all_states, all_actions, all_successes, all_rewards)
+    """
     num_traj = cfg["eval_num_trajectories"]
     max_steps = cfg["eval_max_steps"]
+    num_envs = vec_env.num_envs
 
     all_states = []
     all_actions = []
-    success_metrics = []
-    failure_metrics = []
-    all_metrics = []
+    all_successes = []
+    all_rewards = []
 
-    for i in range(num_traj):
-        states, actions, success, total_reward = rollout(env, policy, max_steps, cfg)
-        all_states.append(states)
-        all_actions.append(actions)
+    while len(all_states) < num_traj:
+        remaining = num_traj - len(all_states)
+        active_envs = min(num_envs, remaining)
 
+        obs_batch, _ = vec_env.reset()
+
+        # Per-env buffers
+        states = [[obs_batch[i].copy()] for i in range(num_envs)]
+        actions = [[] for _ in range(num_envs)]
+        rewards = [0.0] * num_envs
+        done_flags = [False] * num_envs
+        success_flags = [False] * num_envs
+
+        has_batch = hasattr(policy, 'batch') and callable(policy.batch)
+
+        for step in range(max_steps):
+            # Batch policy call
+            if policy is None:
+                action_batch = np.array([vec_env.single_action_space.sample()
+                                         for _ in range(num_envs)])
+            elif has_batch:
+                action_batch = policy.batch(obs_batch)
+            else:
+                action_batch = np.array([policy(obs_batch[i]) for i in range(num_envs)])
+
+            obs_batch, rew_batch, terminated, truncated, infos = vec_env.step(action_batch)
+            dones = terminated | truncated
+
+            for i in range(active_envs):
+                if done_flags[i]:
+                    continue
+
+                actions[i].append(action_batch[i].copy())
+                rewards[i] += float(rew_batch[i])
+
+                if dones[i]:
+                    # On auto-reset, obs_batch[i] is the NEW episode obs.
+                    # Use the last known obs + action to infer terminal state.
+                    # Since Pendulum-v1 truncates (not terminates), the
+                    # pre-step obs after applying the action IS the terminal obs.
+                    # We record obs_batch[i] from the auto-reset as a proxy —
+                    # but for correctness, we skip appending the post-reset obs
+                    # and just mark the trajectory as done with what we have.
+                    done_flags[i] = True
+                    success_flags[i] = check_success(states[i], cfg)
+                else:
+                    states[i].append(obs_batch[i].copy())
+                    if check_success(states[i], cfg):
+                        success_flags[i] = True
+                        done_flags[i] = True
+
+            if all(done_flags[:active_envs]):
+                break
+
+        # Collect from this wave
+        for i in range(active_envs):
+            if len(all_states) >= num_traj:
+                break
+            s = np.array(states[i], dtype=np.float32)
+            a = np.array(actions[i], dtype=np.float32).reshape(-1, 1) if actions[i] else np.empty((0, 1), dtype=np.float32)
+            all_states.append(s)
+            all_actions.append(a)
+            all_successes.append(success_flags[i])
+            all_rewards.append(rewards[i])
+
+    return all_states, all_actions, all_successes, all_rewards
+
+
+def evaluate(env, policy, cfg):
+    """Run policy evaluation. Prints summary table. Returns (results, all_states, all_actions).
+
+    Automatically detects vectorized envs and runs parallel evaluation.
+    """
+    num_traj = cfg["eval_num_trajectories"]
+    is_vectorized = hasattr(env, 'num_envs')
+
+    if is_vectorized:
+        all_states, all_actions, all_successes, all_rewards = _vectorized_evaluate(env, policy, cfg)
+    else:
+        max_steps = cfg["eval_max_steps"]
+        all_states, all_actions, all_successes, all_rewards = [], [], [], []
+        for i in range(num_traj):
+            states, actions, success, total_reward = rollout(env, policy, max_steps, cfg)
+            all_states.append(states)
+            all_actions.append(actions)
+            all_successes.append(success)
+            all_rewards.append(total_reward)
+
+    # Compute metrics (same for both paths)
+    success_metrics, failure_metrics, all_metrics = [], [], []
+    for states, actions, success, reward in zip(all_states, all_actions, all_successes, all_rewards):
         metrics = compute_trajectory_metrics(states, actions)
-        metrics["reward"] = float(total_reward)
+        metrics["reward"] = float(reward)
         all_metrics.append(metrics)
-
         if success:
             success_metrics.append(metrics)
         else:
@@ -159,12 +275,11 @@ if __name__ == "__main__":
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    render_mode = "human" if args.render else None
-    env = gym.make(cfg["env_name"], render_mode=render_mode)
     np.random.seed(cfg["eval_seed"])
     policy = make_policy(cfg)
 
     if args.render:
+        env = gym.make(cfg["env_name"], render_mode="human")
         import time
         num_traj = cfg["eval_num_trajectories"]
         max_steps = cfg["eval_max_steps"]
@@ -189,6 +304,7 @@ if __name__ == "__main__":
             time.sleep(0.5)
         env.close()
     else:
+        env = make_eval_env(cfg)
         results, all_states, all_actions = evaluate(env, policy, cfg)
         env.close()
 

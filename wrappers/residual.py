@@ -31,10 +31,10 @@ class ResidualPolicyEnv(gym.Wrapper):
             dtype=np.float32,
         )
 
-        # Agent action space: z_ref in latent space
+        # Agent action space: raw actions in [-1, 1], scaled to z_ref by z_ref_limit
         self.action_space = gym.spaces.Box(
-            low=-np.ones(latent_dim, dtype=np.float32) * z_ref_limit,
-            high=np.ones(latent_dim, dtype=np.float32) * z_ref_limit,
+            low=-np.ones(latent_dim, dtype=np.float32),
+            high=np.ones(latent_dim, dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -50,8 +50,9 @@ class ResidualPolicyEnv(gym.Wrapper):
         obs, info = self.env.reset(**kwargs)
         return self._augment_obs(obs), info
 
-    def step(self, z_ref):
-        # u_res = F @ z_ref -> shape (action_dim,)
+    def step(self, raw_action):
+        # z_ref = z_ref_limit * raw_action (raw_action in [-1, 1])
+        z_ref = self.z_ref_limit * raw_action
         u_res = self.F @ z_ref
         total_action = np.clip(
             self._last_base_action + u_res,

@@ -31,7 +31,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compute stability variables from a pre-trained Koopman model")
     parser.add_argument("model_dir", type=str,
-                        help="Path to model output directory (contains config.yaml and checkpoint.pt)")
+                        help="Path to model output directory (contains config.yaml and koopman_ckpt.pt)")
     parser.add_argument("--config", type=str, default="config/pendulum.yaml",
                         help="Config file for tuning params (q_scale, r_scale, etc.)")
     parser.add_argument("--filename", type=str, default=None,
@@ -42,7 +42,7 @@ def main():
 
     # Load config and weights from model directory
     config_path = os.path.join(args.model_dir, "config.yaml")
-    weights_path = os.path.join(args.model_dir, "checkpoint.pt")
+    weights_path = os.path.join(args.model_dir, "koopman_ckpt.pt")
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)

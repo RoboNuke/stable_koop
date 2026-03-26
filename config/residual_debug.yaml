@@ -1,0 +1,24 @@
+# Residual Policy Training Config
+run_name: "residual_debug"
+
+# SAC Hyperparameters
+residual_num_envs: 256
+residual_total_timesteps: 100000
+residual_eval_interval: 5000
+residual_batch_size: 256
+residual_lr: 3.0e-4
+residual_gamma: 0.99
+residual_tau: 0.005
+residual_initial_entropy_value: 1.0
+residual_random_timesteps: 1000
+residual_learning_starts: 1000
+residual_memory_size: 100000
+
+# Eval
+num_parallel_evals: 16
+
+# Network Architecture
+residual_actor_hidden_size: 64
+residual_actor_hidden_layers: 2
+residual_critic_hidden_size: 256
+residual_critic_hidden_layers: 2

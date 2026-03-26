@@ -91,6 +91,7 @@ upper_lip_m_max: 1.25
 
 
 # Eval
+num_parallel_evals: 16
 eval_num_trajectories: 200
 eval_max_steps: 200
 eval_seed: 42

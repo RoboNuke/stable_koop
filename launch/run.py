@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import yaml
 
-from launch.eval_policy import evaluate as evaluate_policy, make_policy
+from launch.eval_policy import evaluate as evaluate_policy, make_policy, make_eval_env
 from launch.eval_pendulum import evaluate_model
 from launch.train_pendulum import collect_data, train
 from model.autoencoder import KoopmanAutoencoder
@@ -37,9 +37,8 @@ def save_config(cfg, run_dir):
 
 
 def make_env(cfg):
-    """Create and seed the environment."""
-    env = gym.make(cfg["env_name"])
-    env.reset(seed=cfg["eval_seed"])
+    """Create and seed the environment (vectorized if num_parallel_evals > 1)."""
+    env = make_eval_env(cfg)
     np.random.seed(cfg["eval_seed"])
     return env
 
@@ -88,16 +87,18 @@ def make_base_policy(cfg):
     return make_policy(cfg)
 
 
-def save_eval_results(results, all_states, all_actions, phase_dir):
-    """Save evaluation stats and trajectories to a phase directory."""
-    os.makedirs(phase_dir, exist_ok=True)
+def save_eval_results(results, all_states, all_actions, run_dir, prefix=""):
+    """Save evaluation stats and trajectories to run_dir with optional prefix."""
+    os.makedirs(run_dir, exist_ok=True)
 
-    stats_path = os.path.join(phase_dir, "eval_stats.yaml")
+    stats_name = f"{prefix}eval_stats.yaml" if prefix else "eval_stats.yaml"
+    stats_path = os.path.join(run_dir, stats_name)
     with open(stats_path, "w") as f:
         yaml.dump(results, f, default_flow_style=False, sort_keys=False)
     print(f"Stats saved to {stats_path}")
 
-    traj_path = os.path.join(phase_dir, "traj.npz")
+    traj_name = f"{prefix}traj.npz" if prefix else "traj.npz"
+    traj_path = os.path.join(run_dir, traj_name)
     save_dict = {}
     for i, (s, a) in enumerate(zip(all_states, all_actions)):
         save_dict[f"states_{i}"] = s
@@ -238,12 +239,11 @@ def augment_perturbed_trajectories(trajectories, augment=True, obs_scale=None,
 def phase_0_base_eval(env, policy, cfg, run_dir):
     """Phase 0: evaluate the base PD policy and save results."""
     print("\n=== Phase 0: Base Policy Benchmark ===")
-    phase_dir = os.path.join(run_dir, "base_eval")
 
     results, all_states, all_actions = evaluate_policy(env, policy, cfg)
-    save_eval_results(results, all_states, all_actions, phase_dir)
+    save_eval_results(results, all_states, all_actions, run_dir, prefix="base_eval_")
 
-    print(f"Phase 0 complete. Results in {phase_dir}")
+    print(f"Phase 0 complete.")
     return results
 
 
@@ -251,8 +251,6 @@ def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_sc
                           act_scale=None):
     """Phase 1: train Koopman model with base policy as part of environment."""
     print("\n=== Phase 1: Train Koopman Model ===")
-    phase_dir = os.path.join(run_dir, "koopman_train")
-    os.makedirs(phase_dir, exist_ok=True)
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -271,7 +269,7 @@ def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_sc
     model = train(model, aug_trajectories, cfg)
 
     # 4. Save checkpoint
-    ckpt_path = os.path.join(phase_dir, "checkpoint.pt")
+    ckpt_path = os.path.join(run_dir, "koop_a_checkpoint.pt")
     torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
     print(f"Checkpoint saved to {ckpt_path}")
 
@@ -280,7 +278,7 @@ def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_sc
         model, aug_trajectories, cfg["horizon"], eval_horizon=25)
 
     # 6. Save heatmap
-    plot_path = os.path.join(phase_dir, "prediction_error.png")
+    plot_path = os.path.join(run_dir, "koop_a_prediction_error.png")
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     print(f"Heatmap saved to {plot_path}")
 
@@ -290,20 +288,18 @@ def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_sc
         "max_prediction_error_state": float(max_pred_error_state),
         "heatmap": heatmap_data,
     }
-    stats_path = os.path.join(phase_dir, "eval_stats.yaml")
+    stats_path = os.path.join(run_dir, "koop_a_eval_stats.yaml")
     with open(stats_path, "w") as f:
         yaml.dump(eval_stats, f, default_flow_style=False, sort_keys=False)
     print(f"Eval stats saved to {stats_path}")
 
-    print(f"Phase 1 complete. Results in {phase_dir}")
+    print(f"Phase 1 complete.")
 
 
 def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=None,
                     act_scale=None):
     """Phase 2: train A and B with random perturbations on top of base policy."""
     print("\n=== Phase 2: Train B Matrix (Perturbed Policy) ===")
-    phase_dir = os.path.join(run_dir, "koopman_train_B")
-    os.makedirs(phase_dir, exist_ok=True)
 
     # 1. Reinitialize B
     import torch.nn as nn
@@ -332,8 +328,8 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
     # 4. Train (both A and B update)
     model = train(model, aug_trajectories, cfg)
 
-    # 5. Save checkpoint to top-level run directory
-    ckpt_path = os.path.join(run_dir, "checkpoint.pt")
+    # 5. Save checkpoint
+    ckpt_path = os.path.join(run_dir, "koopman_ckpt.pt")
     torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
     print(f"Checkpoint saved to {ckpt_path}")
 
@@ -342,7 +338,7 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
         model, aug_trajectories, cfg["horizon"], eval_horizon=25)
 
     # 7. Save heatmap
-    plot_path = os.path.join(phase_dir, "prediction_error.png")
+    plot_path = os.path.join(run_dir, "koop_b_prediction_error.png")
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     print(f"Heatmap saved to {plot_path}")
 
@@ -352,12 +348,12 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
         "max_prediction_error_state": float(max_pred_error_state),
         "heatmap": heatmap_data,
     }
-    stats_path = os.path.join(phase_dir, "eval_stats.yaml")
+    stats_path = os.path.join(run_dir, "koop_b_eval_stats.yaml")
     with open(stats_path, "w") as f:
         yaml.dump(eval_stats, f, default_flow_style=False, sort_keys=False)
     print(f"Eval stats saved to {stats_path}")
 
-    print(f"Phase 2 complete. Results in {phase_dir}")
+    print(f"Phase 2 complete.")
     return aug_trajectories
 
 
@@ -494,8 +490,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
              f"rho={rho:.4f}  C={C:.4f}  m={m:.4f}  Q_scale={cfg.get('q_scale', 1.0)}  R_scale={cfg['r_scale']}",
              transform=ax3.transAxes, ha='center', fontsize=9)
     fig3.tight_layout()
-    folder_name = os.path.basename(os.path.normpath(phase_dir))
-    heatmap_name = f"eigen_heatmap.png"
+    heatmap_name = "eigen_heatmap.png"
     fig3.savefig(os.path.join(phase_dir, heatmap_name), dpi=150)
     plt.close(fig3)
     print(f"Saved {heatmap_name}")
@@ -698,7 +693,6 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
             f"κ(P)={kappa_P:.4f}  ρ²={rho_sq:.4f}  m={m:.4f}  Q={cfg.get('q_scale', 1.0)}  R={cfg['r_scale']}",
             transform=ax.transAxes, ha='center', fontsize=9)
     fig.tight_layout()
-    folder_name = os.path.basename(os.path.normpath(phase_dir))
     heatmap_name = "lyapunov_heatmap.png"
     fig.savefig(os.path.join(phase_dir, heatmap_name), dpi=150)
     plt.close(fig)
@@ -728,36 +722,29 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     return variables, lqr
 
 
-def phase_4_residual_policy(base_policy, lqr, cfg, run_dir):
+def phase_4_residual_policy(base_policy, lqr, cfg, run_dir, z_ref_limit=1.0, keep_all_ckpts=False):
     """Phase 4: train residual policy with SAC. Returns trained actor model."""
     print("\n=== Phase 4: Residual Policy Training ===")
+    print(f"  z_ref_limit (from eta): {z_ref_limit:.6f}")
     from launch.train_residual import train_residual
-    return train_residual(base_policy, lqr, cfg, run_dir)
+    return train_residual(base_policy, lqr, cfg, run_dir, z_ref_limit=z_ref_limit,
+                          keep_all_ckpts=keep_all_ckpts)
 
 
-def phase_5_final_eval(env, base_policy, residual_model, lqr, cfg, run_dir, baseline_results):
+def phase_5_final_eval(env, base_policy, residual_model, lqr, cfg, run_dir, baseline_results, z_ref_limit=1.0):
     """Phase 5: evaluate combined policy and compare against Phase 0 baseline."""
     print("\n=== Phase 5: Final Combined Policy Benchmark ===")
-    phase_dir = os.path.join(run_dir, "final_eval")
-
     import torch
+    from launch.train_residual import make_composite_policy
 
     device = next(residual_model.parameters()).device
     lqr_F_np = lqr.F.numpy().astype(np.float32)
     residual_model.eval()
+    action_bounds = (env.action_space.low, env.action_space.high)
+    policy = make_composite_policy(base_policy, residual_model, lqr_F_np, z_ref_limit, device, action_bounds)
 
-    def composite_policy(obs):
-        base_action = base_policy(obs)
-        obs_aug = np.concatenate([obs, base_action]).astype(np.float32)
-        with torch.no_grad():
-            obs_t = torch.FloatTensor(obs_aug).unsqueeze(0).to(device)
-            z_ref = residual_model.act({"states": obs_t})[0]
-            z_ref_np = z_ref.cpu().numpy().flatten()
-        u_res = lqr_F_np @ z_ref_np
-        return np.clip(base_action + u_res, env.action_space.low, env.action_space.high)
-
-    results, all_states, all_actions = evaluate_policy(env, composite_policy, cfg)
-    save_eval_results(results, all_states, all_actions, phase_dir)
+    results, all_states, all_actions = evaluate_policy(env, policy, cfg)
+    save_eval_results(results, all_states, all_actions, run_dir, prefix="final_eval_")
 
     # Compare against baseline
     # Green (improved) = lower for most metrics, higher for reward/success_rate
@@ -801,6 +788,8 @@ def main():
                         help="Do not append base policy action to the Koopman state")
     parser.add_argument("--skip-pretrain", action="store_true", default=False,
                         help="Skip Phase 1 (A-only training), go straight to joint A+B training")
+    parser.add_argument("--keep-all-ckpts", action="store_true", default=False,
+                        help="Save every residual policy checkpoint (not just best)")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -810,7 +799,28 @@ def main():
     cfg["augment_state"] = augment
 
     run_dir = make_run_dir(cfg)
+
+    # Tee stdout to log file
+    import sys
+    class Tee:
+        def __init__(self, filepath, stream):
+            self.file = open(filepath, "w")
+            self.stream = stream
+        def write(self, data):
+            self.stream.write(data)
+            self.file.write(data)
+            self.file.flush()
+        def flush(self):
+            self.stream.flush()
+            self.file.flush()
+        def close(self):
+            self.file.close()
+    log_path = os.path.join(run_dir, "run.log")
+    tee = Tee(log_path, sys.stdout)
+    sys.stdout = tee
+
     print(f"Run directory: {run_dir}")
+    print(f"Log file: {log_path}")
     print(f"Augment state with base policy action: {augment}")
     save_config(cfg, run_dir)
 
@@ -853,14 +863,13 @@ def main():
                               act_scale)
     aug_trajectories = phase_2_train_B(model, env, policy, cfg, run_dir, augment, obs_scale,
                                        act_scale)
-    stability_dir = os.path.join(run_dir, "stability")
     variables = {}
     lqr = None
     if cfg.get("use_eigen_bound", False):
-        eigen_vars, lqr = phase_3_compute_variables(model, cfg, stability_dir, aug_trajectories)
+        eigen_vars, lqr = phase_3_compute_variables(model, cfg, run_dir, aug_trajectories)
         variables.update(eigen_vars)
     if cfg.get("use_lyapunov_bound", False):
-        lyap_vars, lyap_lqr = phase_3_lyapunov(model, cfg, stability_dir, aug_trajectories)
+        lyap_vars, lyap_lqr = phase_3_lyapunov(model, cfg, run_dir, aug_trajectories)
         variables.update(lyap_vars)
         if lqr is None:
             lqr = lyap_lqr
@@ -868,13 +877,19 @@ def main():
     # Phase 4: Residual policy training
     # Phase 5: Final combined benchmark
     if lqr is not None:
-        residual_model = phase_4_residual_policy(policy, lqr, cfg, run_dir)
-        phase_5_final_eval(env, policy, residual_model, lqr, cfg, run_dir, baseline_results)
+        z_ref_limit = variables.get("eta", 1.0)
+        residual_model = phase_4_residual_policy(policy, lqr, cfg, run_dir, z_ref_limit=z_ref_limit,
+                                                    keep_all_ckpts=args.keep_all_ckpts)
+        phase_5_final_eval(env, policy, residual_model, lqr, cfg, run_dir, baseline_results, z_ref_limit=z_ref_limit)
     else:
         print("\nSkipping Phases 4-5: no LQR available (enable use_eigen_bound)")
 
     env.close()
     print(f"\n=== Pipeline complete. All outputs in {run_dir} ===")
+
+    # Restore stdout and close log
+    sys.stdout = tee.stream
+    tee.close()
 
 
 if __name__ == "__main__":
