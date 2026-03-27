@@ -149,7 +149,9 @@ def collect_perturbed_data(env, policy, num_trajectories, max_steps, seed,
     separately so they can be used differently in the Koopman model.
 
     Args:
-        perturb_scale: max magnitude of perturbation. If None, uses action space bounds.
+        perturb_scale: fraction of action space bounds to use as perturbation
+            range. E.g. 0.5 with action range [-2, 2] gives perturbations in
+            [-1, 1]. If None, uses full action space bounds (scale=1.0).
         fix_perturb_range: if True, sample perturbations only in the range that
             doesn't saturate the controller given the current base action.
         hold_steps: number of steps to hold each sampled perturbation before
@@ -159,14 +161,14 @@ def collect_perturbed_data(env, policy, num_trajectories, max_steps, seed,
         list of (states: (T+1, S), base_actions: (T, A), perturbations: (T, A))
     """
     np.random.seed(seed)
-    if perturb_scale is not None:
-        perturb_low_default = -np.ones_like(env.action_space.low) * perturb_scale
-        perturb_high_default = np.ones_like(env.action_space.high) * perturb_scale
-    else:
-        perturb_low_default = env.action_space.low
-        perturb_high_default = env.action_space.high
     action_low = env.action_space.low
     action_high = env.action_space.high
+    # Perturbation range: sample u ~ uniform(-1, 1) scaled by action bounds * perturb_scale
+    scale = perturb_scale if perturb_scale is not None else 1.0
+    perturb_low_default = action_low * scale
+    perturb_high_default = action_high * scale
+    # Absolute max perturbation magnitude per dimension (for fix_perturb_range clipping)
+    perturb_mag = np.abs(action_high) * scale
 
     trajectories = []
     for i in range(num_trajectories):
@@ -180,8 +182,8 @@ def collect_perturbed_data(env, policy, num_trajectories, max_steps, seed,
             # Resample perturbation every hold_steps
             if t % hold_steps == 0:
                 if fix_perturb_range:
-                    p_low = np.clip(action_low - base_action, -perturb_scale, 0)
-                    p_high = np.clip(action_high - base_action, 0, perturb_scale)
+                    p_low = np.clip(action_low - base_action, -perturb_mag, 0)
+                    p_high = np.clip(action_high - base_action, 0, perturb_mag)
                     perturbation = np.random.uniform(p_low, p_high).astype(np.float32)
                 else:
                     perturbation = np.random.uniform(perturb_low_default, perturb_high_default).astype(np.float32)
@@ -873,7 +875,10 @@ def main():
     print(f"Augment state with base policy action: {augment}")
     save_config(cfg, run_dir)
 
-    env = make_env(cfg)
+    # Vectorized env for evaluation, single env for data collection / scaling
+    eval_env = make_env(cfg)
+    train_env = gym.make(cfg["env_name"])
+
     if cfg.get("no_base_policy", False):
         from launch.eval_policy import zero_policy
         policy = zero_policy
@@ -881,9 +886,9 @@ def main():
     else:
         policy = make_base_policy(cfg)
 
-    # Compute observation and action scaling
-    obs_scale = compute_obs_scale(env, augment)
-    act_scale = compute_act_scale(env)
+    # Compute observation and action scaling (single env has 1-D bounds)
+    obs_scale = compute_obs_scale(train_env, augment)
+    act_scale = compute_act_scale(train_env)
     cfg["obs_scale"] = obs_scale.tolist()
     cfg["act_scale"] = act_scale.tolist()
     print(f"Observation scale: {obs_scale}")
@@ -907,11 +912,11 @@ def main():
           f"latent_dim={cfg['latent_dim']}")
 
     # --- Execute phases ---
-    baseline_results = phase_0_base_eval(env, policy, cfg, run_dir)
+    baseline_results = phase_0_base_eval(eval_env, policy, cfg, run_dir)
     if not args.skip_pretrain:
-        phase_1_train_koopman(model, env, policy, cfg, run_dir, augment, obs_scale,
+        phase_1_train_koopman(model, train_env, policy, cfg, run_dir, augment, obs_scale,
                               act_scale)
-    aug_trajectories = phase_2_train_B(model, env, policy, cfg, run_dir, augment, obs_scale,
+    aug_trajectories = phase_2_train_B(model, train_env, policy, cfg, run_dir, augment, obs_scale,
                                        act_scale)
     variables = {}
     lqr = None
@@ -930,7 +935,8 @@ def main():
     if delta_max is not None and delta_max < 0:
         print(f"\n\033[91mStopping after Phase 3: delta_max = {delta_max:.6f} < 0 "
               f"(infeasible error budget). Tune Q/R scales or retrain.\033[0m")
-        env.close()
+        eval_env.close()
+        train_env.close()
         print(f"\n=== Pipeline stopped. Outputs in {run_dir} ===")
         return
 
@@ -940,11 +946,12 @@ def main():
         z_ref_limit = variables.get("eta", 1.0)
         residual_model = phase_4_residual_policy(policy, lqr, cfg, run_dir, z_ref_limit=z_ref_limit,
                                                     keep_all_ckpts=args.keep_all_ckpts)
-        phase_5_final_eval(env, policy, residual_model, lqr, cfg, run_dir, baseline_results, z_ref_limit=z_ref_limit)
+        phase_5_final_eval(eval_env, policy, residual_model, lqr, cfg, run_dir, baseline_results, z_ref_limit=z_ref_limit)
     else:
         print("\nSkipping Phases 4-5: no LQR available (enable use_eigen_bound)")
 
-    env.close()
+    eval_env.close()
+    train_env.close()
     print(f"\n=== Pipeline complete. All outputs in {run_dir} ===")
 
     # Restore stdout and close log
