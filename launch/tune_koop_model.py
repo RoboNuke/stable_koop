@@ -85,7 +85,10 @@ def main():
         encoder_latent=cfg["encoder_latent"],
     ).to(device)
 
-    model.load_state_dict(checkpoint["model"])
+    # Strip _orig_mod. prefix from torch.compile'd state_dicts
+    state_dict = checkpoint["model"]
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     print(f"Loaded weights from {weights_path}")
     print(f"Koopman model: state_dim={koopman_state_dim}, action_dim={cfg['action_dim']}, "
           f"latent_dim={cfg['latent_dim']}")
@@ -105,6 +108,7 @@ def main():
     with open(args.config) as f:
         tune_cfg = yaml.safe_load(f)
     for key in ("use_eigen_bound", "use_lyapunov_bound",
+                "controllable_subspace", "ctrl_threshold",
                 "q_scale", "r_scale", "max_tracking_error_x", "max_displacement_x"):
         if key in tune_cfg:
             cfg[key] = tune_cfg[key]

@@ -249,7 +249,8 @@ def main():
         encoder_latent=cfg.get("encoder_latent", 64),
     ).to(device)
     ckpt = torch.load(args.koopman_ckpt, map_location=device)
-    koopman_model.load_state_dict(ckpt["model"])
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+    koopman_model.load_state_dict(state_dict)
     koopman_model.eval()
     print(f"Loaded Koopman model from {args.koopman_ckpt}")
 
@@ -258,9 +259,12 @@ def main():
     B_mat = koopman_model.B_matrix.detach().cpu()
     latent_dim = cfg["latent_dim"]
     action_dim = cfg["action_dim"]
-    Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
+    q_scale = cfg.get("q_scale", 1.0)
+    Q = torch.eye(latent_dim) * q_scale
     R = torch.eye(action_dim) * cfg.get("r_scale", 1.0)
-    lqr = LQR(A, B_mat, Q, R)
+    lqr = LQR(A, B_mat, Q, R, q_scale=q_scale,
+              controllable_subspace=cfg.get("controllable_subspace", False),
+              ctrl_threshold=cfg.get("ctrl_threshold", None))
     lqr_F_np = lqr.F.numpy().astype(np.float32)
     print(f"LQR: F shape={lqr.F.shape}, gain_norm={lqr.gain_norm:.4f}")
 

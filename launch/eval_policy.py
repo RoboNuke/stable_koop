@@ -9,6 +9,11 @@ sys.path.insert(0, ".")
 from launch.train_pendulum import pd_policy, energy_shaping_policy, bang_energy_policy
 
 
+def zero_policy(obs):
+    """Policy that always returns zero action."""
+    return np.array([0.0], dtype=np.float32)
+
+
 def make_policy(cfg):
     """Build the policy callable from config. Extension point for residual policies."""
     kp, kd = cfg["kp"], cfg["kd"]
@@ -16,7 +21,8 @@ def make_policy(cfg):
     sa = cfg['sa'] * 3.14159/180
     print(f"Using kp={kp} and kd={kd} and ke={ke} and switch_angle={sa}")
     #return lambda obs: pd_policy(obs, kp, kd)
-    return lambda obs: bang_energy_policy(obs, kp, kd, ke, switch_angle=sa)
+    #return lambda obs: bang_energy_policy(obs, kp, kd, ke, switch_angle=sa)
+    return lambda obs: energy_shaping_policy(obs, kp, kd, ke, switch_angle=sa)
 
 
 def check_success(states, cfg):

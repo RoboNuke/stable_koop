@@ -399,7 +399,8 @@ if __name__ == "__main__":
 
     ckpt_path = os.path.join(args.model_dir, "koopman_ckpt.pt")
     checkpoint = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint["model"])
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in checkpoint["model"].items()}
+    model.load_state_dict(state_dict)
     print(f"Loaded Koopman model from {ckpt_path}")
 
     # 4. Load Lyapunov variables for eta (z_ref_limit)
@@ -414,15 +415,19 @@ if __name__ == "__main__":
     B_mat = model.B_matrix.detach().cpu()
     latent_dim = cfg["latent_dim"]
     action_dim = cfg["action_dim"]
-    Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
+    q_scale = cfg.get("q_scale", 1.0)
+    Q = torch.eye(latent_dim) * q_scale
     R = torch.eye(action_dim) * cfg.get("r_scale", 1.0)
-    lqr = LQR(A, B_mat, Q, R)
+    lqr = LQR(A, B_mat, Q, R, q_scale=q_scale,
+              controllable_subspace=cfg.get("controllable_subspace", False),
+              ctrl_threshold=cfg.get("ctrl_threshold", None))
     print(f"LQR: F shape={lqr.F.shape}, gain_norm={lqr.gain_norm:.4f}")
 
     # 6. Build base policy
     if cfg.get("no_base_policy", False):
-        base_policy = None
-        print("No base policy — using random actions only")
+        from launch.eval_policy import zero_policy
+        base_policy = zero_policy
+        print("No base policy — using zero actions")
     else:
         base_policy = make_policy(cfg)
 

@@ -64,6 +64,8 @@ def evaluate_model(model, trajectories, train_horizon, eval_horizon=25):
     errors_all = []
     max_pred_error_latent = 0.0
     max_pred_error_state = 0.0
+    all_latent_errs = []
+    all_state_errs = []
 
     with torch.no_grad():
         for states, actions in trajectories:
@@ -93,10 +95,12 @@ def evaluate_model(model, trajectories, train_horizon, eval_horizon=25):
 
             latent_errs = torch.linalg.norm(z_next_all - z_pred_all, dim=-1)  # (T,)
             max_pred_error_latent = max(max_pred_error_latent, latent_errs.max().item())
+            all_latent_errs.append(latent_errs.cpu())
 
             x_pred_all = model.decode(z_pred_all)  # (T, state_dim)
             state_errs = torch.linalg.norm(x_pred_all - states_t[1:T_act + 1], dim=-1)  # (T,)
             max_pred_error_state = max(max_pred_error_state, state_errs.max().item())
+            all_state_errs.append(state_errs.cpu())
 
     # Bin into a 2D histogram: x=step, y=true angle, value=mean error
     angle_bins = np.linspace(-np.pi, np.pi, 37)
@@ -148,9 +152,27 @@ def evaluate_model(model, trajectories, train_horizon, eval_horizon=25):
         "heatmap_deg": np.where(np.isnan(heatmap_deg), None, heatmap_deg).tolist(),
     }
 
-    print(f"Max one-step prediction error (latent): {max_pred_error_latent:.6f}")
-    print(f"Max one-step prediction error (state):  {max_pred_error_state:.6f}")
-    return fig, max_pred_error_latent, max_pred_error_state, heatmap_data
+    all_latent_errs = torch.cat(all_latent_errs)
+    all_state_errs = torch.cat(all_state_errs)
+    mean_pred_error_latent = all_latent_errs.mean().item()
+    std_pred_error_latent = all_latent_errs.std().item()
+    mean_pred_error_state = all_state_errs.mean().item()
+    std_pred_error_state = all_state_errs.std().item()
+
+    print(f"One-step prediction error (latent): max={max_pred_error_latent:.6f}  "
+          f"mean={mean_pred_error_latent:.6f}  std={std_pred_error_latent:.6f}")
+    print(f"One-step prediction error (state):  max={max_pred_error_state:.6f}  "
+          f"mean={mean_pred_error_state:.6f}  std={std_pred_error_state:.6f}")
+
+    error_stats = {
+        "max_pred_error_latent": max_pred_error_latent,
+        "mean_pred_error_latent": mean_pred_error_latent,
+        "std_pred_error_latent": std_pred_error_latent,
+        "max_pred_error_state": max_pred_error_state,
+        "mean_pred_error_state": mean_pred_error_state,
+        "std_pred_error_state": std_pred_error_state,
+    }
+    return fig, error_stats, heatmap_data
 
 
 if __name__ == "__main__":
@@ -176,14 +198,15 @@ if __name__ == "__main__":
         encoder_spec_norm=cfg["encoder_spec_norm"],
         encoder_latent=cfg["encoder_latent"],
     ).to(device)
-    model.load_state_dict(ckpt["model"])
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+    model.load_state_dict(state_dict)
 
     trajectories = collect_eval_trajectories(
         cfg["env_name"], args.num_trajectories, args.horizon, args.seed,
     )
 
     train_horizon = cfg.get("horizon", args.horizon)
-    fig, max_err_latent, max_err_state, heatmap_data = evaluate_model(model, trajectories, train_horizon, eval_horizon=args.horizon)
+    fig, error_stats, heatmap_data = evaluate_model(model, trajectories, train_horizon, eval_horizon=args.horizon)
     fig.savefig("eval_prediction_error.png", dpi=150, bbox_inches="tight")
     print(f"Plot saved to eval_prediction_error.png")
     plt.show()

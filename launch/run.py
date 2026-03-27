@@ -249,32 +249,48 @@ def phase_0_base_eval(env, policy, cfg, run_dir):
 
 def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_scale=None,
                           act_scale=None):
-    """Phase 1: train Koopman model with base policy as part of environment."""
-    print("\n=== Phase 1: Train Koopman Model ===")
+    """Phase 1: pre-train Koopman model with perturbed data but only core losses.
+
+    Same data collection as Phase 2 (base policy + random perturbations), but
+    only recon, pred, and latent_consistency losses are active.
+    """
+    print("\n=== Phase 1: Pre-Train Koopman Model (Core Losses Only) ===")
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 1. Collect data with base policy
-    trajectories = collect_data(
-        env, cfg["num_trajectories"],
-        cfg["max_episode_steps"], cfg["seed"], policy=policy,
+    # 1. Collect data with base policy + random perturbations (same as Phase 2)
+    trajectories = collect_perturbed_data(
+        env, policy, cfg["num_trajectories"],
+        cfg["max_episode_steps"], cfg["seed"],
+        perturb_scale=cfg.get("perturb_scale", None),
+        fix_perturb_range=cfg.get("fix_perturb_range", False),
+        hold_steps=cfg.get("hold_steps", 1),
     )
 
-    # 2. Prepare for Koopman training
-    aug_trajectories = augment_trajectories(trajectories, augment=augment,
-                                            obs_scale=obs_scale,
-                                            act_scale=act_scale)
+    # 2. Prepare for Koopman training (same augmentation as Phase 2)
+    aug_trajectories = augment_perturbed_trajectories(trajectories, augment=augment,
+                                                      obs_scale=obs_scale,
+                                                      act_scale=act_scale)
 
-    # 3. Train
-    model = train(model, aug_trajectories, cfg)
+    # 3. Train with only core losses (override config to disable optional losses)
+    phase1_cfg = dict(cfg)
+    # Disable all optional losses — keep only recon, pred, latent_consistency
+    for key in ("controllability_loss", "bi_lipschitz_loss", "spectral_loss",
+                "normality_loss", "cl_normality_loss", "b_eigen_loss",
+                "b_scale_loss", "eig_spread_loss", "unstable_ctrl_loss",
+                "upper_lipschitz_loss", "unit_circle_gap_loss"):
+        phase1_cfg[key] = False
+
+    model = train(model, aug_trajectories, phase1_cfg)
 
     # 4. Save checkpoint
     ckpt_path = os.path.join(run_dir, "koop_a_checkpoint.pt")
-    torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
+    save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
+    torch.save({"model": save_dict, "config": cfg}, ckpt_path)
     print(f"Checkpoint saved to {ckpt_path}")
 
     # 5. Evaluate on training data
-    fig, max_pred_error_latent, max_pred_error_state, heatmap_data = evaluate_model(
+    fig, error_stats, heatmap_data = evaluate_model(
         model, aug_trajectories, cfg["horizon"], eval_horizon=25)
 
     # 6. Save heatmap
@@ -284,8 +300,7 @@ def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_sc
 
     # 7. Save eval stats
     eval_stats = {
-        "max_prediction_error_latent": float(max_pred_error_latent),
-        "max_prediction_error_state": float(max_pred_error_state),
+        **error_stats,
         "heatmap": heatmap_data,
     }
     stats_path = os.path.join(run_dir, "koop_a_eval_stats.yaml")
@@ -329,12 +344,14 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
     model = train(model, aug_trajectories, cfg)
 
     # 5. Save checkpoint
+    os.makedirs(run_dir, exist_ok=True)
     ckpt_path = os.path.join(run_dir, "koopman_ckpt.pt")
-    torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
+    save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
+    torch.save({"model": save_dict, "config": cfg}, ckpt_path)
     print(f"Checkpoint saved to {ckpt_path}")
 
     # 6. Evaluate on training data
-    fig, max_pred_error_latent, max_pred_error_state, heatmap_data = evaluate_model(
+    fig, error_stats, heatmap_data = evaluate_model(
         model, aug_trajectories, cfg["horizon"], eval_horizon=25)
 
     # 7. Save heatmap
@@ -344,8 +361,7 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
 
     # 8. Save eval stats
     eval_stats = {
-        "max_prediction_error_latent": float(max_pred_error_latent),
-        "max_prediction_error_state": float(max_pred_error_state),
+        **error_stats,
         "heatmap": heatmap_data,
     }
     stats_path = os.path.join(run_dir, "koop_b_eval_stats.yaml")
@@ -423,14 +439,21 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
     # 2. LQR: F and gain norm
     latent_dim = cfg["latent_dim"]
     action_dim = cfg["action_dim"]
-    Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
+    q_scale = cfg.get("q_scale", 1.0)
+    Q = torch.eye(latent_dim) * q_scale
+    print(f"  Q: {q_scale} * I")
     R = torch.eye(action_dim) * cfg["r_scale"]
-    lqr = LQR(A, B_mat, Q, R)
+    lqr = LQR(A, B_mat, Q, R, q_scale=q_scale,
+              controllable_subspace=cfg.get("controllable_subspace", False),
+              ctrl_threshold=cfg.get("ctrl_threshold", None))
     F = lqr.F
     gain_norm = lqr.gain_norm.item()
-    print(f"  Q scale:                               {cfg.get('q_scale', 1.0)}")
     print(f"  R scale:                               {cfg['r_scale']}")
-    BtPB = (B_mat.T @ lqr.P @ B_mat).item()
+    if lqr.V_ctrl is not None:
+        B_for_P = lqr.V_ctrl @ B_mat
+    else:
+        B_for_P = B_mat
+    BtPB = (B_for_P.T @ lqr.P @ B_for_P).item()
     print(f"  B^T P B:                               {BtPB:.6f}")
     print(f"  LQR gain norm (||F||):                 {gain_norm:.6f}")
 
@@ -616,16 +639,23 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
 
     latent_dim = cfg["latent_dim"]
     action_dim = cfg["action_dim"]
-    Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
+    q_scale = cfg.get("q_scale", 1.0)
     R = torch.eye(action_dim) * cfg["r_scale"]
     scale_B=True
     if scale_B:
         print("Scaling B")
         B_scale = torch.norm(B_mat, p=2)
         B_norm = B_mat / B_scale
-        lqr = LQR(A, B_norm, Q, R)
+        B_for_lqr = B_norm
     else:
-        lqr = LQR(A, B_mat, Q, R)
+        B_scale = 1.0
+        B_for_lqr = B_mat
+
+    Q = torch.eye(latent_dim) * q_scale
+
+    lqr = LQR(A, B_for_lqr, Q, R, q_scale=q_scale,
+              controllable_subspace=cfg.get("controllable_subspace", False),
+              ctrl_threshold=cfg.get("ctrl_threshold", None))
     gain_norm = lqr.gain_norm.item()
     P = lqr.P
 
@@ -633,8 +663,9 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     P_eigvals = torch.linalg.eigvalsh(P)
     kappa_P = (P_eigvals.max() / P_eigvals.min()).item()
 
-    # Lyapunov contraction rate
-    Q_eigvals = torch.linalg.eigvalsh(Q)
+    # Lyapunov contraction rate — use Q_ctrl if in subspace mode
+    Q_for_cert = getattr(lqr, 'Q_ctrl', lqr.Q)
+    Q_eigvals = torch.linalg.eigvalsh(Q_for_cert)
     rho_sq = 1.0 - Q_eigvals.min().item() / P_eigvals.max().item()
 
     # Lyapunov delta_max
@@ -642,7 +673,11 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
 
     print(f"  Q scale:                               {cfg.get('q_scale', 1.0)}")
     print(f"  R scale:                               {cfg['r_scale']}")
-    BtPB = (B_mat.T @ P @ B_mat).item()
+    if lqr.V_ctrl is not None:
+        B_for_P = (lqr.V_ctrl @ B_mat)  # project B into controllable subspace
+    else:
+        B_for_P = B_mat
+    BtPB = (B_for_P.T @ P @ B_for_P).item()
     print(f"  B^T P B:                               {BtPB:.6f}")
     print(f"  LQR gain norm (||F||):                 {gain_norm:.6f}")
     residual_ctrl_budget = max_tracking_error_latent * gain_norm
@@ -659,6 +694,20 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
             denom /= B_scale
         tracking_x_for_2 = 2.0 / denom
         print(f"  max_tracking_error_x for budget=2:     {tracking_x_for_2:.6f}")
+
+        # If budget=2 requires a smaller tracking error, use that instead
+        if tracking_x_for_2 < max_tracking_error_x:
+            print(f"\033[93m  Clamping max_tracking_error_x: {max_tracking_error_x:.6f} -> "
+                  f"{tracking_x_for_2:.6f} (to fit actuator budget)\033[0m")
+            max_tracking_error_x = tracking_x_for_2
+            max_tracking_error_latent = state_error_to_latent_error(max_tracking_error_x, m)
+            residual_ctrl_budget = max_tracking_error_latent * gain_norm
+            if scale_B:
+                residual_ctrl_budget /= B_scale
+            delta_max_lyap = math.sqrt(max(max_tracking_error_latent**2 * (1.0 - rho_sq) / kappa_P, 0.0)) - eta
+            print(f"  Updated max_tracking_error_latent:     {max_tracking_error_latent:.6f}")
+            print(f"  Updated residual_ctrl_budget:          {residual_ctrl_budget:.6f} N-m")
+
     print(f"  κ(P) = λ_max(P)/λ_min(P):             {kappa_P:.6f}")
     print(f"  ρ² (Lyapunov):                         {rho_sq:.6f}")
     if delta_max_lyap < 0:
@@ -826,8 +875,9 @@ def main():
 
     env = make_env(cfg)
     if cfg.get("no_base_policy", False):
-        policy = None
-        print("No base policy — using random actions only")
+        from launch.eval_policy import zero_policy
+        policy = zero_policy
+        print("No base policy — using zero actions")
     else:
         policy = make_base_policy(cfg)
 
@@ -873,6 +923,16 @@ def main():
         variables.update(lyap_vars)
         if lqr is None:
             lqr = lyap_lqr
+
+    # Check stability feasibility before proceeding
+    delta_max = variables.get("max_runtime_error_latent",
+                              variables.get("delta_max_lyapunov", None))
+    if delta_max is not None and delta_max < 0:
+        print(f"\n\033[91mStopping after Phase 3: delta_max = {delta_max:.6f} < 0 "
+              f"(infeasible error budget). Tune Q/R scales or retrain.\033[0m")
+        env.close()
+        print(f"\n=== Pipeline stopped. Outputs in {run_dir} ===")
+        return
 
     # Phase 4: Residual policy training
     # Phase 5: Final combined benchmark

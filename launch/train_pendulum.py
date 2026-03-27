@@ -57,14 +57,17 @@ def bang_energy_policy(obs, kp=10.0, kd=3.0, k_e=2.0, switch_angle=1.0472):
     Pendulum-v1 physics: m=1, l=1, g=10, I=ml^2/3=1/3, max_torque=2.
     Energy: E = thdot^2/6 + 5*cos_th.  E_upright = 5 (theta=0, thdot=0).
 
+    When E < E_target: pump energy via bang-bang in direction of thdot*cos_th.
+    When E > E_target: brake at half gain to shed excess energy.
+
     Args:
         switch_angle: radians, switch to PD balance when |theta| < this value.
     """
     cos_th, sin_th, thdot = obs
     theta = np.arctan2(sin_th, cos_th)
 
-    E = thdot**2 / 6.0 - 5.0 * cos_th
-    E_target = -5.0
+    E = thdot**2 / 6.0 + 5.0 * cos_th
+    E_target = 5.0
 
     if E < E_target:
         u_swing = k_e * np.sign(thdot * cos_th)
@@ -163,6 +166,19 @@ def eigenvalue_spread_loss(log_d, rho, min_gap=0.1):
     d = torch.sort(torch.tanh(log_d) * rho).values
     gaps = d[1:] - d[:-1]
     return torch.relu(min_gap - gaps).sum()
+
+
+def unit_circle_gap_loss(A, gap=0.05):
+    """Penalize eigenvalues within gap of the unit circle.
+
+    Pushes eigenvalues to be either clearly stable (|λ| < 1-gap)
+    or clearly unstable (|λ| > 1+gap). Near-unit eigenvalues
+    make the Lyapunov decrease trivially small regardless of Q.
+    """
+    eigenvalues = torch.linalg.eigvals(A)
+    mags = eigenvalues.abs()
+    dist_from_unit = gap - torch.abs(mags - 1.0)
+    return torch.relu(dist_from_unit).sum()
 
 
 def unstable_controllability_loss(A, B_matrix, threshold=1.0):
@@ -341,6 +357,12 @@ def build_loss_fns(cfg, model):
             return controllability_loss(model.A, model.B_matrix, horizon=horizon)
         losses["Ctrl"] = (_ctrl, cfg["ctrl_weight"])
 
+    if cfg.get("unstable_ctrl_loss", False):
+        uc_threshold = cfg.get("unstable_ctrl_threshold", 1.0)
+        def _uctrl(model, states_seq, actions_seq, all_states):
+            return unstable_controllability_loss(model.A, model.B_matrix, threshold=uc_threshold)
+        losses["UCtrl"] = (_uctrl, cfg["unstable_ctrl_weight"])
+
     if cfg.get("bi_lipschitz_loss", False):
         m_target = cfg.get("bilip_m_target", 0.5)
         def _bilip(model, states_seq, actions_seq, all_states):
@@ -385,11 +407,11 @@ def build_loss_fns(cfg, model):
             return eigenvalue_spread_loss(model.K_module.log_d, rho, min_gap=min_gap)
         losses["ESprd"] = (_espread, cfg["eig_spread_weight"])
 
-    if cfg.get("unstable_ctrl_loss", False):
-        uc_threshold = cfg.get("unstable_ctrl_threshold", 1.0)
-        def _uctrl(model, states_seq, actions_seq, all_states):
-            return unstable_controllability_loss(model.A, model.B_matrix, threshold=uc_threshold)
-        losses["UCtrl"] = (_uctrl, cfg["unstable_ctrl_weight"])
+    if cfg.get("unit_circle_gap_loss", False):
+        gap = cfg.get("unit_circle_gap", 0.05)
+        def _ucgap(model, states_seq, actions_seq, all_states):
+            return unit_circle_gap_loss(model.A, gap=gap)
+        losses["UCGap"] = (_ucgap, cfg["unit_circle_gap_weight"])
 
     if cfg.get("upper_lipschitz_loss", False):
         m_max = cfg.get("upper_lip_m_max", 1.0)
@@ -474,7 +496,12 @@ def train(model, trajectories, cfg):
     print(f"Active losses: {', '.join(f'{n} (w={loss_fns[n][1]})' for n in active_names)}")
 
     # 4. Training loop
+    import copy
     loss_threshold = cfg.get("loss_threshold", 0.001)
+    best_loss = float("inf")
+    best_state_dict = copy.deepcopy(model.state_dict())
+    best_epoch = 0
+
     for epoch in range(1, cfg["num_epochs"] + 1):
         model.train()
         epoch_accum = {name: 0.0 for name in active_names}
@@ -502,6 +529,13 @@ def train(model, trajectories, cfg):
         scheduler.step()
 
         avg_total = epoch_total / n_batches
+
+        # Track best model
+        if avg_total < best_loss:
+            best_loss = avg_total
+            best_state_dict = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+
         if epoch % cfg["log_interval"] == 0 or epoch == 1:
             parts = [f"Epoch {epoch:4d} | Total: {avg_total:.6f}"]
             for name in active_names:
@@ -513,9 +547,13 @@ def train(model, trajectories, cfg):
             print(f"Early stop: total loss {avg_total:.6f} < threshold {loss_threshold}")
             break
 
+    # Restore best model
+    model.load_state_dict(best_state_dict)
+
     # Final loss summary
     print("\n--- Training Complete ---")
-    print(f"  Total: {epoch_total / n_batches:.6f}")
+    print(f"  Best total: {best_loss:.6f} (epoch {best_epoch})")
+    print(f"  Final total: {epoch_total / n_batches:.6f}")
     for name in active_names:
         print(f"  {name:>6s}: {epoch_accum[name] / n_batches:.6f}")
     print(f"  Epochs: {epoch}/{cfg['num_epochs']}")
@@ -571,5 +609,6 @@ if __name__ == "__main__":
     # Save checkpoint
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
     ckpt_path = os.path.join(cfg["checkpoint_dir"], "final.pt")
-    torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
+    save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
+    torch.save({"model": save_dict, "config": cfg}, ckpt_path)
     print(f"Saved checkpoint to {ckpt_path}")

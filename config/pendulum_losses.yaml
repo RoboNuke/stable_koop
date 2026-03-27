@@ -1,9 +1,9 @@
 # Run
-run_name: "pendulum_pd"
+run_name: "no_losses"
 
 # Environment
 env_name: "Pendulum-v1"
-num_trajectories: 200
+num_trajectories: 2000
 max_episode_steps: 200
 
 # Model
@@ -33,40 +33,43 @@ hold_steps: 5  # number of steps to hold each sampled perturbation before resamp
 # LQR / Stability
 use_eigen_bound: false  # spectral radius / transient constant bound
 use_lyapunov_bound: true  # Lyapunov-based bound
-q_scale: 100
-r_scale: 0.001
+controllable_subspace: true  # if true, solve LQR only in controllable subspace
+ctrl_threshold: 0.1          # controllability singular value threshold (null = machine epsilon default)
+
+q_scale: 1000
+r_scale: 0.0001
 max_tracking_error_x: 0.5 #0.3 # define by success bounds (1-cos(15), sin(15), 1)
 max_displacement_x: 0.1 #0.57 # define as maximum possible displacement of system (0.4, 0.4, 0.8)
 
 # Training
 horizon: 5
 batch_size: 1024
-lr: 1.0e-3
+lr: 5.0e-5
 weight_decay: 1.0e-5
 num_epochs: 200
 loss_threshold: -100000 #0.003 #0.003 works with pred_weight=10
-scheduler_step: 50
+scheduler_step: 100
 scheduler_gamma: 0.5
 riemannian_optimizer: false  # use geoopt RiemannianAdam instead of Adam
 vectorize_rollout: true  # use closed-form vectorized prediction rollout (faster but more memory)
-torch_compile: false  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)
+torch_compile: true  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)
 
 # losses
-recon_weight: 1.0
-pred_weight: 1.0
-latent_consistency_weight: 0.0
+recon_weight: 0.05 #1.0
+pred_weight: 0.05 #1.0
+latent_consistency_weight: 2.0 #0.1
 
-controllability_loss: true
-ctrl_weight: 0.05 
+controllability_loss: false
+ctrl_weight: 0.5
 
-bi_lipschitz_loss: true
-bilip_weight: 1
+bi_lipschitz_loss: false
+bilip_weight: 2.0
 bilip_m_target: 1.0
 
-spectral_loss: true
-spectral_weight: 0.01
+spectral_loss: false
+spectral_weight: 0.5
 
-normality_loss: true
+normality_loss: false
 normality_weight: 2.0
 
 cl_normality_loss: false
@@ -81,7 +84,7 @@ b_eigen_loss: false
 b_eigen_weight: 1.0
 b_eigen_min_scale: 0.3
 
-b_scale_loss: true
+b_scale_loss: false
 b_scale_weight: 2.0
 b_scale_target: 1.0
 
@@ -90,11 +93,17 @@ eig_spread_weight: 1.0
 eig_spread_min_gap: 0.1
 
 unstable_ctrl_loss: false
-unstable_ctrl_weight: 0.05
-unstable_ctrl_threshold: 1.0
+unstable_ctrl_weight: 1.0
+unstable_ctrl_threshold: 0.99
+
+unit_circle_gap_loss: false
+unit_circle_gap_weight: 1.0
+unit_circle_gap: 0.05
+
+
 
 # Eval
-num_parallel_evals: 16
+num_parallel_evals: 1
 eval_num_trajectories: 200
 eval_max_steps: 200
 eval_seed: 42
