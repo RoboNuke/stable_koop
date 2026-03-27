@@ -19,11 +19,10 @@ from launch.train_pendulum import collect_data, train
 from model.autoencoder import KoopmanAutoencoder
 
 
-def make_run_dir(cfg):
-    """Create and return output/{run_name}_{datetime}/."""
-    run_name = cfg.get("run_name", "run")
+def make_run_dir(exp_name):
+    """Create and return output/{exp_name}_{datetime}/."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = os.path.join("output", f"{run_name}_{timestamp}")
+    run_dir = os.path.join("output", f"{exp_name}_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
 
@@ -833,6 +832,8 @@ def phase_5_final_eval(env, base_policy, residual_model, lqr, cfg, run_dir, base
 
 def main():
     parser = argparse.ArgumentParser(description="Koopman pipeline runner")
+    parser.add_argument("exp_name", type=str,
+                        help="Experiment name (used for output directory)")
     parser.add_argument("--config", type=str, required=True,
                         help="Path to YAML config file")
     parser.add_argument("--no-augment", action="store_true", default=False,
@@ -849,7 +850,7 @@ def main():
     augment = not args.no_augment
     cfg["augment_state"] = augment
 
-    run_dir = make_run_dir(cfg)
+    run_dir = make_run_dir(args.exp_name)
 
     # Tee stdout to log file
     import sys
@@ -879,12 +880,7 @@ def main():
     eval_env = make_env(cfg)
     train_env = gym.make(cfg["env_name"])
 
-    if cfg.get("no_base_policy", False):
-        from launch.eval_policy import zero_policy
-        policy = zero_policy
-        print("No base policy — using zero actions")
-    else:
-        policy = make_base_policy(cfg)
+    policy = make_base_policy(cfg)
 
     # Compute observation and action scaling (single env has 1-D bounds)
     obs_scale = compute_obs_scale(train_env, augment)

@@ -638,6 +638,173 @@ def make_a_only_heatmap(model, aug_trajectories, raw_trajectories, cfg, run_dir,
     print(f"A-only perturbation heatmap saved to {path}")
 
 
+def make_latent_diff_heatmap(model, B_final, aug_trajectories, raw_trajectories,
+                             cfg, run_dir):
+    """Heatmap: improvement in latent error from adding B.
+
+    Color = error_A_only - error_A+B. Positive (green) = B helps,
+    negative (red) = B hurts.
+    """
+    device = next(model.parameters()).device
+    model.eval()
+
+    B_t = torch.tensor(B_final, dtype=torch.float32, device=device)
+
+    all_angles = []
+    all_perturbations = []
+    all_diffs = []
+
+    with torch.no_grad():
+        A = model.A.detach()
+        for (states_norm, actions_norm), (states_raw, _, perturbations_raw) in zip(
+                aug_trajectories, raw_trajectories):
+            states_t = torch.tensor(states_norm, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions_norm, dtype=torch.float32, device=device)
+
+            z_all = model.encode(states_t)
+            z_t = z_all[:-1]
+            z_next = z_all[1:]
+            u_t = actions_t[:len(z_t)]
+
+            err_a = torch.linalg.norm(z_next - z_t @ A.T, dim=-1)
+            err_ab = torch.linalg.norm(z_next - (z_t @ A.T + u_t @ B_t.T), dim=-1)
+            diff = (err_a - err_ab).cpu().numpy()  # positive = B helps
+
+            angles = np.array([obs_to_angle(s) for s in states_raw[:-2]])
+            perturbs = perturbations_raw[:len(angles), 0]
+
+            all_angles.append(angles)
+            all_perturbations.append(perturbs)
+            all_diffs.append(diff[:len(angles)])
+
+    all_angles = np.concatenate(all_angles)
+    all_perturbations = np.concatenate(all_perturbations)
+    all_diffs = np.concatenate(all_diffs)
+
+    u_min, u_max = all_perturbations.min(), all_perturbations.max()
+    u_bins = np.linspace(u_min, u_max, 41)
+    u_centers = 0.5 * (u_bins[:-1] + u_bins[1:])
+    angle_bins = np.linspace(-np.pi, np.pi, 37)
+    angle_centers = 0.5 * (angle_bins[:-1] + angle_bins[1:])
+
+    heatmap = np.full((len(angle_centers), len(u_centers)), np.nan)
+    u_idx = np.digitize(all_perturbations, u_bins) - 1
+    a_idx = np.digitize(all_angles, angle_bins) - 1
+
+    for ai in range(len(angle_centers)):
+        for ui in range(len(u_centers)):
+            mask = (a_idx == ai) & (u_idx == ui)
+            if mask.sum() > 0:
+                heatmap[ai, ui] = np.mean(all_diffs[mask])
+
+    # Symmetric color scale centered at 0
+    abs_max = np.nanmax(np.abs(heatmap))
+    cmap = plt.cm.RdYlGn.copy()  # red=negative(B hurts), green=positive(B helps)
+    cmap.set_bad(color="lightgrey")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    im = ax.pcolormesh(
+        u_centers, np.degrees(angle_centers), heatmap,
+        cmap=cmap, shading="nearest",
+        vmin=-abs_max, vmax=abs_max,
+    )
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("Latent Error Improvement (A_only - A+B)")
+
+    ax.set_xlabel("Control Perturbation (u)")
+    ax.set_ylabel("Pendulum Angle (degrees)")
+    ax.set_title("B Improvement: Latent Error (green=B helps, red=B hurts)")
+
+    path = os.path.join(run_dir, "latent_diff_heatmap.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Latent diff heatmap saved to {path}")
+
+
+def make_prediction_diff_heatmap(model, B_final, aug_trajectories, raw_trajectories,
+                                  cfg, run_dir, eval_horizon=5):
+    """Heatmap: improvement in prediction error from adding B.
+
+    Color = error_A_only - error_A+B. Positive (green) = B helps,
+    negative (red) = B hurts.
+    """
+    device = next(model.parameters()).device
+    model.eval()
+
+    B_t = torch.tensor(B_final, dtype=torch.float32, device=device)
+
+    true_angles_all = []
+    diffs_all = []
+
+    with torch.no_grad():
+        A = model.A.detach()
+        for (states_norm, actions_norm), (states_raw, _, _) in zip(
+                aug_trajectories, raw_trajectories):
+            states_t = torch.tensor(states_norm, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions_norm, dtype=torch.float32, device=device)
+
+            z_ab = model.encode(states_t[0:1])
+            z_a = z_ab.clone()
+            T = min(eval_horizon, len(actions_norm))
+            for t in range(T):
+                u = actions_t[t:t+1]
+                z_ab = z_ab @ A.T + u @ B_t.T
+                z_a = z_a @ A.T
+
+                x_pred_ab = model.decode(z_ab).cpu().numpy()[0]
+                x_pred_a = model.decode(z_a).cpu().numpy()[0]
+
+                true_angle = obs_to_angle(states_raw[t + 1])
+                err_ab = abs(((obs_to_angle(x_pred_ab) - true_angle + np.pi) % (2 * np.pi)) - np.pi)
+                err_a = abs(((obs_to_angle(x_pred_a) - true_angle + np.pi) % (2 * np.pi)) - np.pi)
+
+                true_angles_all.append(true_angle)
+                diffs_all.append((t + 1, err_a - err_ab))  # positive = B helps
+
+    angle_bins = np.linspace(-np.pi, np.pi, 37)
+    angle_centers = 0.5 * (angle_bins[:-1] + angle_bins[1:])
+    steps = np.arange(1, eval_horizon + 1)
+
+    heatmap = np.full((len(angle_centers), eval_horizon), np.nan)
+    true_angles_all = np.array(true_angles_all)
+    diffs_arr = np.array(diffs_all)
+
+    for t in range(eval_horizon):
+        mask = diffs_arr[:, 0] == (t + 1)
+        angles_t = true_angles_all[mask]
+        diffs_t = diffs_arr[mask, 1]
+        bin_idx = np.digitize(angles_t, angle_bins) - 1
+        for b in range(len(angle_centers)):
+            in_bin = diffs_t[bin_idx == b]
+            if len(in_bin) > 0:
+                heatmap[b, t] = np.mean(in_bin)
+
+    abs_max = np.nanmax(np.abs(heatmap))
+    heatmap_deg = np.degrees(heatmap)
+    abs_max_deg = np.nanmax(np.abs(heatmap_deg))
+
+    cmap = plt.cm.RdYlGn.copy()
+    cmap.set_bad(color="lightgrey")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    im = ax.pcolormesh(
+        steps, np.degrees(angle_centers), heatmap_deg,
+        cmap=cmap, shading="nearest",
+        vmin=-abs_max_deg, vmax=abs_max_deg,
+    )
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("Prediction Error Improvement (degrees)")
+
+    ax.set_xlabel("Prediction Step")
+    ax.set_ylabel("True Pendulum Angle (degrees)")
+    ax.set_title("B Improvement: Prediction Error (green=B helps, red=B hurts)")
+
+    path = os.path.join(run_dir, "prediction_diff_heatmap.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Prediction diff heatmap saved to {path}")
+
+
 def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
                      obs_scale=None, num_trajectories=None):
     """Analytically derive B matrix for a pre-trained Koopman model.
@@ -704,6 +871,10 @@ def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
     make_a_only_heatmap(model, aug_trajectories, trajectories, cfg, run_dir,
                         vmin=recon_vmin, vmax=recon_vmax,
                         filename="A_with_pert_heatmap-scaled.png")
+    make_latent_diff_heatmap(model, B_ls, aug_trajectories, trajectories,
+                             cfg, run_dir)
+    make_prediction_diff_heatmap(model, B_ls, aug_trajectories, trajectories,
+                                 cfg, run_dir, eval_horizon=train_horizon)
 
     # Save results
     A_f64 = A.astype(np.float64)

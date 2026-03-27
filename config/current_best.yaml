@@ -19,7 +19,8 @@ init_b_in_a: false  # initialize B in A eigenbasis (only effective with two-step
 
 # Policy
 
-no_base_policy: true  # if true, use random actions instead of PD policy
+# Policy (options: "none", "energy", "bang_energy")
+base_policy: "none"
 kp: 10.0
 kd: 2.0
 

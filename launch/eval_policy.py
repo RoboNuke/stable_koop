@@ -15,14 +15,29 @@ def zero_policy(obs):
 
 
 def make_policy(cfg):
-    """Build the policy callable from config. Extension point for residual policies."""
+    """Build the policy callable from config.
+
+    Uses cfg["base_policy"]: "none", "energy", "bang_energy".
+    """
+    policy_type = cfg.get("base_policy", "none")
+
+    if policy_type == "none":
+        print(f"Using base_policy='none' (zero actions)")
+        return zero_policy
+
     kp, kd = cfg["kp"], cfg["kd"]
     ke = cfg["ke"]
-    sa = cfg['sa'] * 3.14159/180
-    print(f"Using kp={kp} and kd={kd} and ke={ke} and switch_angle={sa}")
-    #return lambda obs: pd_policy(obs, kp, kd)
-    #return lambda obs: bang_energy_policy(obs, kp, kd, ke, switch_angle=sa)
-    return lambda obs: energy_shaping_policy(obs, kp, kd, ke, switch_angle=sa)
+    sa = cfg['sa'] * 3.14159 / 180
+
+    if policy_type == "energy":
+        print(f"Using base_policy='energy' (kp={kp}, kd={kd}, ke={ke}, sa={sa:.4f})")
+        return lambda obs: energy_shaping_policy(obs, kp, kd, ke, switch_angle=sa)
+    elif policy_type == "bang_energy":
+        print(f"Using base_policy='bang_energy' (kp={kp}, kd={kd}, ke={ke}, sa={sa:.4f})")
+        return lambda obs: bang_energy_policy(obs, kp, kd, ke, switch_angle=sa)
+    else:
+        raise ValueError(f"Unknown base_policy='{policy_type}'. "
+                         f"Options: 'none', 'energy', 'bang_energy'")
 
 
 def check_success(states, cfg):

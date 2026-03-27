@@ -424,12 +424,7 @@ if __name__ == "__main__":
     print(f"LQR: F shape={lqr.F.shape}, gain_norm={lqr.gain_norm:.4f}")
 
     # 6. Build base policy
-    if cfg.get("no_base_policy", False):
-        from launch.eval_policy import zero_policy
-        base_policy = zero_policy
-        print("No base policy — using zero actions")
-    else:
-        base_policy = make_policy(cfg)
+    base_policy = make_policy(cfg)
 
     # 7. Set up output directory
     import shutil

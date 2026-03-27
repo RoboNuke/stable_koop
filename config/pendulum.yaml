@@ -17,8 +17,8 @@ encoder_spec_norm: false
 encoder_latent: 16
 init_b_in_a: True  # initialize B in A eigenbasis (only effective with two-step training)
 
-# Policy
-no_base_policy: true  # if true, use random actions instead of PD policy
+# Policy (options: "none", "energy", "bang_energy")
+base_policy: "none"
 kp: 10.0
 kd: 2.0
 

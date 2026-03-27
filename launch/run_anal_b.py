@@ -113,6 +113,8 @@ def phase_2_analytical_B(model, env, policy, cfg, run_dir, augment=True,
 def main():
     parser = argparse.ArgumentParser(
         description="Train Koopman A matrix only (base policy absorbed, u=0)")
+    parser.add_argument("exp_name", type=str,
+                        help="Experiment name (used for output directory)")
     parser.add_argument("--config", type=str, required=True,
                         help="Path to YAML config file")
     parser.add_argument("--no-augment", action="store_true", default=False,
@@ -125,7 +127,7 @@ def main():
     augment = not args.no_augment
     cfg["augment_state"] = augment
 
-    run_dir = make_run_dir(cfg)
+    run_dir = make_run_dir(args.exp_name)
 
     # Tee stdout to log file
     import sys
@@ -158,15 +160,12 @@ def main():
     RED = "\033[91m"
     RESET = "\033[0m"
 
-    if cfg.get("no_base_policy", False):
-        from launch.eval_policy import zero_policy
-        policy = zero_policy
-        print(f"{RED}WARNING: no_base_policy=True but this script is designed to absorb "
+    policy = make_base_policy(cfg)
+    if cfg.get("base_policy", "none") == "none":
+        print(f"{RED}WARNING: base_policy='none' but this script is designed to absorb "
               f"the base policy into autonomous dynamics.{RESET}")
         print(f"{RED}FALLBACK: Using zero_policy (u=0 everywhere). The Koopman A matrix "
               f"will learn uncontrolled dynamics only.{RESET}")
-    else:
-        policy = make_base_policy(cfg)
 
     # Compute observation and action scaling (single env has 1-D bounds)
     obs_scale = compute_obs_scale(train_env, augment)
