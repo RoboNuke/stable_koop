@@ -19,13 +19,13 @@ import matplotlib.pyplot as plt
 import yaml
 from tqdm import tqdm
 
-from launch.train_pendulum import energy_shaping_policy
+from launch.train_pendulum import energy_shaping_policy, bang_energy_policy
 from launch.eval_policy import check_success
 
 
 PARAM_DEFAULTS = {
-    "ke":           (0.1,  3.0,  20),
-    "kp":           (5.0,  20.0, 15),
+    "ke":           (0.0,  1.0,  100),
+    "kp":           (5.0,  15.0, 100),
     "kd":           (0.5,  5.0,  15),
     "switch_angle": (10.0, 90.0, 15),  # degrees
     "gamma":        (0.3,  1.0,  15),
@@ -65,7 +65,7 @@ def resolve_params(x_name, x_val, y_name, y_val, fixed):
 
 
 def run_sweep(cfg, env, x_name, y_name, x_range, y_range, fixed,
-              num_traj=200, max_steps=200):
+              policy_fn=energy_shaping_policy, num_traj=200, max_steps=200):
     x_values = np.linspace(*x_range)
     y_values = np.linspace(*y_range)
     results = np.zeros((len(y_values), len(x_values)))
@@ -81,7 +81,7 @@ def run_sweep(cfg, env, x_name, y_name, x_range, y_range, fixed,
                 obs, _ = env.reset()
                 states = [obs]
                 for t in range(max_steps):
-                    action = energy_shaping_policy(
+                    action = policy_fn(
                         obs, kp=p["kp"], kd=p["kd"], k_e=p["ke"],
                         switch_angle=math.radians(p["switch_angle"]),
                     )
@@ -144,6 +144,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Sweep 2 energy shaping parameters and plot success rate")
     parser.add_argument("--config", type=str, default="config/pendulum.yaml")
+    parser.add_argument("--type", type=str, required=True, choices=["energy", "bang"],
+                        help="Policy type: 'energy' for energy_shaping, 'bang' for bang_energy")
     parser.add_argument("--x", type=str, required=True, choices=PARAM_DEFAULTS.keys(),
                         help="Parameter for x-axis")
     parser.add_argument("--y", type=str, required=True, choices=PARAM_DEFAULTS.keys(),
@@ -190,6 +192,9 @@ def main():
     x_range = (x_range[0], x_range[1], int(x_range[2]))
     y_range = (y_range[0], y_range[1], int(y_range[2]))
 
+    policy_fn = energy_shaping_policy if args.type == "energy" else bang_energy_policy
+
+    print(f"Policy type: {args.type}")
     print(f"Sweeping {args.x} ({x_range[0]}-{x_range[1]}, n={x_range[2]}) "
           f"x {args.y} ({y_range[0]}-{y_range[1]}, n={y_range[2]})")
     print(f"Fixed: { {k: v for k, v in fixed.items() if k not in {args.x, args.y}} }")
@@ -197,7 +202,7 @@ def main():
     env = gym.make(cfg["env_name"])
     x_vals, y_vals, results = run_sweep(
         cfg, env, args.x, args.y, x_range, y_range, fixed,
-        num_traj=args.num_traj, max_steps=args.max_steps,
+        policy_fn=policy_fn, num_traj=args.num_traj, max_steps=args.max_steps,
     )
     env.close()
 

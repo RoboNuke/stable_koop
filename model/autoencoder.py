@@ -8,7 +8,7 @@ class CayleyK(nn.Module):
     def __init__(self, latent_dim, rho=0.95):
         super().__init__()
         self.rho = rho
-        self.A_upper = nn.Parameter(torch.randn(latent_dim, latent_dim) * 0.01)
+        self.A_upper = nn.Parameter(torch.randn(latent_dim, latent_dim))
         self.latent_dim = latent_dim
 
     @property
@@ -150,11 +150,11 @@ class KoopmanAutoencoder(nn.Module):
         elif encoder_type == "linear":
             self.encoder = nn.Sequential(
                 nn.Linear(state_dim, encoder_latent), 
-                #nn.Tanh(),
-                nn.ReLU(),
+                nn.Tanh(),
+                #nn.ReLU(),
                 nn.Linear(encoder_latent, encoder_latent),        
-                #nn.Tanh(),
-                nn.ReLU(),
+                nn.Tanh(),
+                #nn.ReLU(),
                 nn.Linear(encoder_latent, latent_dim)
             )
 
@@ -163,10 +163,13 @@ class KoopmanAutoencoder(nn.Module):
                 if hasattr(layer, 'weight'):
                     nn.utils.parametrizations.spectral_norm(layer)
         
+        # making the decoder lower capacity forces the encoder to do better work
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 64), nn.Tanh(),
-            nn.Linear(64, 64),         nn.Tanh(),
-            nn.Linear(64, state_dim)
+            nn.Linear(latent_dim, encoder_latent//2), 
+            nn.Tanh(),
+            nn.Linear(encoder_latent//2, encoder_latent//2),         
+            nn.Tanh(),
+            nn.Linear(encoder_latent//2, state_dim)
         )
         self.b_from_k_mod = False
         if k_type == "cayley":
@@ -183,7 +186,7 @@ class KoopmanAutoencoder(nn.Module):
         
 
         self.B = nn.Linear(action_dim, latent_dim, bias=False)
-        nn.init.zeros_(self.B.weight)
+        #nn.init.zeros_(self.B.weight)
 
     def encode(self, x):    return self.encoder(x)
     def decode(self, z):    return self.decoder(z)

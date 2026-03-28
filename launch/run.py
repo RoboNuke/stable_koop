@@ -484,6 +484,32 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
         print(f"\033[92m  max_runtime_error_latent:              {max_runtime_error_latent:.6f}\033[0m")
     print(f"  residual_ctrl_budget:                  {residual_ctrl_budget:.6f}")
 
+    # One-step prediction error in latent space
+    model.to(device)
+    model.eval()
+    all_latent_errs = []
+    with torch.no_grad():
+        for states, actions in aug_trajectories:
+            states_t = torch.tensor(states, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
+            T_act = len(actions)
+            z_all = model.encode(states_t[:T_act])
+            z_next = model.encode(states_t[1:T_act + 1])
+            z_pred = model.predict(z_all, actions_t[:T_act])
+            errs = torch.linalg.norm(z_next - z_pred, dim=-1)
+            all_latent_errs.append(errs.cpu())
+    all_latent_errs = torch.cat(all_latent_errs)
+    err_mean = all_latent_errs.mean().item()
+    err_std = all_latent_errs.std().item()
+    err_2sigma = err_mean + 2 * err_std
+    print(f"  " + "-" * 48)
+    print(f"  One-step latent error mean:            {err_mean:.6f}")
+    print(f"  One-step latent error std:             {err_std:.6f}")
+    if err_2sigma > max_runtime_error_latent:
+        print(f"\033[91m  One-step latent error mean+2σ:         {err_2sigma:.6f}\033[0m")
+    else:
+        print(f"\033[92m  One-step latent error mean+2σ:         {err_2sigma:.6f}\033[0m")
+
     # Heatmap: max_runtime_error_latent over (max_tracking_error_x, max_displacement_x)
     import matplotlib.pyplot as plt
     from matplotlib.colors import TwoSlopeNorm
@@ -642,7 +668,7 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     action_dim = cfg["action_dim"]
     q_scale = cfg.get("q_scale", 1.0)
     R = torch.eye(action_dim) * cfg["r_scale"]
-    scale_B=True
+    scale_B = cfg.get("scale_B", False)
     if scale_B:
         print("Scaling B")
         B_scale = torch.norm(B_mat, p=2)
@@ -715,6 +741,32 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
         print(f"\033[91m  δ_max (Lyapunov):                      {delta_max_lyap:.6f}\033[0m")
     else:
         print(f"\033[92m  δ_max (Lyapunov):                      {delta_max_lyap:.6f}\033[0m")
+
+    # One-step prediction error in latent space
+    model_on_device = model.to(device)
+    model_on_device.eval()
+    all_latent_errs = []
+    with torch.no_grad():
+        for states, actions in aug_trajectories:
+            states_t = torch.tensor(states, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
+            T_act = len(actions)
+            z_all = model_on_device.encode(states_t[:T_act])
+            z_next = model_on_device.encode(states_t[1:T_act + 1])
+            z_pred = model_on_device.predict(z_all, actions_t[:T_act])
+            errs = torch.linalg.norm(z_next - z_pred, dim=-1)
+            all_latent_errs.append(errs.cpu())
+    all_latent_errs = torch.cat(all_latent_errs)
+    err_mean = all_latent_errs.mean().item()
+    err_std = all_latent_errs.std().item()
+    err_2sigma = err_mean + 2 * err_std
+    print(f"  " + "-" * 48)
+    print(f"  One-step latent error mean:                {err_mean:.6f}")
+    print(f"  One-step latent error std:                 {err_std:.6f}")
+    if err_2sigma > delta_max_lyap:
+        print(f"\033[91m  One-step latent error mean+2σ:             {err_2sigma:.6f}\033[0m")
+    else:
+        print(f"\033[92m  One-step latent error mean+2σ:             {err_2sigma:.6f}\033[0m")
 
     # Heatmap: delta_max_lyap over (max_tracking_error_x, max_displacement_x)
     n_heatmap = 200
@@ -832,8 +884,6 @@ def phase_5_final_eval(env, base_policy, residual_model, lqr, cfg, run_dir, base
 
 def main():
     parser = argparse.ArgumentParser(description="Koopman pipeline runner")
-    parser.add_argument("exp_name", type=str,
-                        help="Experiment name (used for output directory)")
     parser.add_argument("--config", type=str, required=True,
                         help="Path to YAML config file")
     parser.add_argument("--no-augment", action="store_true", default=False,
@@ -844,13 +894,17 @@ def main():
                         help="Save every residual policy checkpoint (not just best)")
     args = parser.parse_args()
 
+    exp_name = input("Enter experiment name: ").strip()
+    if not exp_name:
+        raise ValueError("Experiment name cannot be empty.")
+
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
     augment = not args.no_augment
     cfg["augment_state"] = augment
 
-    run_dir = make_run_dir(args.exp_name)
+    run_dir = make_run_dir(exp_name)
 
     # Tee stdout to log file
     import sys

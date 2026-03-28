@@ -10,12 +10,12 @@ import argparse
 import os
 from datetime import datetime
 
+import gymnasium as gym
 import numpy as np
 import torch
 import yaml
 
 from launch.run import (
-    make_env,
     make_base_policy,
     compute_obs_scale,
     collect_perturbed_data,
@@ -61,8 +61,8 @@ def main():
     print(f"Augment state with base policy action: {augment}")
     save_config(cfg, run_dir)
 
-    # Environment and policy
-    env = make_env(cfg)
+    # Environment and policy (single env for correct 1-D observation bounds)
+    env = gym.make(cfg["env_name"])
     policy = make_base_policy(cfg)
     obs_scale = compute_obs_scale(env, augment)
     cfg["obs_scale"] = obs_scale.tolist()

@@ -113,13 +113,15 @@ def phase_2_analytical_B(model, env, policy, cfg, run_dir, augment=True,
 def main():
     parser = argparse.ArgumentParser(
         description="Train Koopman A matrix only (base policy absorbed, u=0)")
-    parser.add_argument("exp_name", type=str,
-                        help="Experiment name (used for output directory)")
     parser.add_argument("--config", type=str, required=True,
                         help="Path to YAML config file")
     parser.add_argument("--no-augment", action="store_true", default=False,
                         help="Do not append base policy action to the Koopman state")
     args = parser.parse_args()
+
+    exp_name = input("Enter experiment name: ").strip()
+    if not exp_name:
+        raise ValueError("Experiment name cannot be empty.")
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -127,7 +129,7 @@ def main():
     augment = not args.no_augment
     cfg["augment_state"] = augment
 
-    run_dir = make_run_dir(args.exp_name)
+    run_dir = make_run_dir(exp_name)
 
     # Tee stdout to log file
     import sys

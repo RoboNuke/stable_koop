@@ -12,6 +12,7 @@ import argparse
 import os
 from datetime import datetime
 
+import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -19,7 +20,6 @@ import yaml
 
 from launch.eval_pendulum import obs_to_angle
 from launch.run import (
-    make_env,
     make_base_policy,
     compute_obs_scale,
     collect_perturbed_data,
@@ -970,7 +970,7 @@ def main():
     print(f"Augment state: {augment}")
 
     # Environment and policy
-    env = make_env(cfg)
+    env = gym.make(cfg["env_name"])
     policy = make_base_policy(cfg)
     obs_scale = compute_obs_scale(env, augment)
     cfg["obs_scale"] = obs_scale.tolist()

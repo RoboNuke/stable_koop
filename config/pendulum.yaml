@@ -34,18 +34,23 @@ controllable_subspace: false  # if true, solve LQR only in controllable subspace
 ctrl_threshold: null          # controllability singular value threshold (null = machine epsilon default)
 q_scale: 1
 r_scale: 1
+scale_B: false
 max_tracking_error_x: 0.3 # define by success bounds (1-cos(15), sin(15), 1)
 max_displacement_x: 0.57 # define as maximum possible displacement of system (0.4, 0.4, 0.8)
 
 # Training
 horizon: 5
 batch_size: 2048 #1024
+num_workers: 4
 lr: 1.0e-2
 weight_decay: 1.0e-5
 num_epochs: 100
 loss_threshold: -10 #0.003 works with pred_weight=10
 scheduler_step: 100
 scheduler_gamma: 0.5
+cosine_scheduler: false
+cosine_T_max: 200
+cosine_eta_min: 1.0e-6
 riemannian_optimizer: true  # use geoopt RiemannianAdam instead of Adam
 vectorize_rollout: true  # use closed-form vectorized prediction rollout (faster but more memory)
 torch_compile: false  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)

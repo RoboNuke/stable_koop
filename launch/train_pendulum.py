@@ -66,8 +66,8 @@ def bang_energy_policy(obs, kp=10.0, kd=3.0, k_e=2.0, switch_angle=1.0472):
     cos_th, sin_th, thdot = obs
     theta = np.arctan2(sin_th, cos_th)
 
-    E = thdot**2 / 6.0 + 5.0 * cos_th
-    E_target = 5.0
+    E = thdot**2 / 6.0 - 5.0 * cos_th
+    E_target = -5.0
 
     if E < E_target:
         u_swing = k_e * np.sign(thdot * cos_th)
@@ -465,10 +465,14 @@ def train(model, trajectories, cfg):
     # 1. Build dataset and dataloader
     dataset = TrajectoryDataset(trajectories, cfg["horizon"])
     print(f"Dataset size: {len(dataset)} windows")
+    num_workers = cfg.get("num_workers", 0)
     loader = DataLoader(
         dataset, batch_size=cfg["batch_size"],
         shuffle=True, drop_last=True, pin_memory=True,
+        num_workers=num_workers, persistent_workers=num_workers > 0,
     )
+    if num_workers > 0:
+        print(f"DataLoader: {num_workers} workers (persistent)")
 
     # 2. Optimizer and scheduler
     if cfg.get("riemannian_optimizer", False):
@@ -481,9 +485,16 @@ def train(model, trajectories, cfg):
         optimizer = torch.optim.Adam(
             model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
         )
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=cfg["scheduler_step"], gamma=cfg["scheduler_gamma"],
-    )
+    if cfg.get("cosine_scheduler", False):
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg["cosine_T_max"], eta_min=cfg["cosine_eta_min"],
+        )
+        print(f"Using CosineAnnealingLR scheduler (T_max={cfg['cosine_T_max']}, eta_min={cfg['cosine_eta_min']})")
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=cfg["scheduler_step"], gamma=cfg["scheduler_gamma"],
+        )
+        print(f"Using StepLR scheduler (step_size={cfg['scheduler_step']}, gamma={cfg['scheduler_gamma']})")
 
     # 2b. Optional torch.compile
     if cfg.get("torch_compile", False):

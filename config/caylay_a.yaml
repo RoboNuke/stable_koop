@@ -1,28 +1,30 @@
 # Run
-run_name: "pendulum_pd"
+run_name: "no_losses"
 
 # Environment
 env_name: "Pendulum-v1"
-num_trajectories: 200
+num_trajectories: 2000
 max_episode_steps: 200
 
 # Model
 state_dim: 3
 action_dim: 1
-latent_dim: 8
+latent_dim: 16
 k_type: "unbounded" #"cayley", "schur", "normalized"
-rho: 0.80
+rho: 0.95
 encoder_type: "linear"  # "linear" or "cayley"
 encoder_spec_norm: false
-encoder_latent: 16
+encoder_latent: 32
 init_b_in_a: false  # initialize B in A eigenbasis (only effective with two-step training)
 
 # Policy
 
 # Policy (options: "none", "energy", "bang_energy")
-base_policy: "none"
-kp: 10.0
-kd: 2.0
+base_policy: "energy"
+kp: 10
+kd: 2
+ke: 0.5
+sa: 40
 
 # Perturbation (random actions to excite the system that represent possible residual actions)
 perturb_scale: 1.0
@@ -32,79 +34,88 @@ hold_steps: 5  # number of steps to hold each sampled perturbation before resamp
 # LQR / Stability
 use_eigen_bound: false  # spectral radius / transient constant bound
 use_lyapunov_bound: true  # Lyapunov-based bound
-q_scale: 100
-r_scale: 0.01
-scale_B: false
+controllable_subspace: true  # if true, solve LQR only in controllable subspace
+ctrl_threshold: null          # controllability singular value threshold (null = machine epsilon default)
+
+q_scale: 1
+r_scale: 1
+scale_B: true
 max_tracking_error_x: 0.5 #0.3 # define by success bounds (1-cos(15), sin(15), 1)
 max_displacement_x: 0.1 #0.57 # define as maximum possible displacement of system (0.4, 0.4, 0.8)
 
 # Training
 horizon: 5
-batch_size: 1024
-num_workers: 4
+batch_size: 2048
+num_workers: 8
 lr: 1.0e-3
-weight_decay: 1.0e-5
+weight_decay: 1.0e-3
 num_epochs: 200
-loss_threshold: -100000 #0.003 #0.003 works with pred_weight=10
+loss_threshold: 0.02 #0.003 works with pred_weight=10
 scheduler_step: 50
 scheduler_gamma: 0.5
 cosine_scheduler: false
-cosine_T_max: 200
-cosine_eta_min: 1.0e-6
+cosine_T_max: 50
+cosine_eta_min: 5.0e-5
 riemannian_optimizer: false  # use geoopt RiemannianAdam instead of Adam
 vectorize_rollout: true  # use closed-form vectorized prediction rollout (faster but more memory)
-torch_compile: false  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)
+torch_compile: true  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)
 
 # losses
-recon_weight: 1.0
+recon_weight: 0.01
 pred_weight: 1.0
-latent_consistency_weight: 0.0
-
-controllability_loss: true
-ctrl_weight: 0.05 
+latent_consistency_weight: 3.0
 
 bi_lipschitz_loss: true
-bilip_weight: 1
-bilip_m_target: 1.0
+bilip_weight: 2.0
+bilip_m_target: 1.2
 
-spectral_loss: true
-spectral_weight: 0.01
+controllability_loss: false
+ctrl_weight: 0.5
 
-normality_loss: true
-normality_weight: 2.0
+spectral_loss: false
+spectral_weight: 0.1
 
+normality_loss: false
 cl_normality_loss: false
-cl_normality_weight: 1.0
-
 upper_lipschitz_loss: false
-upper_lip_weight: 1.0
-upper_lip_m_max: 1.25
-
-
 b_eigen_loss: false
-b_eigen_weight: 1.0
-b_eigen_min_scale: 0.3
-
 b_scale_loss: false
-b_scale_weight: 1.0
-b_scale_target: 1.0
 
 eig_spread_loss: false
 eig_spread_weight: 1.0
 eig_spread_min_gap: 0.1
 
 unstable_ctrl_loss: false
-unstable_ctrl_weight: 0.05
-unstable_ctrl_threshold: 1.0
+unit_circle_gap_loss: false
+
+
 
 # Eval
-num_parallel_evals: 16
+num_parallel_evals: 200
 eval_num_trajectories: 200
 eval_max_steps: 200
 eval_seed: 42
 success_angle_deg: 15.0
 success_max_thdot: 1.0
 success_hold_steps: 20
+
+# Residual Policy (SAC)
+residual_z_ref_limit: 1.0
+residual_num_envs: 256
+residual_total_timesteps: 100000
+residual_eval_interval: 5000
+residual_batch_size: 256
+residual_lr: 3.0e-4
+residual_actor_hidden_size: 64
+residual_actor_hidden_layers: 2
+residual_critic_hidden_size: 256
+residual_critic_hidden_layers: 4
+residual_gamma: 0.99
+residual_tau: 0.005
+residual_initial_entropy_value: 1.0
+residual_random_timesteps: 1000
+residual_learning_starts: 1000
+residual_memory_size: 100000
 
 # Logging / checkpointing
 log_interval: 10
