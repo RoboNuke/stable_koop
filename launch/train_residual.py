@@ -222,40 +222,44 @@ def train_residual(base_policy, lqr, cfg, run_dir, z_ref_limit=1.0, keep_all_ckp
     next_eval = 0
     best_reward = -float("inf")
     best_path = os.path.join(phase_dir, "best.pt")
+    print("(Press Ctrl+C to end training early and continue pipeline)")
 
-    while total_steps < total_timesteps:
-        with torch.no_grad():
-            actions = agent.act(states, total_steps, total_timesteps)[0]
+    try:
+        while total_steps < total_timesteps:
+            with torch.no_grad():
+                actions = agent.act(states, total_steps, total_timesteps)[0]
 
-        next_states, rewards, terminated, truncated, infos = wrapped_env.step(actions)
-        agent.record_transition(states, actions, rewards, next_states,
-                                terminated, truncated, infos, total_steps, total_timesteps)
-        agent.post_interaction(total_steps, total_timesteps)
+            next_states, rewards, terminated, truncated, infos = wrapped_env.step(actions)
+            agent.record_transition(states, actions, rewards, next_states,
+                                    terminated, truncated, infos, total_steps, total_timesteps)
+            agent.post_interaction(total_steps, total_timesteps)
 
-        states = next_states
-        total_steps += num_envs
+            states = next_states
+            total_steps += num_envs
 
-        # Periodic evaluation
-        if total_steps >= next_eval:
-            print(f"\n--- Eval at step {total_steps} ---")
-            results = run_eval(models["policy"], base_policy, lqr_F_np,
-                               z_ref_limit, cfg, eval_env, writer, total_steps, device)
-            avg_reward = results['combined']['reward']['mean']
-            print(f"  Success rate: {results['success_rate']:.1%}")
-            print(f"  Avg reward: {avg_reward:.1f}")
+            # Periodic evaluation
+            if total_steps >= next_eval:
+                print(f"\n--- Eval at step {total_steps} ---")
+                results = run_eval(models["policy"], base_policy, lqr_F_np,
+                                   z_ref_limit, cfg, eval_env, writer, total_steps, device)
+                avg_reward = results['combined']['reward']['mean']
+                print(f"  Success rate: {results['success_rate']:.1%}")
+                print(f"  Avg reward: {avg_reward:.1f}")
 
-            # Save best
-            if avg_reward > best_reward:
-                best_reward = avg_reward
-                torch.save(models["policy"].state_dict(), best_path)
-                print(f"  New best (reward={best_reward:.1f}) saved to {best_path}")
+                # Save best
+                if avg_reward > best_reward:
+                    best_reward = avg_reward
+                    torch.save(models["policy"].state_dict(), best_path)
+                    print(f"  New best (reward={best_reward:.1f}) saved to {best_path}")
 
-            # Optionally save every checkpoint
-            if keep_all_ckpts:
-                ckpt_path = os.path.join(ckpt_dir, f"step_{total_steps}.pt")
-                agent.save(ckpt_path)
+                # Optionally save every checkpoint
+                if keep_all_ckpts:
+                    ckpt_path = os.path.join(ckpt_dir, f"step_{total_steps}.pt")
+                    agent.save(ckpt_path)
 
-            next_eval += eval_interval
+                next_eval += eval_interval
+    except KeyboardInterrupt:
+        print(f"\nResidual training interrupted at step {total_steps}. Continuing...")
 
     # Final eval
     print(f"\n--- Final eval at step {total_steps} ---")

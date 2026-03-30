@@ -109,7 +109,8 @@ def main():
         tune_cfg = yaml.safe_load(f)
     for key in ("use_eigen_bound", "use_lyapunov_bound",
                 "controllable_subspace", "ctrl_threshold",
-                "q_scale", "r_scale", "max_tracking_error_x", "max_displacement_x"):
+                "q_scale", "r_scale", "scale_B",
+                "max_tracking_error_x", "max_displacement_x"):
         if key in tune_cfg:
             cfg[key] = tune_cfg[key]
 

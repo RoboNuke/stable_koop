@@ -3,8 +3,8 @@ run_name: "no_losses"
 
 # Environment
 env_name: "Pendulum-v1"
-num_trajectories: 2000
-max_episode_steps: 200
+num_trajectories: 1000
+max_episode_steps: 50
 
 # Model
 state_dim: 3
@@ -20,7 +20,7 @@ init_b_in_a: false  # initialize B in A eigenbasis (only effective with two-step
 # Policy
 
 # Policy (options: "none", "energy", "bang_energy")
-base_policy: "energy"
+base_policy: "none"
 kp: 10
 kd: 2
 ke: 0.5
@@ -34,23 +34,23 @@ hold_steps: 5  # number of steps to hold each sampled perturbation before resamp
 # LQR / Stability
 use_eigen_bound: false  # spectral radius / transient constant bound
 use_lyapunov_bound: true  # Lyapunov-based bound
-controllable_subspace: true  # if true, solve LQR only in controllable subspace
+controllable_subspace: false  # if true, solve LQR only in controllable subspace
 ctrl_threshold: null          # controllability singular value threshold (null = machine epsilon default)
 
 q_scale: 1
 r_scale: 1
-scale_B: true
+scale_B: false
 max_tracking_error_x: 0.5 #0.3 # define by success bounds (1-cos(15), sin(15), 1)
 max_displacement_x: 0.1 #0.57 # define as maximum possible displacement of system (0.4, 0.4, 0.8)
 
 # Training
-horizon: 5
+horizon: 30
 batch_size: 2048
 num_workers: 8
 lr: 1.0e-3
 weight_decay: 1.0e-3
-num_epochs: 200
-loss_threshold: 0.02 #0.003 works with pred_weight=10
+num_epochs: 100
+loss_threshold: 0.011 #0.02 #0.003 works with pred_weight=10
 scheduler_step: 50
 scheduler_gamma: 0.5
 cosine_scheduler: false
@@ -61,11 +61,15 @@ vectorize_rollout: true  # use closed-form vectorized prediction rollout (faster
 torch_compile: true  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)
 
 # losses
-recon_weight: 0.01
-pred_weight: 1.0
-latent_consistency_weight: 3.0
+weight_decay: 1.0e-14
+recon_weight: 0.1
+pred_weight: 0.1
+latent_consistency_weight: 1.0
 
-bi_lipschitz_loss: true
+l_inf_pred_loss: true
+l_inf_pred_weight: 1.0e-9
+
+bi_lipschitz_loss: false
 bilip_weight: 2.0
 bilip_m_target: 1.2
 
@@ -78,14 +82,25 @@ spectral_weight: 0.1
 normality_loss: false
 cl_normality_loss: false
 upper_lipschitz_loss: false
+
 b_eigen_loss: false
+b_eigen_weight: 1.0
+b_eigen_min_scale: 0.3
+
 b_scale_loss: false
+b_scale_weight: 2.0
+b_scale_target: 1.0
+
+b_min_sv_loss: false
+b_min_sv_weight: 1.0
+b_min_sv_target: 0.3
 
 eig_spread_loss: false
 eig_spread_weight: 1.0
 eig_spread_min_gap: 0.1
 
 unstable_ctrl_loss: false
+unstable_ctrl_weight: 1.0
 unit_circle_gap_loss: false
 
 

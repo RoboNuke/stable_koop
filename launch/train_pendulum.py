@@ -162,6 +162,12 @@ def b_scale_loss(B_matrix, target_scale=1.0):
     return torch.relu(current_scale - target_scale)
 
 
+def b_min_sv_loss(B_matrix, min_sv=0.1):
+    """Penalize B minimum singular value below min_sv."""
+    sigma_min = torch.linalg.svdvals(B_matrix)[-1]
+    return torch.relu(min_sv - sigma_min)
+
+
 def eigenvalue_spread_loss(log_d, rho, min_gap=0.1):
     d = torch.sort(torch.tanh(log_d) * rho).values
     gaps = d[1:] - d[:-1]
@@ -216,6 +222,37 @@ def normality_loss(A):
     return torch.norm(A.T @ A - A @ A.T, p='fro')
 
 
+def l_inf_pred_loss(model, states_seq, actions_seq):
+    """Worst-case multi-step prediction error over the batch.
+    
+    Computes RMSE for each (sample, timestep) pair and returns
+    the maximum across all of them.
+    """
+    B_batch, Hp1, S = states_seq.shape
+    H = Hp1 - 1
+    device = states_seq.device
+
+    # Encode all states once
+    all_states_flat = states_seq.reshape(B_batch * Hp1, S)
+    all_z = model.encode(all_states_flat).reshape(B_batch, Hp1, -1)
+
+    worst_case = torch.tensor(0.0, device=device)
+
+    for t_start in range(H):
+        z = all_z[:, t_start, :]  # (B, L)
+
+        for t in range(t_start, H):
+            z = model.predict(z, actions_seq[:, t, :])
+            x_pred = model.decode(z)
+            x_target = states_seq[:, t + 1, :]
+
+            # RMSE per sample in this batch
+            sample_errors = (x_pred - x_target).pow(2).mean(dim=-1).sqrt()
+            worst_case = torch.max(worst_case, sample_errors.max())
+
+    return worst_case
+
+
 def _pred_loss_sequential(model, states_seq, actions_seq):
     """Original sequential multi-step prediction loss."""
     z = model.encode(states_seq[:, 0])
@@ -229,57 +266,54 @@ def _pred_loss_sequential(model, states_seq, actions_seq):
 
 
 def _pred_loss_vectorized(model, states_seq, actions_seq):
-    """Vectorized multi-step prediction loss using closed-form linear recurrence.
-
-    Since predict is z_{t+1} = K z_t + B u_t, we have:
-        z_t = K^t z_0 + sum_{k=0}^{t-1} K^{t-1-k} B u_k
-
-    This builds K powers and uses a causal matmul to compute all z_t at once.
     """
-    B_batch, H, _ = actions_seq.shape
-    device = actions_seq.device
+    Multi-step prediction loss starting from every timestep in each window.
 
-    # Get K and B matrices
-    K = model.A  # (L, L)
-    B_mat = model.B_matrix  # (L, A)
-    L = K.shape[0]
+    For a window of length H, computes predictions starting from t=0, 1, ..., H-1
+    and predicts as many steps forward as the window allows. This gives O(H^2)
+    prediction targets per window rather than O(H), providing much richer gradient
+    signal to both A and B.
 
-    # Precompute K powers: K^0, K^1, ..., K^H
-    K_powers = [torch.eye(L, device=device)]
-    for _ in range(H):
-        K_powers.append(K_powers[-1] @ K)
-    K_powers = torch.stack(K_powers)  # (H+1, L, L)
+    Args:
+        states_seq:   (B, H+1, S)  — states x_0 through x_H
+        actions_seq:  (B, H, A)    — actions u_0 through u_{H-1}
 
-    # z_0
-    z0 = model.encode(states_seq[:, 0])  # (B_batch, L)
+    Returns:
+        scalar loss
+    """
+    B_batch, Hp1, S = states_seq.shape
+    H = Hp1 - 1
+    device = states_seq.device
 
-    # Free evolution: K^t z_0 for t=1..H
-    # K_powers[1:H+1] is (H, L, L), z0 is (B_batch, L)
-    z_free = torch.einsum('hij,bj->bhi', K_powers[1:H+1], z0)  # (B_batch, H, L)
+    # Encode all states in the window at once
+    # Shape: (B, H+1, L)
+    all_states_flat = states_seq.reshape(B_batch * Hp1, S)
+    all_z = model.encode(all_states_flat).reshape(B_batch, Hp1, -1)
+    L = all_z.shape[-1]
 
-    # Forced response: Bu for all timesteps
-    Bu = actions_seq @ B_mat.T  # (B_batch, H, L)
+    total_loss = torch.tensor(0.0, device=device)
+    n_predictions = 0
 
-    # Build causal convolution matrix from K powers
-    # conv[t, k] = K^{t-k} for k <= t, else 0  (t=0..H-1, k=0..H-1)
-    # For target step t+1, we need sum_{k=0}^{t} K^{t-k} Bu_k
-    conv = torch.zeros(H, H, L, L, device=device)
-    for t in range(H):
-        for k in range(t + 1):
-            conv[t, k] = K_powers[t - k]
+    # Start from every position t_start within the window
+    for t_start in range(H):
+        # Initial latent state for this starting position
+        z = all_z[:, t_start, :]  # (B, L)
 
-    # Apply convolution: z_forced[t] = sum_k conv[t,k] @ Bu[k]
-    z_forced = torch.einsum('tklm,bkm->btl', conv, Bu)  # (B_batch, H, L)
+        # Roll forward as many steps as the window allows
+        for t in range(t_start, H):
+            # One step: A*z + B*u — both A and B in computation graph
+            z = model.predict(z, actions_seq[:, t, :])  # (B, L)
 
-    # All predicted latent states for t=1..H
-    z_all = z_free + z_forced  # (B_batch, H, L)
+            # Decode and compare to ground truth
+            x_pred = model.decode(z)                    # (B, S)
+            x_target = states_seq[:, t + 1, :]         # (B, S)
 
-    # Decode all at once
-    x_pred = model.decode(z_all.reshape(B_batch * H, L)).reshape(B_batch, H, -1)
-    x_target = states_seq[:, 1:]  # (B_batch, H, S)
+            total_loss = total_loss + F.mse_loss(x_pred, x_target)
+            n_predictions += 1
 
-    return F.mse_loss(x_pred, x_target)
-
+    # Normalize by number of predictions so loss scale is
+    # independent of H — makes weight tuning consistent
+    return total_loss / n_predictions
 
 def closed_loop_normality_loss(A, B, Q, R):
     """Normality loss on the closed-loop matrix A - B @ F.
@@ -308,12 +342,17 @@ def latent_consistency_loss(model, states_seq, actions_seq):
 
     all_states = states_seq.reshape(B_batch * Hp1, S)
     all_z = model.encode(all_states).reshape(B_batch, Hp1, -1)
-
-    z_t = all_z[:, :H].reshape(B_batch * H, -1)       # (B*H, L)
     u_t = actions_seq.reshape(B_batch * H, -1)          # (B*H, A)
-    z_pred = model.predict(z_t, u_t)                    # (B*H, L)
 
-    z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)  # (B*H, L)
+    #z_t = all_z[:, :H].reshape(B_batch * H, -1)       # (B*H, L)
+    #z_pred = model.predict(z_t, u_t)                    # (B*H, L)
+    # z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)  # (B*H, L)
+
+    z_t = all_z[:, :H].detach().reshape(B_batch * H, -1)  # detach input too
+    z_pred = model.predict(z_t, u_t)    
+    z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)
+
+    
     return F.mse_loss(z_pred, z_target)
 
 
@@ -344,6 +383,11 @@ def build_loss_fns(cfg, model):
             return _pred_loss_vectorized(model, states_seq, actions_seq)
         return _pred_loss_sequential(model, states_seq, actions_seq)
     losses["Pred"] = (_pred, pred_w)
+
+    if cfg.get("l_inf_pred_loss", False):
+        def _linf(model, states_seq, actions_seq, all_states):
+            return l_inf_pred_loss(model, states_seq, actions_seq)
+        losses["L_inf"] = (_linf, cfg["l_inf_pred_weight"])
 
     def _lc(model, states_seq, actions_seq, all_states):
         return latent_consistency_loss(model, states_seq, actions_seq)
@@ -399,6 +443,12 @@ def build_loss_fns(cfg, model):
         def _bscale(model, states_seq, actions_seq, all_states):
             return b_scale_loss(model.B_matrix, target_scale=target_scale)
         losses["BScl"] = (_bscale, cfg["b_scale_weight"])
+
+    if cfg.get("b_min_sv_loss", False):
+        min_sv = cfg.get("b_min_sv_target", 0.1)
+        def _bminsv(model, states_seq, actions_seq, all_states):
+            return b_min_sv_loss(model.B_matrix, min_sv=min_sv)
+        losses["BMinSV"] = (_bminsv, cfg["b_min_sv_weight"])
 
     if cfg.get("eig_spread_loss", False) and hasattr(model.K_module, 'log_d'):
         min_gap = cfg.get("eig_spread_min_gap", 0.1)
@@ -506,57 +556,73 @@ def train(model, trajectories, cfg):
     active_names = list(loss_fns.keys())
     print(f"Active losses: {', '.join(f'{n} (w={loss_fns[n][1]})' for n in active_names)}")
 
-    # 4. Training loop
+    # 4. Gradient clipping config
+    grad_clip_enabled = cfg.get("grad_clip", False)
+    grad_clip_type = cfg.get("grad_clip_type", "norm")  # "norm" or "value"
+    grad_clip_value = cfg.get("grad_clip_value", 1.0)
+    if grad_clip_enabled:
+        print(f"Gradient clipping: {grad_clip_type}, max={grad_clip_value}")
+
+    # 5. Training loop
     import copy
     loss_threshold = cfg.get("loss_threshold", 0.001)
     best_loss = float("inf")
     best_state_dict = copy.deepcopy(model.state_dict())
     best_epoch = 0
+    print("(Press Ctrl+C to end training early and continue pipeline)")
 
-    for epoch in range(1, cfg["num_epochs"] + 1):
-        model.train()
-        epoch_accum = {name: 0.0 for name in active_names}
-        epoch_total = 0.0
-        n_batches = 0
+    try:
+        for epoch in range(1, cfg["num_epochs"] + 1):
+            model.train()
+            epoch_accum = {name: 0.0 for name in active_names}
+            epoch_total = 0.0
+            n_batches = 0
 
-        for states_seq, actions_seq in loader:
-            states_seq = states_seq.to(device)
-            actions_seq = actions_seq.to(device)
+            for states_seq, actions_seq in loader:
+                states_seq = states_seq.to(device)
+                actions_seq = actions_seq.to(device)
 
-            total_loss, losses = compute_loss(model, states_seq, actions_seq, loss_fns)
+                total_loss, losses = compute_loss(model, states_seq, actions_seq, loss_fns)
 
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                total_loss.backward()
+                if grad_clip_enabled:
+                    if grad_clip_type == "norm":
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
+                    elif grad_clip_type == "value":
+                        torch.nn.utils.clip_grad_value_(model.parameters(), grad_clip_value)
+                optimizer.step()
 
-            if hasattr(model.K_module, "project"):
-                model.K_module.project()
+                if hasattr(model.K_module, "project"):
+                    model.K_module.project()
 
-            epoch_total += total_loss.item()
-            for name in active_names:
-                epoch_accum[name] += losses[name].item()
-            n_batches += 1
+                epoch_total += total_loss.item()
+                for name in active_names:
+                    epoch_accum[name] += losses[name].item()
+                n_batches += 1
 
-        scheduler.step()
+            scheduler.step()
 
-        avg_total = epoch_total / n_batches
+            avg_total = epoch_total / n_batches
 
-        # Track best model
-        if avg_total < best_loss:
-            best_loss = avg_total
-            best_state_dict = copy.deepcopy(model.state_dict())
-            best_epoch = epoch
+            # Track best model
+            if avg_total < best_loss:
+                best_loss = avg_total
+                best_state_dict = copy.deepcopy(model.state_dict())
+                best_epoch = epoch
 
-        if epoch % cfg["log_interval"] == 0 or epoch == 1:
-            parts = [f"Epoch {epoch:4d} | Total: {avg_total:.6f}"]
-            for name in active_names:
-                parts.append(f"{name}: {epoch_accum[name] / n_batches:.6f}")
-            parts.append(f"LR: {scheduler.get_last_lr()[0]:.2e}")
-            print(" | ".join(parts))
+            if epoch % cfg["log_interval"] == 0 or epoch == 1:
+                parts = [f"Epoch {epoch:4d} | Total: {avg_total:.6f}"]
+                for name in active_names:
+                    parts.append(f"{name}: {epoch_accum[name] / n_batches:.6f}")
+                parts.append(f"LR: {scheduler.get_last_lr()[0]:.2e}")
+                print(" | ".join(parts))
 
-        if avg_total < loss_threshold:
-            print(f"Early stop: total loss {avg_total:.6f} < threshold {loss_threshold}")
-            break
+            if avg_total < loss_threshold:
+                print(f"Early stop: total loss {avg_total:.6f} < threshold {loss_threshold}")
+                break
+    except KeyboardInterrupt:
+        print(f"\nTraining interrupted at epoch {epoch}. Continuing with best model...")
 
     # Restore best model
     model.load_state_dict(best_state_dict)
