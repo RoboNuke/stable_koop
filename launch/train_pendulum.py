@@ -356,13 +356,13 @@ def latent_consistency_loss(model, states_seq, actions_seq):
     all_z = model.encode(all_states).reshape(B_batch, Hp1, -1)
     u_t = actions_seq.reshape(B_batch * H, -1)          # (B*H, A)
 
-    #z_t = all_z[:, :H].reshape(B_batch * H, -1)       # (B*H, L)
-    #z_pred = model.predict(z_t, u_t)                    # (B*H, L)
-    #z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)  # (B*H, L)
+    z_t = all_z[:, :H].reshape(B_batch * H, -1)       # (B*H, L)
+    z_pred = model.predict(z_t, u_t)                    # (B*H, L)
+    z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)  # (B*H, L)
 
-    z_t = all_z[:, :H].detach().reshape(B_batch * H, -1)  # detach input too
-    z_pred = model.predict(z_t, u_t)    
-    z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)
+    #z_t = all_z[:, :H].detach().reshape(B_batch * H, -1)  # detach input too
+    #z_pred = model.predict(z_t, u_t)    
+    #z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)
 
     
     return F.mse_loss(z_pred, z_target)
@@ -566,10 +566,20 @@ def train(model, trajectories, cfg):
     # 3. Reconstruction pretraining (encoder/decoder only)
     recon_pretrain_epochs = cfg.get("recon_pretrain_epochs", 0)
     if recon_pretrain_epochs > 0:
-        print(f"\n--- Reconstruction Pretraining ({recon_pretrain_epochs} epochs) ---")
+        pretrain_lr = cfg.get("recon_pretrain_lr", cfg["lr"])
+        pretrain_bilip = cfg.get("recon_pretrain_bilip", False)
+        pretrain_bilip_w = cfg.get("recon_pretrain_bilip_weight", 1.0)
+        pretrain_bilip_m = cfg.get("bilip_m_target", 0.5)
+        print(f"\n--- Reconstruction Pretraining ({recon_pretrain_epochs} epochs, lr={pretrain_lr}) ---")
+        if pretrain_bilip:
+            print(f"  BiLip loss enabled (weight={pretrain_bilip_w}, m_target={pretrain_bilip_m})")
+        pretrain_optimizer = torch.optim.Adam(
+            model.parameters(), lr=pretrain_lr, weight_decay=cfg["weight_decay"],
+        )
         for epoch in range(1, recon_pretrain_epochs + 1):
             model.train()
             epoch_recon = 0.0
+            epoch_bilip = 0.0
             n_batches = 0
             for states_seq, actions_seq in loader:
                 states_seq = states_seq.to(device)
@@ -577,17 +587,27 @@ def train(model, trajectories, cfg):
                 all_states = states_seq.reshape(B * Hp1, S)
                 all_z = model.encode(all_states)
                 all_recon = model.decode(all_z)
-                recon_loss = F.mse_loss(all_recon, all_states)
+                loss = F.mse_loss(all_recon, all_states)
+                epoch_recon += loss.item()
 
-                optimizer.zero_grad()
-                recon_loss.backward()
-                optimizer.step()
+                if pretrain_bilip:
+                    bilip = bi_lipschitz_loss(model.encode, all_states.detach(),
+                                             m_target=pretrain_bilip_m)
+                    loss = loss + pretrain_bilip_w * bilip
+                    epoch_bilip += bilip.item()
 
-                epoch_recon += recon_loss.item()
+                pretrain_optimizer.zero_grad()
+                loss.backward()
+                pretrain_optimizer.step()
+
                 n_batches += 1
 
             if epoch % cfg.get("log_interval", 10) == 0 or epoch == 1:
-                print(f"  Pretrain Epoch {epoch:4d} | Recon: {epoch_recon / n_batches:.6f}")
+                parts = [f"  Pretrain Epoch {epoch:4d} | Recon: {epoch_recon / n_batches:.6f}"]
+                if pretrain_bilip:
+                    parts.append(f"BiLip: {epoch_bilip / n_batches:.6f}")
+                print(" | ".join(parts))
+        del pretrain_optimizer
         print("--- Pretraining complete ---\n")
 
     # 4. Build loss functions from config

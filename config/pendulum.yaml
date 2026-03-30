@@ -48,6 +48,9 @@ lr: 1.0e-2
 weight_decay: 1.0e-5
 num_epochs: 100
 recon_pretrain_epochs: 0  # encoder/decoder pretraining with recon loss only (0 = disabled)
+recon_pretrain_lr: 1.0e-3
+recon_pretrain_bilip: false
+recon_pretrain_bilip_weight: 1.0
 loss_threshold: -10 #0.003 works with pred_weight=10
 scheduler_step: 100
 scheduler_gamma: 0.5

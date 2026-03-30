@@ -49,10 +49,13 @@ max_displacement_x: 0.1 #0.57 # define as maximum possible displacement of syste
 horizon: 30
 batch_size: 2048
 num_workers: 8
-lr: 1.0e-2
+lr: 1.0e-4
 num_epochs: 200
 
-recon_pretrain_epochs: 50
+recon_pretrain_epochs: 35
+recon_pretrain_lr: 1.0e-2  # learning rate for recon pretraining (default: same as lr)
+recon_pretrain_bilip: false  # include BiLip loss during recon pretraining
+recon_pretrain_bilip_weight: 1.0  # weight for BiLip during pretraining
 
 
 scheduler_step: 50
@@ -71,13 +74,13 @@ torch_compile: true  # use torch.compile to fuse GPU kernels (slower first epoch
 weight_decay: 1.0e-4
 recon_weight: 0.1
 pred_weight: 0.1
-latent_consistency_weight: 3.0
+latent_consistency_weight: 1.0
 
 l_inf_pred_loss: true
 l_inf_pred_weight: 1.0e-9
 
 bi_lipschitz_loss: true
-bilip_weight: 1.0
+bilip_weight: 3.0
 bilip_m_target: 1.2
 
 controllability_loss: false
