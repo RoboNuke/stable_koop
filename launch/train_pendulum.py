@@ -19,14 +19,28 @@ from model.autoencoder import KoopmanAutoencoder
 #    u = -kp * error - kd * thdot
 #    return np.array([np.clip(u, -2.0, 2.0)])
 
+def _parse_obs(obs):
+    """Extract (theta, cos_th, sin_th, thdot) from either obs format.
+
+    Handles both [cos_th, sin_th, thdot] (3D) and [theta, thdot] (2D).
+    """
+    if len(obs) == 3:
+        cos_th, sin_th, thdot = obs
+        theta = np.arctan2(sin_th, cos_th)
+    else:
+        theta, thdot = obs
+        cos_th = np.cos(theta)
+        sin_th = np.sin(theta)
+    return theta, cos_th, sin_th, thdot
+
+
 def pd_policy(obs, kp, kd):
     """PD controller targeting the upright position (theta=0)."""
-    cos_th, sin_th, thdot = obs
-    theta = np.arctan2(sin_th, cos_th)
+    theta, cos_th, sin_th, thdot = _parse_obs(obs)
     u = -kp * theta - kd * thdot
     return np.array([np.clip(u, -2.0, 2.0)])
 
-def energy_shaping_policy(obs, kp=10.0, kd=3.0, k_e=2.0, switch_angle=0.7854): #0.9599):#1.0472):
+def energy_shaping_policy(obs, kp=10.0, kd=3.0, k_e=2.0, switch_angle=0.7854):
     """Energy-shaping swing-up + PD balance for Pendulum-v1.
 
     Pendulum-v1 physics: m=1, l=1, g=10, I=ml^2/3=1/3, max_torque=2.
@@ -35,11 +49,10 @@ def energy_shaping_policy(obs, kp=10.0, kd=3.0, k_e=2.0, switch_angle=0.7854): #
     Args:
         switch_angle: radians, switch to PD balance when |theta| < this value.
     """
-    cos_th, sin_th, thdot = obs
-    theta = np.arctan2(sin_th, cos_th)
+    theta, cos_th, sin_th, thdot = _parse_obs(obs)
 
     E = thdot**2 / 6.0 + 5.0 * cos_th
-    E_target = 5.0  # energy at upright equilibrium
+    E_target = 5.0
 
     u_swing = k_e * thdot * (E_target - E)
 
@@ -63,8 +76,7 @@ def bang_energy_policy(obs, kp=10.0, kd=3.0, k_e=2.0, switch_angle=1.0472):
     Args:
         switch_angle: radians, switch to PD balance when |theta| < this value.
     """
-    cos_th, sin_th, thdot = obs
-    theta = np.arctan2(sin_th, cos_th)
+    theta, cos_th, sin_th, thdot = _parse_obs(obs)
 
     E = thdot**2 / 6.0 - 5.0 * cos_th
     E_target = -5.0
@@ -346,7 +358,7 @@ def latent_consistency_loss(model, states_seq, actions_seq):
 
     #z_t = all_z[:, :H].reshape(B_batch * H, -1)       # (B*H, L)
     #z_pred = model.predict(z_t, u_t)                    # (B*H, L)
-    # z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)  # (B*H, L)
+    #z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)  # (B*H, L)
 
     z_t = all_z[:, :H].detach().reshape(B_batch * H, -1)  # detach input too
     z_pred = model.predict(z_t, u_t)    
@@ -551,7 +563,34 @@ def train(model, trajectories, cfg):
         model = torch.compile(model)
         print("Model compiled with torch.compile")
 
-    # 3. Build loss functions from config
+    # 3. Reconstruction pretraining (encoder/decoder only)
+    recon_pretrain_epochs = cfg.get("recon_pretrain_epochs", 0)
+    if recon_pretrain_epochs > 0:
+        print(f"\n--- Reconstruction Pretraining ({recon_pretrain_epochs} epochs) ---")
+        for epoch in range(1, recon_pretrain_epochs + 1):
+            model.train()
+            epoch_recon = 0.0
+            n_batches = 0
+            for states_seq, actions_seq in loader:
+                states_seq = states_seq.to(device)
+                B, Hp1, S = states_seq.shape
+                all_states = states_seq.reshape(B * Hp1, S)
+                all_z = model.encode(all_states)
+                all_recon = model.decode(all_z)
+                recon_loss = F.mse_loss(all_recon, all_states)
+
+                optimizer.zero_grad()
+                recon_loss.backward()
+                optimizer.step()
+
+                epoch_recon += recon_loss.item()
+                n_batches += 1
+
+            if epoch % cfg.get("log_interval", 10) == 0 or epoch == 1:
+                print(f"  Pretrain Epoch {epoch:4d} | Recon: {epoch_recon / n_batches:.6f}")
+        print("--- Pretraining complete ---\n")
+
+    # 4. Build loss functions from config
     loss_fns = build_loss_fns(cfg, model)
     active_names = list(loss_fns.keys())
     print(f"Active losses: {', '.join(f'{n} (w={loss_fns[n][1]})' for n in active_names)}")
@@ -630,9 +669,10 @@ def train(model, trajectories, cfg):
     # Final loss summary
     print("\n--- Training Complete ---")
     print(f"  Best total: {best_loss:.6f} (epoch {best_epoch})")
-    print(f"  Final total: {epoch_total / n_batches:.6f}")
-    for name in active_names:
-        print(f"  {name:>6s}: {epoch_accum[name] / n_batches:.6f}")
+    if n_batches > 0:
+        print(f"  Final total: {epoch_total / n_batches:.6f}")
+        for name in active_names:
+            print(f"  {name:>6s}: {epoch_accum[name] / n_batches:.6f}")
     print(f"  Epochs: {epoch}/{cfg['num_epochs']}")
 
     return model
@@ -652,7 +692,8 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Collect data
-    env = gym.make(cfg["env_name"])
+    from launch.eval_policy import make_single_env
+    env = make_single_env(cfg)
     if args.random_policy:
         policy = None
         print("Using random policy")

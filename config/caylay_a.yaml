@@ -3,31 +3,33 @@ run_name: "no_losses"
 
 # Environment
 env_name: "Pendulum-v1"
-num_trajectories: 1000
+num_trajectories: 400
 max_episode_steps: 50
 
 # Model
-state_dim: 3
+obs_type: "theta"  # "cos_sin" = [cos_th, sin_th, thdot] (3D), "theta" = [theta, thdot] (2D)
+state_dim: 2
 action_dim: 1
-latent_dim: 16
+latent_dim: 2
 k_type: "unbounded" #"cayley", "schur", "normalized"
 rho: 0.95
 encoder_type: "linear"  # "linear" or "cayley"
 encoder_spec_norm: false
-encoder_latent: 32
+encoder_latent: 40
 init_b_in_a: false  # initialize B in A eigenbasis (only effective with two-step training)
 
 # Policy
 
 # Policy (options: "none", "energy", "bang_energy")
-base_policy: "none"
+base_policy: "energy"
 kp: 10
 kd: 2
 ke: 0.5
 sa: 40
 
 # Perturbation (random actions to excite the system that represent possible residual actions)
-perturb_scale: 1.0
+analytical_B_policy: "none"  # policy for analytical B data collection: "none", "energy", "bang_energy"
+perturb_scale: 2.0
 fix_perturb_range: false
 hold_steps: 5  # number of steps to hold each sampled perturbation before resampling
 
@@ -47,30 +49,35 @@ max_displacement_x: 0.1 #0.57 # define as maximum possible displacement of syste
 horizon: 30
 batch_size: 2048
 num_workers: 8
-lr: 1.0e-3
-weight_decay: 1.0e-3
-num_epochs: 100
-loss_threshold: 0.011 #0.02 #0.003 works with pred_weight=10
+lr: 1.0e-2
+num_epochs: 200
+
+recon_pretrain_epochs: 50
+
+
 scheduler_step: 50
 scheduler_gamma: 0.5
+
 cosine_scheduler: false
 cosine_T_max: 50
 cosine_eta_min: 5.0e-5
+
+loss_threshold: 0.003 #0.02 #0.003 works with pred_weight=10
 riemannian_optimizer: false  # use geoopt RiemannianAdam instead of Adam
 vectorize_rollout: true  # use closed-form vectorized prediction rollout (faster but more memory)
 torch_compile: true  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)
 
 # losses
-weight_decay: 1.0e-14
+weight_decay: 1.0e-4
 recon_weight: 0.1
 pred_weight: 0.1
-latent_consistency_weight: 1.0
+latent_consistency_weight: 3.0
 
 l_inf_pred_loss: true
 l_inf_pred_weight: 1.0e-9
 
-bi_lipschitz_loss: false
-bilip_weight: 2.0
+bi_lipschitz_loss: true
+bilip_weight: 1.0
 bilip_m_target: 1.2
 
 controllability_loss: false
@@ -133,6 +140,6 @@ residual_learning_starts: 1000
 residual_memory_size: 100000
 
 # Logging / checkpointing
-log_interval: 10
+log_interval: 1
 checkpoint_dir: "checkpoints/pendulum_h20"
 seed: 42

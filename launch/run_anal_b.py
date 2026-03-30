@@ -17,13 +17,14 @@ import numpy as np
 import torch
 import yaml
 
-from launch.eval_policy import evaluate as evaluate_policy, make_policy, make_eval_env
+from launch.eval_policy import evaluate as evaluate_policy, make_policy, make_eval_env, make_analytical_b_policy, make_single_env
 from launch.eval_pendulum import evaluate_model
 from launch.train_pendulum import collect_data, train
 from launch.run import (
     make_run_dir, save_config, make_env, compute_obs_scale, compute_act_scale,
     make_base_policy, save_eval_results, augment_trajectories,
-    phase_0_base_eval,
+    collect_perturbed_data, augment_perturbed_trajectories,
+    phase_0_base_eval, phase_3_lyapunov,
 )
 from launch.analy_b_tuning import run_analytical_b
 from model.autoencoder import KoopmanAutoencoder
@@ -53,15 +54,9 @@ def phase_1_train_A_only(model, env, policy, cfg, run_dir, augment=True,
         obs_scale=obs_scale, act_scale=act_scale,
     )
 
-    # 3. Train with only core losses (disable optional losses)
-    phase1_cfg = dict(cfg)
-    for key in ("controllability_loss", "bi_lipschitz_loss", "spectral_loss",
-                "normality_loss", "cl_normality_loss", "b_eigen_loss",
-                "b_scale_loss", "eig_spread_loss", "unstable_ctrl_loss",
-                "upper_lipschitz_loss", "unit_circle_gap_loss"):
-        phase1_cfg[key] = False
-
-    model = train(model, aug_trajectories, phase1_cfg)
+    # 3. Train with all configured losses
+    #    (recon_pretrain_epochs in config handles recon-only pretraining inside train())
+    model = train(model, aug_trajectories, cfg)
 
     # 4. Save checkpoint
     ckpt_path = os.path.join(run_dir, "koop_a_checkpoint.pt")
@@ -70,8 +65,11 @@ def phase_1_train_A_only(model, env, policy, cfg, run_dir, augment=True,
     print(f"Checkpoint saved to {ckpt_path}")
 
     # 5. Evaluate on training data
+    train_horizon = cfg["horizon"]
     fig, error_stats, heatmap_data = evaluate_model(
-        model, aug_trajectories, cfg["horizon"], eval_horizon=25)
+        model, aug_trajectories, train_horizon, eval_horizon=train_horizon,
+        title="Prediction Error (A only, no B, no perturbations)",
+        obs_scale=cfg.get("obs_scale"), obs_type=cfg.get("obs_type", "cos_sin"))
 
     # 6. Save heatmap
     plot_path = os.path.join(run_dir, "koop_a_prediction_error.png")
@@ -89,11 +87,12 @@ def phase_1_train_A_only(model, env, policy, cfg, run_dir, augment=True,
     print(f"Eval stats saved to {stats_path}")
 
     print("Phase 1 complete.")
-    return aug_trajectories
+    return aug_trajectories, trajectories
 
 
 def phase_2_analytical_B(model, env, policy, cfg, run_dir, augment=True,
-                         obs_scale=None):
+                         obs_scale=None, base_aug_trajectories=None,
+                         base_raw_trajectories=None):
     """Phase 2: Analytically derive B matrix from perturbed trajectory data.
 
     Collects trajectories with base policy + random perturbations, then solves
@@ -104,10 +103,55 @@ def phase_2_analytical_B(model, env, policy, cfg, run_dir, augment=True,
     B_final = run_analytical_b(
         model, env, policy, cfg, run_dir,
         augment=augment, obs_scale=obs_scale,
+        base_aug_trajectories=base_aug_trajectories,
+        base_raw_trajectories=base_raw_trajectories,
     )
 
     print("Phase 2 complete.")
     return B_final
+
+
+def phase_3_stability(model, env, policy, cfg, run_dir, B_final,
+                      augment=True, obs_scale=None):
+    """Phase 3: Lyapunov stability analysis with analytical B on perturbed data.
+
+    Sets the model's B matrix to the analytical solution, collects perturbed
+    trajectories, and runs the Lyapunov stability check.
+    """
+    print("\n=== Phase 3: Lyapunov Stability Analysis ===")
+
+    # 1. Set model B to the analytical solution
+    with torch.no_grad():
+        model.B.weight.copy_(torch.tensor(B_final, dtype=model.B.weight.dtype,
+                                          device=model.B.weight.device))
+    print(f"  Set model B to analytical solution (norm={np.linalg.norm(B_final, ord=2):.4f})")
+
+    # 2. Collect perturbed data (same as what B was derived from)
+    print(f"\nCollecting perturbed trajectories for stability analysis...")
+    trajectories = collect_perturbed_data(
+        env, policy, cfg["num_trajectories"],
+        cfg["max_episode_steps"], cfg["seed"],
+        perturb_scale=cfg.get("perturb_scale", None),
+        fix_perturb_range=cfg.get("fix_perturb_range", False),
+        hold_steps=cfg.get("hold_steps", 1),
+    )
+
+    # 3. Augment trajectories
+    aug_trajectories = augment_perturbed_trajectories(
+        trajectories, augment=augment, obs_scale=obs_scale)
+
+    # 4. Run Lyapunov stability analysis
+    stability_dir = os.path.join(run_dir, "stability")
+    variables, lqr = phase_3_lyapunov(model, cfg, stability_dir, aug_trajectories)
+
+    # 5. Save checkpoint with analytical B included
+    ckpt_path = os.path.join(run_dir, "koopman_ckpt.pt")
+    save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
+    torch.save({"model": save_dict, "config": cfg}, ckpt_path)
+    print(f"Checkpoint (with analytical B) saved to {ckpt_path}")
+
+    print("Phase 3 complete.")
+    return variables, lqr
 
 
 def main():
@@ -157,7 +201,7 @@ def main():
 
     # Vectorized env for evaluation, single env for data collection / scaling
     eval_env = make_env(cfg)
-    train_env = gym.make(cfg["env_name"])
+    train_env = make_single_env(cfg)
 
     RED = "\033[91m"
     RESET = "\033[0m"
@@ -206,10 +250,16 @@ def main():
 
     # --- Execute phases ---
     baseline_results = phase_0_base_eval(eval_env, policy, cfg, run_dir)
-    aug_trajectories = phase_1_train_A_only(
+    base_aug_trajectories, base_raw_trajectories = phase_1_train_A_only(
         model, train_env, policy, cfg, run_dir, augment, obs_scale, act_scale)
+    anal_b_policy = make_analytical_b_policy(cfg)
     B_final = phase_2_analytical_B(
-        model, train_env, policy, cfg, run_dir, augment, obs_scale)
+        model, train_env, anal_b_policy, cfg, run_dir, augment, obs_scale,
+        base_aug_trajectories=base_aug_trajectories,
+        base_raw_trajectories=base_raw_trajectories)
+    variables, lqr = phase_3_stability(
+        model, train_env, anal_b_policy, cfg, run_dir, B_final,
+        augment, obs_scale)
 
     eval_env.close()
     train_env.close()

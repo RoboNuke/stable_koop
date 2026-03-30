@@ -2,6 +2,7 @@
 run_name: "no_losses"
 
 # Environment
+obs_type: "cos_sin"
 env_name: "Pendulum-v1"
 num_trajectories: 2000
 max_episode_steps: 200
@@ -27,6 +28,7 @@ ke: 0.5
 sa: 40
 
 # Perturbation (random actions to excite the system that represent possible residual actions)
+analytical_B_policy: "none"  # policy for analytical B data collection: "none", "energy", "bang_energy"
 perturb_scale: 1.0
 fix_perturb_range: false
 hold_steps: 5  # number of steps to hold each sampled perturbation before resampling
@@ -50,6 +52,7 @@ num_workers: 4
 lr: 5.0e-5
 weight_decay: 1.0e-5
 num_epochs: 200
+recon_pretrain_epochs: 0
 loss_threshold: -100000 #0.003 #0.003 works with pred_weight=10
 scheduler_step: 100
 scheduler_gamma: 0.5

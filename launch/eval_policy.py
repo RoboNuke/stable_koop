@@ -40,6 +40,53 @@ def make_policy(cfg):
                          f"Options: 'none', 'energy', 'bang_energy'")
 
 
+def make_analytical_b_policy(cfg):
+    """Build the policy used for analytical B perturbation data collection.
+
+    Uses cfg["analytical_B_policy"]: "none", "energy", "bang_energy".
+    "none" means zero base policy (perturbations only).
+    """
+    policy_type = cfg.get("analytical_B_policy", "none")
+
+    if policy_type == "none":
+        print(f"Using analytical_B_policy='none' (zero base, perturbations only)")
+        return zero_policy
+
+    kp, kd = cfg["kp"], cfg["kd"]
+    ke = cfg["ke"]
+    sa = cfg['sa'] * 3.14159 / 180
+
+    if policy_type == "energy":
+        print(f"Using analytical_B_policy='energy' (kp={kp}, kd={kd}, ke={ke}, sa={sa:.4f})")
+        return lambda obs: energy_shaping_policy(obs, kp, kd, ke, switch_angle=sa)
+    elif policy_type == "bang_energy":
+        print(f"Using analytical_B_policy='bang_energy' (kp={kp}, kd={kd}, ke={ke}, sa={sa:.4f})")
+        return lambda obs: bang_energy_policy(obs, kp, kd, ke, switch_angle=sa)
+    else:
+        raise ValueError(f"Unknown analytical_B_policy='{policy_type}'. "
+                         f"Options: 'none', 'energy', 'bang_energy'")
+
+
+def _parse_states(states, obs_type=None):
+    """Extract (theta, cos_th, thdot) from states array.
+
+    Uses obs_type if provided, otherwise falls back to dimension check
+    (safe for raw env observations but not for augmented states).
+    """
+    if obs_type is not None:
+        use_theta = (obs_type == "theta")
+    else:
+        use_theta = (states.shape[-1] != 3)
+
+    if not use_theta:
+        cos_th, sin_th, thdot = states[..., 0], states[..., 1], states[..., 2]
+        theta = np.arctan2(sin_th, cos_th)
+    else:
+        theta, thdot = states[..., 0], states[..., 1]
+        cos_th = np.cos(theta)
+    return theta, cos_th, thdot
+
+
 def check_success(states, cfg):
     """Check if the last success_hold_steps meet angle and velocity thresholds."""
     hold = cfg["success_hold_steps"]
@@ -47,9 +94,8 @@ def check_success(states, cfg):
         return False
 
     tail = np.array(states[-hold:])
-    cos_th, sin_th, thdot = tail[:, 0], tail[:, 1], tail[:, 2]
-    theta = np.abs(np.arctan2(sin_th, cos_th))  # 0 = upright
-    angle_ok = np.all(theta < np.radians(cfg["success_angle_deg"]))
+    theta, cos_th, thdot = _parse_states(tail)
+    angle_ok = np.all(np.abs(theta) < np.radians(cfg["success_angle_deg"]))
     vel_ok = np.all(np.abs(thdot) < cfg["success_max_thdot"])
     return bool(angle_ok and vel_ok)
 
@@ -80,7 +126,7 @@ def rollout(env, policy, max_steps, cfg):
 
 def compute_trajectory_metrics(states, actions):
     """Compute per-trajectory metrics (absolute values, averaged over steps)."""
-    cos_th, sin_th, thdot = states[:, 0], states[:, 1], states[:, 2]
+    theta, cos_th, thdot = _parse_states(states)
 
     # Energy: 0.5 * thdot^2 + 10 * (1 - cos_th)  (m=1, l=1, g=10)
     energy = np.abs(0.5 * thdot ** 2 + 10.0 * (1.0 - cos_th))
@@ -140,15 +186,28 @@ def load_eval_stats(filepath):
         return yaml.safe_load(f)
 
 
+def _wrap_obs(env, cfg):
+    """Apply observation wrapper if configured."""
+    if cfg.get("obs_type", "cos_sin") == "theta":
+        from wrappers.theta_obs import ThetaObsWrapper
+        return ThetaObsWrapper(env)
+    return env
+
+
+def make_single_env(cfg, render_mode=None):
+    """Create a single environment with optional obs wrapper."""
+    env = gym.make(cfg["env_name"], render_mode=render_mode) if render_mode else gym.make(cfg["env_name"])
+    return _wrap_obs(env, cfg)
+
+
 def make_eval_env(cfg):
     """Create eval env — vectorized if num_parallel_evals > 1, else single."""
-    env_name = cfg["env_name"]
     num_envs = cfg.get("num_parallel_evals", 1)
     if num_envs > 1:
         return gym.vector.SyncVectorEnv(
-            [lambda en=env_name: gym.make(en) for _ in range(num_envs)]
+            [lambda: make_single_env(cfg) for _ in range(num_envs)]
         )
-    return gym.make(env_name)
+    return make_single_env(cfg)
 
 
 def _vectorized_evaluate(vec_env, policy, cfg):

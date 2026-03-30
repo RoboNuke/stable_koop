@@ -36,12 +36,25 @@ def collect_eval_trajectories(env_name, num_trajectories, min_steps, seed):
     return trajectories
 
 
+_obs_type = "cos_sin"  # module-level default, set by set_obs_type()
+
+def set_obs_type(obs_type):
+    """Set the observation type for angle extraction."""
+    global _obs_type
+    _obs_type = obs_type
+
 def obs_to_angle(obs):
-    """Convert pendulum observation [cos(θ), sin(θ), θ_dot] to angle θ."""
-    return np.arctan2(obs[..., 1], obs[..., 0])
+    """Convert pendulum observation to angle θ. Uses module-level _obs_type."""
+    if _obs_type == "theta":
+        return obs[..., 0]  # theta is already the first element
+    else:
+        return np.arctan2(obs[..., 1], obs[..., 0])
 
 
-def evaluate_model(model, trajectories, train_horizon, eval_horizon=25):
+def evaluate_model(model, trajectories, train_horizon, eval_horizon=25, title=None,
+                   obs_scale=None, obs_type=None):
+    if obs_type is not None:
+        set_obs_type(obs_type)
     """Evaluate Koopman model on trajectories.
 
     Args:
@@ -67,6 +80,9 @@ def evaluate_model(model, trajectories, train_horizon, eval_horizon=25):
     all_latent_errs = []
     all_state_errs = []
 
+    # Precompute unscaling for angle extraction
+    _obs_scale = np.array(obs_scale, dtype=np.float32) if obs_scale is not None else None
+
     with torch.no_grad():
         for states, actions in trajectories:
             states_t = torch.from_numpy(states).to(device)
@@ -79,8 +95,11 @@ def evaluate_model(model, trajectories, train_horizon, eval_horizon=25):
                 z = model.predict(z, actions_t[t:t + 1])
                 x_pred = model.decode(z).cpu().numpy()[0]
 
-                true_angle = obs_to_angle(states[t + 1])
-                pred_angle = obs_to_angle(x_pred)
+                # Unscale before extracting angles
+                true_state = states[t + 1] * _obs_scale if _obs_scale is not None else states[t + 1]
+                pred_state = x_pred * _obs_scale if _obs_scale is not None else x_pred
+                true_angle = obs_to_angle(true_state)
+                pred_angle = obs_to_angle(pred_state)
 
                 err = pred_angle - true_angle
                 err = (err + np.pi) % (2 * np.pi) - np.pi
@@ -144,7 +163,9 @@ def evaluate_model(model, trajectories, train_horizon, eval_horizon=25):
     ax.legend(loc="upper left")
     ax.set_xlabel("Prediction Step")
     ax.set_ylabel("True Pendulum Angle (degrees)")
-    ax.set_title(f"Koopman Prediction Error vs Angle & Horizon ({num_trajectories} trajectories)")
+    if title is None:
+        title = f"Koopman Prediction Error vs Angle & Horizon ({num_trajectories} trajectories)"
+    ax.set_title(title)
 
     heatmap_data = {
         "angle_centers_deg": np.degrees(angle_centers).tolist(),
@@ -206,7 +227,10 @@ if __name__ == "__main__":
     )
 
     train_horizon = cfg.get("horizon", args.horizon)
-    fig, error_stats, heatmap_data = evaluate_model(model, trajectories, train_horizon, eval_horizon=args.horizon)
+    fig, error_stats, heatmap_data = evaluate_model(model, trajectories, train_horizon,
+                                                     eval_horizon=args.horizon,
+                                                     obs_scale=cfg.get("obs_scale"),
+                                                     obs_type=cfg.get("obs_type", "cos_sin"))
     fig.savefig("eval_prediction_error.png", dpi=150, bbox_inches="tight")
     print(f"Plot saved to eval_prediction_error.png")
     plt.show()

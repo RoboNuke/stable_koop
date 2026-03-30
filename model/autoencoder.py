@@ -150,11 +150,11 @@ class KoopmanAutoencoder(nn.Module):
         elif encoder_type == "linear":
             self.encoder = nn.Sequential(
                 nn.Linear(state_dim, encoder_latent), 
-                nn.Tanh(),
-                #nn.ReLU(),
+                #nn.Tanh(),
+                nn.ReLU(),
                 nn.Linear(encoder_latent, encoder_latent),        
-                nn.Tanh(),
-                #nn.ReLU(),
+                #nn.Tanh(),
+                nn.ReLU(),
                 nn.Linear(encoder_latent, latent_dim)
             )
 
@@ -165,10 +165,12 @@ class KoopmanAutoencoder(nn.Module):
         
         # making the decoder lower capacity forces the encoder to do better work
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, encoder_latent//2), 
-            nn.Tanh(),
-            nn.Linear(encoder_latent//2, encoder_latent//2),         
-            nn.Tanh(),
+            nn.Linear(latent_dim, encoder_latent//2),       
+            #nn.Tanh(),
+            nn.ReLU(),
+            nn.Linear(encoder_latent//2, encoder_latent//2),            
+            #nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(encoder_latent//2, state_dim)
         )
         self.b_from_k_mod = False

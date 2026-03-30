@@ -2,6 +2,7 @@
 run_name: "construct_pendulum"
 
 # Environment
+obs_type: "cos_sin"  # "cos_sin" = [cos_th, sin_th, thdot] (3D), "theta" = [theta, thdot] (2D)
 env_name: "Pendulum-v1"
 num_trajectories: 200
 max_episode_steps: 200
@@ -23,6 +24,7 @@ kp: 10.0
 kd: 2.0
 
 # Perturbation (random actions to excite the system that represent possible residual actions)
+analytical_B_policy: "none"  # policy for analytical B data collection: "none", "energy", "bang_energy"
 perturb_scale: 1.0 # multiplier on max action
 fix_perturb_range: false
 hold_steps: 5  # number of steps to hold each sampled perturbation before resampling
@@ -45,6 +47,7 @@ num_workers: 4
 lr: 1.0e-2
 weight_decay: 1.0e-5
 num_epochs: 100
+recon_pretrain_epochs: 0  # encoder/decoder pretraining with recon loss only (0 = disabled)
 loss_threshold: -10 #0.003 works with pred_weight=10
 scheduler_step: 100
 scheduler_gamma: 0.5

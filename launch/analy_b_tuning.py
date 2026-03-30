@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import yaml
 
-from launch.eval_pendulum import obs_to_angle
+from launch.eval_pendulum import obs_to_angle, set_obs_type
 from launch.run import (
     make_base_policy,
     compute_obs_scale,
@@ -33,6 +33,13 @@ RED = "\033[91m"
 YELLOW = "\033[93m"
 GREEN = "\033[92m"
 RESET = "\033[0m"
+
+
+def _unscale_pred(x_pred, obs_scale):
+    """Unscale a decoded prediction back to raw observation space."""
+    if obs_scale is not None:
+        return x_pred * np.array(obs_scale, dtype=np.float32)
+    return x_pred
 
 
 def _fmt(arr):
@@ -288,7 +295,7 @@ def compute_analytical_B(model, trajectories, cfg):
 
 
 def make_prediction_heatmap(model, B_final, aug_trajectories, raw_trajectories,
-                            cfg, run_dir, eval_horizon=25):
+                            cfg, run_dir, eval_horizon=None):
     """Heatmap 1: prediction error vs step forward (x) and pendulum angle (y).
 
     Uses the analytical B with model's A for multi-step Koopman prediction,
@@ -296,7 +303,10 @@ def make_prediction_heatmap(model, B_final, aug_trajectories, raw_trajectories,
     """
     device = next(model.parameters()).device
     model.eval()
+    obs_scale = cfg.get("obs_scale")
     train_horizon = cfg.get("horizon", 5)
+    if eval_horizon is None:
+        eval_horizon = train_horizon
 
     B_t = torch.tensor(B_final, dtype=torch.float32, device=device)
 
@@ -316,9 +326,8 @@ def make_prediction_heatmap(model, B_final, aug_trajectories, raw_trajectories,
             for t in range(T):
                 u = actions_t[t:t+1]  # (1, action_dim)
                 z = z @ A.T + u @ B_t.T
-                x_pred = model.decode(z).cpu().numpy()[0]
+                x_pred = _unscale_pred(model.decode(z).cpu().numpy()[0], obs_scale)
 
-                # True angle from raw (unnormalized) states
                 true_angle = obs_to_angle(states_raw[t + 1])
                 pred_angle = obs_to_angle(x_pred)
 
@@ -364,7 +373,7 @@ def make_prediction_heatmap(model, B_final, aug_trajectories, raw_trajectories,
                 ha="center", va="center", color="white", fontsize=6, alpha=0.7)
     ax.set_xlabel("Prediction Step")
     ax.set_ylabel("True Pendulum Angle (degrees)")
-    ax.set_title("Koopman Prediction Error (Analytical B) vs Angle & Horizon")
+    ax.set_title("Prediction Error (A+B, with perturbations) vs Angle & Horizon")
 
     vmin = float(np.nanmin(heatmap_deg))
     vmax = float(np.nanmax(heatmap_deg))
@@ -378,7 +387,7 @@ def make_prediction_heatmap(model, B_final, aug_trajectories, raw_trajectories,
 
 
 def make_prediction_heatmap_a_only(model, aug_trajectories, raw_trajectories,
-                                   cfg, run_dir, eval_horizon=25,
+                                   cfg, run_dir, eval_horizon=None,
                                    vmin=None, vmax=None,
                                    filename="A_only_prediction_heatmap.png"):
     """Prediction heatmap using only A (no B), with perturbations still applied to env.
@@ -388,7 +397,10 @@ def make_prediction_heatmap_a_only(model, aug_trajectories, raw_trajectories,
     """
     device = next(model.parameters()).device
     model.eval()
+    obs_scale = cfg.get("obs_scale")
     train_horizon = cfg.get("horizon", 5)
+    if eval_horizon is None:
+        eval_horizon = train_horizon
 
     true_angles_all = []
     errors_all = []
@@ -403,7 +415,7 @@ def make_prediction_heatmap_a_only(model, aug_trajectories, raw_trajectories,
             T = min(eval_horizon, len(actions_norm))
             for t in range(T):
                 z = z @ A.T  # A-only, no B term
-                x_pred = model.decode(z).cpu().numpy()[0]
+                x_pred = _unscale_pred(model.decode(z).cpu().numpy()[0], obs_scale)
 
                 true_angle = obs_to_angle(states_raw[t + 1])
                 pred_angle = obs_to_angle(x_pred)
@@ -450,7 +462,7 @@ def make_prediction_heatmap_a_only(model, aug_trajectories, raw_trajectories,
                 ha="center", va="center", color="white", fontsize=6, alpha=0.7)
     ax.set_xlabel("Prediction Step")
     ax.set_ylabel("True Pendulum Angle (degrees)")
-    ax.set_title("A-only Prediction Error (no B) vs Angle & Horizon")
+    ax.set_title("Prediction Error (A only, no B, with perturbations) vs Angle & Horizon")
 
     path = os.path.join(run_dir, filename)
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -541,7 +553,7 @@ def make_latent_recon_heatmap(model, B_final, aug_trajectories, raw_trajectories
 
     ax.set_xlabel("Control Perturbation (u)")
     ax.set_ylabel("Pendulum Angle (degrees)")
-    ax.set_title("Latent Reconstruction Error vs Perturbation & Angle")
+    ax.set_title("Latent Error (A+B, with perturbations) vs Perturbation & Angle")
 
     vmin = float(np.nanmin(heatmap))
     vmax = float(np.nanmax(heatmap))
@@ -630,7 +642,7 @@ def make_a_only_heatmap(model, aug_trajectories, raw_trajectories, cfg, run_dir,
 
     ax.set_xlabel("Control Perturbation (u)")
     ax.set_ylabel("Pendulum Angle (degrees)")
-    ax.set_title("A-only Latent Error with Perturbations (no B correction)")
+    ax.set_title("Latent Error (A only, no B, with perturbations) vs Perturbation & Angle")
 
     path = os.path.join(run_dir, filename)
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -713,7 +725,7 @@ def make_latent_diff_heatmap(model, B_final, aug_trajectories, raw_trajectories,
 
     ax.set_xlabel("Control Perturbation (u)")
     ax.set_ylabel("Pendulum Angle (degrees)")
-    ax.set_title("B Improvement: Latent Error (green=B helps, red=B hurts)")
+    ax.set_title("Latent Error Diff: (A only) - (A+B), with perturbations (green=B helps, red=B hurts)")
 
     path = os.path.join(run_dir, "latent_diff_heatmap.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -730,6 +742,7 @@ def make_prediction_diff_heatmap(model, B_final, aug_trajectories, raw_trajector
     """
     device = next(model.parameters()).device
     model.eval()
+    obs_scale = cfg.get("obs_scale")
 
     B_t = torch.tensor(B_final, dtype=torch.float32, device=device)
 
@@ -751,8 +764,8 @@ def make_prediction_diff_heatmap(model, B_final, aug_trajectories, raw_trajector
                 z_ab = z_ab @ A.T + u @ B_t.T
                 z_a = z_a @ A.T
 
-                x_pred_ab = model.decode(z_ab).cpu().numpy()[0]
-                x_pred_a = model.decode(z_a).cpu().numpy()[0]
+                x_pred_ab = _unscale_pred(model.decode(z_ab).cpu().numpy()[0], obs_scale)
+                x_pred_a = _unscale_pred(model.decode(z_a).cpu().numpy()[0], obs_scale)
 
                 true_angle = obs_to_angle(states_raw[t + 1])
                 err_ab = abs(((obs_to_angle(x_pred_ab) - true_angle + np.pi) % (2 * np.pi)) - np.pi)
@@ -797,7 +810,7 @@ def make_prediction_diff_heatmap(model, B_final, aug_trajectories, raw_trajector
 
     ax.set_xlabel("Prediction Step")
     ax.set_ylabel("True Pendulum Angle (degrees)")
-    ax.set_title("B Improvement: Prediction Error (green=B helps, red=B hurts)")
+    ax.set_title("Prediction Error Diff: (A only) - (A+B), with perturbations (green=B helps, red=B hurts)")
 
     path = os.path.join(run_dir, "prediction_diff_heatmap.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -805,8 +818,233 @@ def make_prediction_diff_heatmap(model, B_final, aug_trajectories, raw_trajector
     print(f"Prediction diff heatmap saved to {path}")
 
 
+def _compute_recon_errors_theta_thdot(model, aug_trajectories, raw_trajectories,
+                                      B_tensor, use_B, device):
+    """Compute one-step reconstruction errors binned by theta and theta_dot.
+
+    Args:
+        B_tensor: torch tensor (latent_dim, action_dim) or None
+        use_B: if True, use z_pred = A*z + B*u; if False, use z_pred = A*z
+
+    Returns:
+        (all_thetas, all_thdots, all_errors) as numpy arrays
+    """
+    model.eval()
+    all_thetas = []
+    all_thdots = []
+    all_errors = []
+
+    with torch.no_grad():
+        A = model.A.detach()
+        for i, (states_norm, actions_norm) in enumerate(aug_trajectories):
+            states_t = torch.tensor(states_norm, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions_norm, dtype=torch.float32, device=device)
+
+            z_all = model.encode(states_t)
+            z_t = z_all[:-1]
+            z_next = z_all[1:]
+
+            if use_B and B_tensor is not None:
+                u_t = actions_t[:len(z_t)]
+                z_pred = z_t @ A.T + u_t @ B_tensor.T
+            else:
+                z_pred = z_t @ A.T
+
+            errs = torch.linalg.norm(z_next - z_pred, dim=-1).cpu().numpy()
+
+            # Get raw states for theta/thdot
+            if len(raw_trajectories[i]) == 3:
+                states_raw = raw_trajectories[i][0]
+            else:
+                states_raw = raw_trajectories[i][0]
+
+            for t in range(len(errs)):
+                obs = states_raw[t]
+                if len(obs) == 3:
+                    theta = np.arctan2(obs[1], obs[0])
+                    thdot = obs[2]
+                else:
+                    theta = obs[0]
+                    thdot = obs[1]
+                all_thetas.append(theta)
+                all_thdots.append(thdot)
+                all_errors.append(errs[t])
+
+    return np.array(all_thetas), np.array(all_thdots), np.array(all_errors)
+
+
+def _make_theta_thdot_heatmap(thetas, thdots, errors, title, filepath,
+                               cmap_name="inferno", vmin=None, vmax=None):
+    """Create and save a heatmap with x=theta_dot, y=theta, color=error."""
+    angle_bins = np.linspace(-np.pi, np.pi, 37)
+    angle_centers = 0.5 * (angle_bins[:-1] + angle_bins[1:])
+
+    thdot_bins = np.linspace(-8, 8, 33)
+    thdot_centers = 0.5 * (thdot_bins[:-1] + thdot_bins[1:])
+
+    heatmap = np.full((len(angle_centers), len(thdot_centers)), np.nan)
+    a_idx = np.digitize(thetas, angle_bins) - 1
+    t_idx = np.digitize(thdots, thdot_bins) - 1
+
+    for ai in range(len(angle_centers)):
+        for ti in range(len(thdot_centers)):
+            mask = (a_idx == ai) & (t_idx == ti)
+            if mask.sum() > 0:
+                heatmap[ai, ti] = np.mean(errors[mask])
+
+    if cmap_name == "RdYlGn":
+        from matplotlib.colors import TwoSlopeNorm
+        cmap = plt.cm.RdYlGn.copy()
+        cmap.set_bad(color="lightgrey")
+        vcenter = 0.0
+        if vmin is None:
+            vmin = np.nanmin(errors) if len(errors) > 0 else -1
+        if vmax is None:
+            vmax = np.nanmax(errors) if len(errors) > 0 else 1
+        norm = TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=max(vmax, 1e-6))
+    else:
+        cmap = plt.cm.get_cmap(cmap_name).copy()
+        cmap.set_bad(color="lightgrey")
+        norm = None
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    kwargs = {"cmap": cmap, "shading": "nearest"}
+    if norm is not None:
+        kwargs["norm"] = norm
+    else:
+        if vmin is not None:
+            kwargs["vmin"] = vmin
+        if vmax is not None:
+            kwargs["vmax"] = vmax
+    im = ax.pcolormesh(thdot_centers, np.degrees(angle_centers), heatmap, **kwargs)
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("Mean Latent Reconstruction Error")
+
+    no_data = np.argwhere(np.isnan(heatmap))
+    for ai, ti in no_data:
+        ax.text(thdot_centers[ti], np.degrees(angle_centers[ai]), "x",
+                ha="center", va="center", color="white", fontsize=5, alpha=0.5)
+
+    ax.set_xlabel("θ̇ (rad/s)")
+    ax.set_ylabel("θ (degrees)")
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(filepath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Heatmap saved to {filepath}")
+
+    return np.nanmin(heatmap) if not np.all(np.isnan(heatmap)) else 0, \
+           np.nanmax(heatmap) if not np.all(np.isnan(heatmap)) else 1
+
+
+def make_theta_thdot_heatmaps(model, B_ls, aug_trajectories, raw_trajectories,
+                               base_aug_trajectories, base_raw_trajectories,
+                               cfg, run_dir):
+    """Generate theta vs thdot reconstruction error heatmaps.
+
+    Creates 4 heatmaps:
+    1. A only, no B, no perturbations (base policy data)
+    2. A only, no B, with perturbations
+    3. A+B, with perturbations
+    4. Difference: (A only, with pert) - (A+B, with pert), green = B helps
+    """
+    device = next(model.parameters()).device
+    B_t = torch.tensor(B_ls, dtype=torch.float32, device=device)
+
+    # 1. A only, no B, no perturbations
+    th1, td1, err1 = _compute_recon_errors_theta_thdot(
+        model, base_aug_trajectories, base_raw_trajectories, None, False, device)
+    vmin1, vmax1 = _make_theta_thdot_heatmap(
+        th1, td1, err1,
+        "Recon Error (A only, no B, no perturbations)",
+        os.path.join(run_dir, "recon_theta_thdot_A_noPert.png"))
+
+    # 2. A only, no B, with perturbations
+    th2, td2, err2 = _compute_recon_errors_theta_thdot(
+        model, aug_trajectories, raw_trajectories, None, False, device)
+    vmin2, vmax2 = _make_theta_thdot_heatmap(
+        th2, td2, err2,
+        "Recon Error (A only, no B, with perturbations)",
+        os.path.join(run_dir, "recon_theta_thdot_A_withPert.png"))
+
+    # 3. A+B, with perturbations
+    th3, td3, err3 = _compute_recon_errors_theta_thdot(
+        model, aug_trajectories, raw_trajectories, B_t, True, device)
+    vmin3, vmax3 = _make_theta_thdot_heatmap(
+        th3, td3, err3,
+        "Recon Error (A+B, with perturbations)",
+        os.path.join(run_dir, "recon_theta_thdot_AB_withPert.png"))
+
+    # Shared scale versions
+    shared_vmin = min(vmin1, vmin2, vmin3)
+    shared_vmax = max(vmax1, vmax2, vmax3)
+    _make_theta_thdot_heatmap(
+        th1, td1, err1,
+        "Recon Error (A only, no B, no perturbations) [shared scale]",
+        os.path.join(run_dir, "recon_theta_thdot_A_noPert-scaled.png"),
+        vmin=shared_vmin, vmax=shared_vmax)
+    _make_theta_thdot_heatmap(
+        th2, td2, err2,
+        "Recon Error (A only, no B, with perturbations) [shared scale]",
+        os.path.join(run_dir, "recon_theta_thdot_A_withPert-scaled.png"),
+        vmin=shared_vmin, vmax=shared_vmax)
+    _make_theta_thdot_heatmap(
+        th3, td3, err3,
+        "Recon Error (A+B, with perturbations) [shared scale]",
+        os.path.join(run_dir, "recon_theta_thdot_AB_withPert-scaled.png"),
+        vmin=shared_vmin, vmax=shared_vmax)
+
+    # 4. Difference: (A only with pert) - (A+B with pert), green = B helps
+    # Need to bin both on the same grid and compute diff
+    angle_bins = np.linspace(-np.pi, np.pi, 37)
+    angle_centers = 0.5 * (angle_bins[:-1] + angle_bins[1:])
+    thdot_bins = np.linspace(-8, 8, 33)
+    thdot_centers = 0.5 * (thdot_bins[:-1] + thdot_bins[1:])
+
+    heatmap_a = np.full((len(angle_centers), len(thdot_centers)), np.nan)
+    heatmap_ab = np.full((len(angle_centers), len(thdot_centers)), np.nan)
+
+    a_idx2 = np.digitize(th2, angle_bins) - 1
+    t_idx2 = np.digitize(td2, thdot_bins) - 1
+    a_idx3 = np.digitize(th3, angle_bins) - 1
+    t_idx3 = np.digitize(td3, thdot_bins) - 1
+
+    for ai in range(len(angle_centers)):
+        for ti in range(len(thdot_centers)):
+            mask2 = (a_idx2 == ai) & (t_idx2 == ti)
+            mask3 = (a_idx3 == ai) & (t_idx3 == ti)
+            if mask2.sum() > 0:
+                heatmap_a[ai, ti] = np.mean(err2[mask2])
+            if mask3.sum() > 0:
+                heatmap_ab[ai, ti] = np.mean(err3[mask3])
+
+    diff = heatmap_a - heatmap_ab  # positive = B helps
+
+    from matplotlib.colors import TwoSlopeNorm
+    cmap_diff = plt.cm.RdYlGn.copy()
+    cmap_diff.set_bad(color="lightgrey")
+    d_abs = max(abs(np.nanmin(diff)) if not np.all(np.isnan(diff)) else 1,
+                abs(np.nanmax(diff)) if not np.all(np.isnan(diff)) else 1, 1e-6)
+    norm = TwoSlopeNorm(vmin=-d_abs, vcenter=0, vmax=d_abs)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    im = ax.pcolormesh(thdot_centers, np.degrees(angle_centers), diff,
+                       cmap=cmap_diff, shading="nearest", norm=norm)
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("Error Diff: (A only) − (A+B)  [green = B helps]")
+    ax.set_xlabel("θ̇ (rad/s)")
+    ax.set_ylabel("θ (degrees)")
+    ax.set_title("Recon Error Diff: (A only) − (A+B), with perturbations (green = B helps)")
+    fig.tight_layout()
+    path = os.path.join(run_dir, "recon_theta_thdot_diff.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Diff heatmap saved to {path}")
+
+
 def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
-                     obs_scale=None, num_trajectories=None):
+                     obs_scale=None, num_trajectories=None,
+                     base_aug_trajectories=None, base_raw_trajectories=None):
     """Analytically derive B matrix for a pre-trained Koopman model.
 
     Collects perturbed trajectory data, solves for B via least-squares with
@@ -825,6 +1063,9 @@ def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
     Returns:
         B_final: (latent_dim, action_dim) numpy array
     """
+    # Set obs_type for angle extraction
+    set_obs_type(cfg.get("obs_type", "cos_sin"))
+
     # Print A matrix properties
     A = model.A.detach().cpu().numpy()
     eigvals = np.linalg.eigvals(A)
@@ -875,6 +1116,14 @@ def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
                              cfg, run_dir)
     make_prediction_diff_heatmap(model, B_ls, aug_trajectories, trajectories,
                                  cfg, run_dir, eval_horizon=train_horizon)
+
+    # Theta vs thdot reconstruction heatmaps
+    if base_aug_trajectories is not None and base_raw_trajectories is not None:
+        make_theta_thdot_heatmaps(model, B_ls, aug_trajectories, trajectories,
+                                   base_aug_trajectories, base_raw_trajectories,
+                                   cfg, run_dir)
+    else:
+        print("  Skipping theta-thdot heatmaps (no base trajectory data provided)")
 
     # Save results
     A_f64 = A.astype(np.float64)
@@ -970,7 +1219,8 @@ def main():
     print(f"Augment state: {augment}")
 
     # Environment and policy
-    env = gym.make(cfg["env_name"])
+    from launch.eval_policy import make_single_env
+    env = make_single_env(cfg)
     policy = make_base_policy(cfg)
     obs_scale = compute_obs_scale(env, augment)
     cfg["obs_scale"] = obs_scale.tolist()

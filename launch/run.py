@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import yaml
 
-from launch.eval_policy import evaluate as evaluate_policy, make_policy, make_eval_env
+from launch.eval_policy import evaluate as evaluate_policy, make_policy, make_eval_env, make_single_env
 from launch.eval_pendulum import evaluate_model
 from launch.train_pendulum import collect_data, train
 from model.autoencoder import KoopmanAutoencoder
@@ -292,7 +292,9 @@ def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_sc
 
     # 5. Evaluate on training data
     fig, error_stats, heatmap_data = evaluate_model(
-        model, aug_trajectories, cfg["horizon"], eval_horizon=25)
+        model, aug_trajectories, cfg["horizon"], eval_horizon=25,
+        title="Prediction Error (A+B, with perturbations, core losses only)",
+        obs_scale=cfg.get("obs_scale"), obs_type=cfg.get("obs_type", "cos_sin"))
 
     # 6. Save heatmap
     plot_path = os.path.join(run_dir, "koop_a_prediction_error.png")
@@ -353,7 +355,9 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
 
     # 6. Evaluate on training data
     fig, error_stats, heatmap_data = evaluate_model(
-        model, aug_trajectories, cfg["horizon"], eval_horizon=25)
+        model, aug_trajectories, cfg["horizon"], eval_horizon=25,
+        title="Prediction Error (A+B, with perturbations, all losses)",
+        obs_scale=cfg.get("obs_scale"), obs_type=cfg.get("obs_type", "cos_sin"))
 
     # 7. Save heatmap
     plot_path = os.path.join(run_dir, "koop_b_prediction_error.png")
@@ -932,7 +936,7 @@ def main():
 
     # Vectorized env for evaluation, single env for data collection / scaling
     eval_env = make_env(cfg)
-    train_env = gym.make(cfg["env_name"])
+    train_env = make_single_env(cfg)
 
     policy = make_base_policy(cfg)
 

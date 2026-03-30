@@ -62,7 +62,8 @@ def main():
     save_config(cfg, run_dir)
 
     # Environment and policy (single env for correct 1-D observation bounds)
-    env = gym.make(cfg["env_name"])
+    from launch.eval_policy import make_single_env
+    env = make_single_env(cfg)
     policy = make_base_policy(cfg)
     obs_scale = compute_obs_scale(env, augment)
     cfg["obs_scale"] = obs_scale.tolist()
