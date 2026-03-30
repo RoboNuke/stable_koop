@@ -22,6 +22,7 @@ from launch.run import (
     augment_perturbed_trajectories,
     phase_3_compute_variables,
     phase_3_lyapunov,
+    lipschitz_m_free,
     save_config,
 )
 from model.autoencoder import KoopmanAutoencoder
@@ -108,7 +109,7 @@ def main():
     # Override tuning parameters from the --config file
     with open(args.config) as f:
         tune_cfg = yaml.safe_load(f)
-    for key in ("use_eigen_bound", "use_lyapunov_bound",
+    for key in ("use_eigen_bound", "use_lyapunov_bound", "use_m_free_bound",
                 "controllable_subspace", "ctrl_threshold",
                 "q_scale", "r_scale", "scale_B",
                 "max_tracking_error_x", "max_displacement_x"):
@@ -125,6 +126,9 @@ def main():
         lyap_vars, _ = phase_3_lyapunov(model, cfg, run_dir, aug_trajectories,
                                          tuning_config=args.config)
         variables.update(lyap_vars)
+    if cfg.get("use_m_free_bound", False):
+        mfree_vars, _ = lipschitz_m_free(model, cfg, run_dir, aug_trajectories, env)
+        variables.update(mfree_vars)
 
     env.close()
     print(f"\n=== Done. All outputs in {run_dir} ===")

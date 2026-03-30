@@ -24,7 +24,7 @@ from launch.run import (
     make_run_dir, save_config, make_env, compute_obs_scale, compute_act_scale,
     make_base_policy, save_eval_results, augment_trajectories,
     collect_perturbed_data, augment_perturbed_trajectories,
-    phase_0_base_eval, phase_3_lyapunov,
+    phase_0_base_eval, phase_3_lyapunov, lipschitz_m_free,
 )
 from launch.analy_b_tuning import run_analytical_b
 from model.autoencoder import KoopmanAutoencoder
@@ -113,12 +113,12 @@ def phase_2_analytical_B(model, env, policy, cfg, run_dir, augment=True,
 
 def phase_3_stability(model, env, policy, cfg, run_dir, B_final,
                       augment=True, obs_scale=None):
-    """Phase 3: Lyapunov stability analysis with analytical B on perturbed data.
+    """Phase 3: Stability analysis with analytical B on perturbed data.
 
     Sets the model's B matrix to the analytical solution, collects perturbed
-    trajectories, and runs the Lyapunov stability check.
+    trajectories, and runs configured stability checks (Lyapunov and/or m-free).
     """
-    print("\n=== Phase 3: Lyapunov Stability Analysis ===")
+    print("\n=== Phase 3: Stability Analysis ===")
 
     # 1. Set model B to the analytical solution
     with torch.no_grad():
@@ -140,9 +140,23 @@ def phase_3_stability(model, env, policy, cfg, run_dir, B_final,
     aug_trajectories = augment_perturbed_trajectories(
         trajectories, augment=augment, obs_scale=obs_scale)
 
-    # 4. Run Lyapunov stability analysis
+    # 4. Run stability analyses
     stability_dir = os.path.join(run_dir, "stability")
-    variables, lqr = phase_3_lyapunov(model, cfg, stability_dir, aug_trajectories)
+    variables = {}
+    lqr = None
+
+    if cfg.get("use_lyapunov_bound", False):
+        lyap_vars, lyap_lqr = phase_3_lyapunov(model, cfg, stability_dir, aug_trajectories)
+        variables.update(lyap_vars)
+        if lqr is None:
+            lqr = lyap_lqr
+
+    if cfg.get("use_m_free_bound", False):
+        mfree_vars, mfree_lqr = lipschitz_m_free(model, cfg, stability_dir,
+                                                   aug_trajectories, env)
+        variables.update(mfree_vars)
+        if lqr is None:
+            lqr = mfree_lqr
 
     # 5. Save checkpoint with analytical B included
     ckpt_path = os.path.join(run_dir, "koopman_ckpt.pt")

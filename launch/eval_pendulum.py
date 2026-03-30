@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -194,6 +195,140 @@ def evaluate_model(model, trajectories, train_horizon, eval_horizon=25, title=No
         "std_pred_error_state": std_pred_error_state,
     }
     return fig, error_stats, heatmap_data
+
+
+def _extract_theta_thdot(raw_trajectories):
+    """Extract theta and thdot arrays from raw perturbed trajectories.
+
+    Each raw trajectory is (states, base_actions, perturbations).
+    Returns list of (thetas, thdots) arrays, one per trajectory, with length T-1
+    (matching one-step prediction pairs).
+    """
+    all_thetas = []
+    all_thdots = []
+    for traj in raw_trajectories:
+        states_raw = traj[0]  # (T+1, obs_dim)
+        T = len(states_raw) - 2  # match z_t/z_next pairs (exclude last state)
+        thetas = np.zeros(T)
+        thdots = np.zeros(T)
+        for t in range(T):
+            obs = states_raw[t]
+            if len(obs) == 3:  # cos_sin
+                thetas[t] = np.arctan2(obs[1], obs[0])
+                thdots[t] = obs[2]
+            else:  # theta
+                thetas[t] = obs[0]
+                thdots[t] = obs[1]
+        all_thetas.append(thetas)
+        all_thdots.append(thdots)
+    return all_thetas, all_thdots
+
+
+def _make_theta_thdot_heatmap(thetas, thdots, errors, title, filepath):
+    """Create and save a theta vs theta_dot heatmap with error as color."""
+    angle_bins = np.linspace(-np.pi, np.pi, 37)
+    angle_centers = 0.5 * (angle_bins[:-1] + angle_bins[1:])
+    thdot_bins = np.linspace(-8, 8, 33)
+    thdot_centers = 0.5 * (thdot_bins[:-1] + thdot_bins[1:])
+
+    heatmap = np.full((len(angle_centers), len(thdot_centers)), np.nan)
+    a_idx = np.digitize(thetas, angle_bins) - 1
+    t_idx = np.digitize(thdots, thdot_bins) - 1
+
+    for ai in range(len(angle_centers)):
+        for ti in range(len(thdot_centers)):
+            mask = (a_idx == ai) & (t_idx == ti)
+            if mask.sum() > 0:
+                heatmap[ai, ti] = np.mean(errors[mask])
+
+    cmap = plt.cm.inferno.copy()
+    cmap.set_bad(color="lightgrey")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    im = ax.pcolormesh(thdot_centers, np.degrees(angle_centers), heatmap,
+                        cmap=cmap, shading="nearest")
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("Mean Error")
+
+    no_data = np.argwhere(np.isnan(heatmap))
+    for ai, ti in no_data:
+        ax.text(thdot_centers[ti], np.degrees(angle_centers[ai]), "x",
+                ha="center", va="center", color="white", fontsize=5, alpha=0.5)
+
+    ax.set_xlabel("θ̇ (rad/s)")
+    ax.set_ylabel("θ (degrees)")
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(filepath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Heatmap saved to {filepath}")
+
+
+def make_recon_and_lc_heatmaps(model, aug_trajectories, raw_trajectories,
+                                run_dir, prefix=""):
+    """Generate theta vs theta_dot heatmaps for reconstruction and LC errors.
+
+    Creates two heatmaps:
+      1. Reconstruction error: ||decode(encode(x)) - x|| at each (theta, thdot)
+      2. Latent consistency error: ||z_{t+1} - predict(z_t, u_t)|| at each (theta, thdot)
+
+    Args:
+        model: KoopmanAutoencoder (on device)
+        aug_trajectories: list of (koopman_states, actions) — normalized
+        raw_trajectories: list of (states, base_actions, perturbations) — raw
+        run_dir: output directory
+        prefix: filename prefix (e.g. "phase1_" or "phase2_")
+    """
+    device = next(model.parameters()).device
+    model.eval()
+
+    all_thetas_list, all_thdots_list = _extract_theta_thdot(raw_trajectories)
+
+    all_recon_errs = []
+    all_lc_errs = []
+    all_thetas = []
+    all_thdots = []
+
+    with torch.no_grad():
+        for i, (states_norm, actions_norm) in enumerate(aug_trajectories):
+            states_t = torch.tensor(states_norm, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions_norm, dtype=torch.float32, device=device)
+
+            # Reconstruction error: ||decode(encode(x)) - x||
+            z_all = model.encode(states_t)
+            x_recon = model.decode(z_all)
+            recon_errs = torch.linalg.norm(x_recon - states_t, dim=-1).cpu().numpy()
+
+            # LC error: ||z_{t+1} - predict(z_t, u_t)||
+            z_t = z_all[:-1]
+            z_next = z_all[1:]
+            u_t = actions_t[:len(z_t)]
+            z_pred = model.predict(z_t, u_t)
+            lc_errs = torch.linalg.norm(z_next - z_pred, dim=-1).cpu().numpy()
+
+            # Trim to match (use T-1 pairs like LC)
+            thetas = all_thetas_list[i]
+            thdots = all_thdots_list[i]
+            n = min(len(thetas), len(lc_errs), len(recon_errs) - 1)
+            all_recon_errs.append(recon_errs[:n])
+            all_lc_errs.append(lc_errs[:n])
+            all_thetas.append(thetas[:n])
+            all_thdots.append(thdots[:n])
+
+    all_recon_errs = np.concatenate(all_recon_errs)
+    all_lc_errs = np.concatenate(all_lc_errs)
+    all_thetas = np.concatenate(all_thetas)
+    all_thdots = np.concatenate(all_thdots)
+
+    _make_theta_thdot_heatmap(
+        all_thetas, all_thdots, all_recon_errs,
+        f"Reconstruction Error vs θ, θ̇",
+        os.path.join(run_dir, f"{prefix}recon_theta_thdot.png"))
+
+    _make_theta_thdot_heatmap(
+        all_thetas, all_thdots, all_lc_errs,
+        f"Latent Consistency Error (1-step) vs θ, θ̇",
+        os.path.join(run_dir, f"{prefix}lc_theta_thdot.png"))
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from skrl.agents.torch.sac import SAC, SAC_DEFAULT_CONFIG
 from skrl.memories.torch import RandomMemory
 from skrl.envs.wrappers.torch import wrap_env
 
-from launch.eval_policy import evaluate as evaluate_policy, load_eval_stats, make_eval_env
+from launch.eval_policy import evaluate as evaluate_policy, load_eval_stats, make_eval_env, make_single_env
 from launch.train_pendulum import energy_shaping_policy
 from model.residual import StochasticActor, Critic
 from wrappers.residual import ResidualPolicyEnv
@@ -147,7 +147,7 @@ def train_residual(base_policy, lqr, cfg, run_dir, z_ref_limit=1.0, keep_all_ckp
 
     # Vectorized training envs
     def make_env():
-        env = gym.make(cfg["env_name"])
+        env = make_single_env(cfg)
         return ResidualPolicyEnv(env, base_policy, lqr, latent_dim, z_ref_limit)
 
     vec_env = gym.vector.SyncVectorEnv([make_env for _ in range(num_envs)])

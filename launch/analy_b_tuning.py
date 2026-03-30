@@ -206,13 +206,16 @@ def project_for_controllability(A, B_ls, n):
     return B_aug.astype(np.float32)
 
 
-def compute_analytical_B(model, trajectories, cfg):
+def compute_analytical_B(model, trajectories, cfg,
+                         base_trajectories=None):
     """Compute B analytically from trajectory data.
 
     Args:
         model: KoopmanAutoencoder with trained A matrix
         trajectories: list of (koopman_states, perturbations)
         cfg: config dict
+        base_trajectories: optional list of (koopman_states, zero_actions) from
+            Phase 1 (no perturbations). Used to report A-only fit quality.
 
     Returns:
         B_final: (latent_dim, action_dim) numpy array
@@ -260,7 +263,21 @@ def compute_analytical_B(model, trajectories, cfg):
     R = np.concatenate(all_residuals, axis=0).T  # (latent_dim, N)
     U = np.concatenate(all_actions, axis=0).T     # (action_dim, N)
     print(f"Data matrix shapes: R={R.shape}, U={U.shape}")
-    print(f"  R norm: {np.linalg.norm(R):.4f}, U norm: {np.linalg.norm(U):.4f}")
+    print(f"  R norm (perturbed): {np.linalg.norm(R):.4f}, U norm: {np.linalg.norm(U):.4f}")
+
+    # Compare with A-only fit on base (unperturbed) data
+    if base_trajectories is not None:
+        base_residuals = []
+        with torch.no_grad():
+            for states, actions in base_trajectories:
+                states_t = torch.tensor(states, dtype=torch.float32, device=device)
+                z_all = model.encode(states_t)
+                z_t = z_all[:-1]
+                z_next = z_all[1:]
+                z_pred = z_t @ A.T
+                base_residuals.append((z_next - z_pred).cpu().numpy())
+        R_base = np.concatenate(base_residuals, axis=0).T
+        print(f"  R norm (base, no perturbations): {np.linalg.norm(R_base):.4f}")
 
     A_np = A.cpu().numpy()
 
@@ -273,14 +290,19 @@ def compute_analytical_B(model, trajectories, cfg):
 
     # Step 2: Project onto maximally controllable subspace
     print(f"\nStep 2 - Controllability projection:")
-    B_proj = project_for_controllability(A_np, B_ls, n)
+    B_proj = B_ls #project_for_controllability(A_np, B_ls, n)
 
-    # Step 3: Normalize to unit spectral norm
+    # Step 3: Optionally normalize to unit spectral norm
+    normalize_B = cfg.get("normalize_analytical_B", True)
     B_scale = np.linalg.norm(B_proj, ord=2)
-    print(f"\nStep 3 - Normalize to unit spectral norm:")
-    print(f"  B_proj spectral norm before: {B_scale:.3f}")
-    B_proj = B_proj / B_scale
-    print(f"  Scaled to: {np.linalg.norm(B_proj, ord=2):.3f}")
+    if normalize_B:
+        print(f"\nStep 3 - Normalize to unit spectral norm:")
+        print(f"  B_proj spectral norm before: {B_scale:.3f}")
+        B_proj = B_proj / B_scale
+        print(f"  Scaled to: {np.linalg.norm(B_proj, ord=2):.3f}")
+    else:
+        print(f"\nStep 3 - Skipping normalization (normalize_analytical_B=false)")
+        print(f"  B_proj spectral norm: {B_scale:.3f}")
 
     # Step 4: Final verification
     rank, sv, _ = _ctrl_rank_and_sv(A_np.astype(np.float64), B_proj.astype(np.float64), n)
@@ -1090,7 +1112,8 @@ def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
     print(f"\n{'='*60}")
     print(f"Computing analytical B matrix")
     print(f"{'='*60}")
-    B_final, B_ls = compute_analytical_B(model, aug_trajectories, cfg)
+    B_final, B_ls = compute_analytical_B(model, aug_trajectories, cfg,
+                                         base_trajectories=base_aug_trajectories)
 
     # Generate heatmaps (use B_ls for prediction/recon — unnormalized, data-scale B)
     print(f"\nGenerating heatmaps...")
@@ -1179,32 +1202,36 @@ def main():
         description="Analytically compute B matrix for a pre-trained Koopman model")
     parser.add_argument("model_dir", type=str,
                         help="Path to model output directory (contains config.yaml and koopman_ckpt.pt)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Config file for stability/LQR tuning params (q_scale, r_scale, etc.)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Checkpoint file to load (default: koopman_ckpt.pt or koop_a_checkpoint.pt)")
+    parser.add_argument("--train-a", action="store_true", default=False,
+                        help="Train A matrix from scratch before computing B (requires --config)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (overrides default location)")
     parser.add_argument("--num-trajectories", type=int, default=None,
                         help="Number of trajectories to collect (default: from config)")
     args = parser.parse_args()
 
-    # Load config
+    # Load config from model directory
     config_path = os.path.join(args.model_dir, "config.yaml")
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    augment = cfg.get("augment_state", False)
+    # Override with tuning config if provided
+    if args.config:
+        with open(args.config) as f:
+            tune_cfg = yaml.safe_load(f)
+        for key in ("use_m_free_bound", "use_lyapunov_bound", "use_eigen_bound",
+                     "controllable_subspace", "ctrl_threshold",
+                     "q_scale", "r_scale", "scale_B",
+                     "max_tracking_error_x", "max_displacement_x",
+                     "perturb_scale", "fix_perturb_range", "hold_steps"):
+            if key in tune_cfg:
+                cfg[key] = tune_cfg[key]
 
-    # Determine checkpoint path
-    if args.checkpoint:
-        weights_path = args.checkpoint
-    else:
-        # Prefer koop_a_checkpoint.pt (A-only) if available, else koopman_ckpt.pt
-        a_path = os.path.join(args.model_dir, "koop_a_checkpoint.pt")
-        ab_path = os.path.join(args.model_dir, "koopman_ckpt.pt")
-        if os.path.exists(a_path):
-            weights_path = a_path
-        else:
-            weights_path = ab_path
+    augment = cfg.get("augment_state", False)
 
     # Output directory
     if args.output_dir:
@@ -1215,22 +1242,19 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     print(f"Output directory: {run_dir}")
     print(f"Model directory: {args.model_dir}")
-    print(f"Checkpoint: {weights_path}")
     print(f"Augment state: {augment}")
 
     # Environment and policy
-    from launch.eval_policy import make_single_env
+    from launch.eval_policy import make_single_env, make_analytical_b_policy
     env = make_single_env(cfg)
-    policy = make_base_policy(cfg)
     obs_scale = compute_obs_scale(env, augment)
     cfg["obs_scale"] = obs_scale.tolist()
     print(f"Observation scale: {obs_scale}")
 
-    # Build model and load weights
+    # Build model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    checkpoint = torch.load(weights_path, map_location=device)
     koopman_state_dim = cfg["state_dim"] + cfg["action_dim"] if augment else cfg["state_dim"]
     model = KoopmanAutoencoder(
         state_dim=koopman_state_dim,
@@ -1243,18 +1267,97 @@ def main():
         encoder_latent=cfg["encoder_latent"],
     ).to(device)
 
-    state_dict = checkpoint["model"]
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
-    model.eval()
-    print(f"Loaded weights from {weights_path}")
+    if args.train_a:
+        # Train A from scratch
+        print("\n=== Training A matrix from scratch ===")
+        from launch.train_pendulum import collect_data, train
+        from launch.run import augment_trajectories, compute_act_scale
+
+        policy = make_base_policy(cfg)
+        act_scale = compute_act_scale(env)
+
+        trajectories = collect_data(
+            env, cfg["num_trajectories"],
+            cfg["max_episode_steps"], cfg["seed"], policy=policy,
+        )
+        aug_trajectories = augment_trajectories(
+            trajectories, augment=augment,
+            obs_scale=obs_scale, act_scale=act_scale,
+        )
+        model = train(model, aug_trajectories, cfg)
+
+        # Save A checkpoint
+        ckpt_path = os.path.join(run_dir, "koop_a_checkpoint.pt")
+        save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
+        torch.save({"model": save_dict, "config": cfg}, ckpt_path)
+        print(f"A checkpoint saved to {ckpt_path}")
+    else:
+        # Load existing checkpoint
+        if args.checkpoint:
+            weights_path = args.checkpoint
+        else:
+            a_path = os.path.join(args.model_dir, "koop_a_checkpoint.pt")
+            ab_path = os.path.join(args.model_dir, "koopman_ckpt.pt")
+            if os.path.exists(a_path):
+                weights_path = a_path
+            else:
+                weights_path = ab_path
+
+        print(f"Checkpoint: {weights_path}")
+        checkpoint = torch.load(weights_path, map_location=device)
+        state_dict = checkpoint["model"]
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        model.eval()
+        print(f"Loaded weights from {weights_path}")
+
     print(f"Koopman model: state_dim={koopman_state_dim}, action_dim={cfg['action_dim']}, "
           f"latent_dim={cfg['latent_dim']}, k_type={cfg['k_type']}")
 
     # Run analytical B computation
-    B_final = run_analytical_b(model, env, policy, cfg, run_dir,
+    anal_b_policy = make_analytical_b_policy(cfg)
+    B_final = run_analytical_b(model, env, anal_b_policy, cfg, run_dir,
                                augment=augment, obs_scale=obs_scale,
                                num_trajectories=args.num_trajectories)
+
+    # Run stability analysis if config provided
+    if args.config and cfg.get("use_m_free_bound", False):
+        from launch.run import lipschitz_m_free
+        stability_dir = os.path.join(run_dir, "stability")
+
+        # Collect perturbed data for stability analysis
+        from launch.run import collect_perturbed_data, augment_perturbed_trajectories
+        trajectories = collect_perturbed_data(
+            env, anal_b_policy, cfg["num_trajectories"],
+            cfg["max_episode_steps"], cfg["seed"],
+            perturb_scale=cfg.get("perturb_scale", None),
+            fix_perturb_range=cfg.get("fix_perturb_range", False),
+            hold_steps=cfg.get("hold_steps", 1),
+        )
+        aug_trajectories = augment_perturbed_trajectories(
+            trajectories, augment=augment, obs_scale=obs_scale)
+
+        variables, lqr = lipschitz_m_free(model, cfg, stability_dir,
+                                           aug_trajectories, env)
+
+    if args.config and cfg.get("use_lyapunov_bound", False):
+        from launch.run import phase_3_lyapunov, collect_perturbed_data, augment_perturbed_trajectories
+        stability_dir = os.path.join(run_dir, "stability")
+
+        # Reuse perturbed data if already collected, otherwise collect
+        if 'aug_trajectories' not in dir():
+            trajectories = collect_perturbed_data(
+                env, anal_b_policy, cfg["num_trajectories"],
+                cfg["max_episode_steps"], cfg["seed"],
+                perturb_scale=cfg.get("perturb_scale", None),
+                fix_perturb_range=cfg.get("fix_perturb_range", False),
+                hold_steps=cfg.get("hold_steps", 1),
+            )
+            aug_trajectories = augment_perturbed_trajectories(
+                trajectories, augment=augment, obs_scale=obs_scale)
+
+        variables, lqr = phase_3_lyapunov(model, cfg, stability_dir,
+                                           aug_trajectories)
 
     env.close()
 

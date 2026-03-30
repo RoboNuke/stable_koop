@@ -37,7 +37,13 @@ def compute_lower_lipschitz(encoder, training_data):
         return encoder(x.unsqueeze(0)).squeeze(0)
     J_batch = vmap(jacrev(encode_single))(X)
     sigma_mins = torch.linalg.svdvals(J_batch)[:, -1]
-    return float(sigma_mins.min().detach())
+    m = float(sigma_mins.min().detach())
+    # Print distribution for diagnostics
+    print(f"  σ_min distribution ({len(sigma_mins)} points): "
+          f"min={sigma_mins.min():.6f}  p1={sigma_mins.quantile(0.01):.6f}  "
+          f"p5={sigma_mins.quantile(0.05):.6f}  median={sigma_mins.median():.6f}  "
+          f"mean={sigma_mins.mean():.6f}")
+    return m
 
 """
 def compute_lower_lipschitz(encoder, training_data):

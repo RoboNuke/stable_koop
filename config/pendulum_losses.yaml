@@ -29,6 +29,7 @@ sa: 40
 
 # Perturbation (random actions to excite the system that represent possible residual actions)
 analytical_B_policy: "none"  # policy for analytical B data collection: "none", "energy", "bang_energy"
+normalize_analytical_B: false  # normalize analytical B to unit spectral norm
 perturb_scale: 1.0
 fix_perturb_range: false
 hold_steps: 5  # number of steps to hold each sampled perturbation before resampling
@@ -36,6 +37,7 @@ hold_steps: 5  # number of steps to hold each sampled perturbation before resamp
 # LQR / Stability
 use_eigen_bound: false  # spectral radius / transient constant bound
 use_lyapunov_bound: true  # Lyapunov-based bound
+use_m_free_bound: false   # Lipschitz-m-free stability bound
 controllable_subspace: true  # if true, solve LQR only in controllable subspace
 ctrl_threshold: 0.1          # controllability singular value threshold (null = machine epsilon default)
 
@@ -70,6 +72,9 @@ torch_compile: true  # use torch.compile to fuse GPU kernels (slower first epoch
 recon_weight: 0.05 #1.0
 pred_weight: 0.05 #1.0
 latent_consistency_weight: 2.0 #0.1
+
+latent_rollout_loss: false
+latent_rollout_weight: 1.0
 
 l_inf_pred_loss: false
 l_inf_pred_weight: 1.0

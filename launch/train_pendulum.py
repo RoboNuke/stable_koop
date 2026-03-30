@@ -149,12 +149,12 @@ def bi_lipschitz_loss(encoder, x_batch, m_target=0.5):
 """
 
 def bi_lipschitz_loss(encoder, x_batch, m_target=0.5):
-    """Penalize encoder Jacobian singular values below m_target."""
+    """Penalize worst-case encoder Jacobian singular value below m_target."""
     def encode_single(x):
         return encoder(x.unsqueeze(0)).squeeze(0)
     J = vmap(jacrev(encode_single))(x_batch)  # (N, latent_dim, state_dim)
     sigma_mins = torch.linalg.svdvals(J)[:, -1]
-    return torch.relu(m_target - sigma_mins).mean()
+    return torch.relu(m_target - sigma_mins.min())
 
 def upper_lipschitz_loss(encoder, x_batch, m_max=1.0):
     """Penalize encoder Jacobian singular values above m_max."""
@@ -235,34 +235,31 @@ def normality_loss(A):
 
 
 def l_inf_pred_loss(model, states_seq, actions_seq):
-    """Worst-case multi-step prediction error over the batch.
-    
-    Computes RMSE for each (sample, timestep) pair and returns
-    the maximum across all of them.
+    """Worst-case reconstruction + one-step prediction error over the batch.
+
+    For each (sample, timestep t), computes:
+      ||decode(encode(x_t)) - x_t||_2 + ||decode(A*encode(x_t) + B*u_t) - x_{t+1}||_2
+    and returns the maximum across all pairs.
     """
     B_batch, Hp1, S = states_seq.shape
     H = Hp1 - 1
-    device = states_seq.device
 
     # Encode all states once
     all_states_flat = states_seq.reshape(B_batch * Hp1, S)
     all_z = model.encode(all_states_flat).reshape(B_batch, Hp1, -1)
 
-    worst_case = torch.tensor(0.0, device=device)
+    # Reconstruction error: ||decode(encode(x_t)) - x_t|| for t=0..H-1
+    z_t = all_z[:, :H, :].reshape(B_batch * H, -1)              # (B*H, L)
+    x_t = states_seq[:, :H, :].reshape(B_batch * H, S)          # (B*H, S)
+    recon_err = torch.linalg.norm(model.decode(z_t) - x_t, dim=-1)  # (B*H,)
 
-    for t_start in range(H):
-        z = all_z[:, t_start, :]  # (B, L)
+    # One-step prediction error: ||decode(A*z_t + B*u_t) - x_{t+1}||
+    u_t = actions_seq.reshape(B_batch * H, -1)                   # (B*H, A)
+    z_pred = model.predict(z_t, u_t)                             # (B*H, L)
+    x_target = states_seq[:, 1:, :].reshape(B_batch * H, S)     # (B*H, S)
+    pred_err = torch.linalg.norm(model.decode(z_pred) - x_target, dim=-1)  # (B*H,)
 
-        for t in range(t_start, H):
-            z = model.predict(z, actions_seq[:, t, :])
-            x_pred = model.decode(z)
-            x_target = states_seq[:, t + 1, :]
-
-            # RMSE per sample in this batch
-            sample_errors = (x_pred - x_target).pow(2).mean(dim=-1).sqrt()
-            worst_case = torch.max(worst_case, sample_errors.max())
-
-    return worst_case
+    return (recon_err + pred_err).max()
 
 
 def _pred_loss_sequential(model, states_seq, actions_seq):
@@ -347,6 +344,43 @@ def closed_loop_normality_loss(A, B, Q, R):
     return normality_loss(cl)
 
 
+def latent_rollout_consistency_loss(model, states_seq, actions_seq):
+    """Multi-step latent consistency loss starting from every timestep.
+
+    Same structure as _pred_loss_vectorized but compares rolled-out latent
+    predictions against encoded ground truth instead of decoding to state space.
+
+    For a window of length H, computes predictions starting from t=0, 1, ..., H-1
+    and predicts as many steps forward as the window allows. This gives O(H^2)
+    prediction targets per window.
+    """
+    B_batch, Hp1, S = states_seq.shape
+    H = Hp1 - 1
+    device = states_seq.device
+
+    # Encode all states in the window at once
+    all_states_flat = states_seq.reshape(B_batch * Hp1, S)
+    all_z = model.encode(all_states_flat).reshape(B_batch, Hp1, -1)
+
+    total_loss = torch.tensor(0.0, device=device)
+    n_predictions = 0
+
+    # Start from every position t_start within the window
+    for t_start in range(H):
+        z = all_z[:, t_start, :]  # (B, L)
+
+        # Roll forward as many steps as the window allows
+        for t in range(t_start, H):
+            z = model.predict(z, actions_seq[:, t, :])  # (B, L)
+
+            # Compare to encoded ground truth
+            z_target = all_z[:, t + 1, :]  # (B, L)
+            total_loss = total_loss + F.mse_loss(z, z_target)
+            n_predictions += 1
+
+    return total_loss / n_predictions
+
+
 def latent_consistency_loss(model, states_seq, actions_seq):
     """Enforce z_{t+1} ≈ A*z_t + B*u_t directly in latent space (vectorized)."""
     B_batch, Hp1, S = states_seq.shape
@@ -358,7 +392,7 @@ def latent_consistency_loss(model, states_seq, actions_seq):
 
     z_t = all_z[:, :H].reshape(B_batch * H, -1)       # (B*H, L)
     z_pred = model.predict(z_t, u_t)                    # (B*H, L)
-    z_target = all_z[:, 1:].detach().reshape(B_batch * H, -1)  # (B*H, L)
+    z_target = all_z[:, 1:].reshape(B_batch * H, -1)  # (B*H, L)
 
     #z_t = all_z[:, :H].detach().reshape(B_batch * H, -1)  # detach input too
     #z_pred = model.predict(z_t, u_t)    
@@ -404,6 +438,12 @@ def build_loss_fns(cfg, model):
     def _lc(model, states_seq, actions_seq, all_states):
         return latent_consistency_loss(model, states_seq, actions_seq)
     losses["LC"] = (_lc, lc_w)
+
+    if cfg.get("latent_rollout_loss", False):
+        lrc_w = cfg["latent_rollout_weight"]
+        def _lrc(model, states_seq, actions_seq, all_states):
+            return latent_rollout_consistency_loss(model, states_seq, actions_seq)
+        losses["LRC"] = (_lrc, lrc_w)
 
     # --- Optional losses (enabled by config bool + weight) ---
 

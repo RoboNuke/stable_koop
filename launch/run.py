@@ -14,7 +14,7 @@ import torch
 import yaml
 
 from launch.eval_policy import evaluate as evaluate_policy, make_policy, make_eval_env, make_single_env
-from launch.eval_pendulum import evaluate_model
+from launch.eval_pendulum import evaluate_model, make_recon_and_lc_heatmaps
 from launch.train_pendulum import collect_data, train
 from model.autoencoder import KoopmanAutoencoder
 
@@ -292,7 +292,7 @@ def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_sc
 
     # 5. Evaluate on training data
     fig, error_stats, heatmap_data = evaluate_model(
-        model, aug_trajectories, cfg["horizon"], eval_horizon=25,
+        model, aug_trajectories, cfg["horizon"], eval_horizon=max(25, cfg["horizon"]),
         title="Prediction Error (A+B, with perturbations, core losses only)",
         obs_scale=cfg.get("obs_scale"), obs_type=cfg.get("obs_type", "cos_sin"))
 
@@ -310,6 +310,10 @@ def phase_1_train_koopman(model, env, policy, cfg, run_dir, augment=True, obs_sc
     with open(stats_path, "w") as f:
         yaml.dump(eval_stats, f, default_flow_style=False, sort_keys=False)
     print(f"Eval stats saved to {stats_path}")
+
+    # 8. Theta/thdot heatmaps (reconstruction + LC)
+    make_recon_and_lc_heatmaps(model, aug_trajectories, trajectories,
+                                run_dir, prefix="phase1_")
 
     print(f"Phase 1 complete.")
 
@@ -355,7 +359,7 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
 
     # 6. Evaluate on training data
     fig, error_stats, heatmap_data = evaluate_model(
-        model, aug_trajectories, cfg["horizon"], eval_horizon=25,
+        model, aug_trajectories, cfg["horizon"], eval_horizon=max(25, cfg["horizon"]),
         title="Prediction Error (A+B, with perturbations, all losses)",
         obs_scale=cfg.get("obs_scale"), obs_type=cfg.get("obs_type", "cos_sin"))
 
@@ -374,12 +378,16 @@ def phase_2_train_B(model, env, policy, cfg, run_dir, augment=True, obs_scale=No
         yaml.dump(eval_stats, f, default_flow_style=False, sort_keys=False)
     print(f"Eval stats saved to {stats_path}")
 
+    # 9. Theta/thdot heatmaps (reconstruction + LC)
+    make_recon_and_lc_heatmaps(model, aug_trajectories, trajectories,
+                                run_dir, prefix="phase2_")
+
     print(f"Phase 2 complete.")
-    return aug_trajectories
+    return aug_trajectories, error_stats
 
 
 def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
-                              tuning_config=None):
+                              tuning_config=None, error_stats=None):
     """Phase 3: compute stability and control variables from trained model.
 
     Args:
@@ -488,23 +496,28 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
         print(f"\033[92m  max_runtime_error_latent:              {max_runtime_error_latent:.6f}\033[0m")
     print(f"  residual_ctrl_budget:                  {residual_ctrl_budget:.6f}")
 
-    # One-step prediction error in latent space
-    model.to(device)
-    model.eval()
-    all_latent_errs = []
-    with torch.no_grad():
-        for states, actions in aug_trajectories:
-            states_t = torch.tensor(states, dtype=torch.float32, device=device)
-            actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
-            T_act = len(actions)
-            z_all = model.encode(states_t[:T_act])
-            z_next = model.encode(states_t[1:T_act + 1])
-            z_pred = model.predict(z_all, actions_t[:T_act])
-            errs = torch.linalg.norm(z_next - z_pred, dim=-1)
-            all_latent_errs.append(errs.cpu())
-    all_latent_errs = torch.cat(all_latent_errs)
-    err_mean = all_latent_errs.mean().item()
-    err_std = all_latent_errs.std().item()
+    # One-step prediction error in latent space (from Phase 2 eval stats)
+    if error_stats is not None:
+        err_mean = error_stats["mean_pred_error_latent"]
+        err_std = error_stats["std_pred_error_latent"]
+    else:
+        # Fallback: recompute (e.g. when called from tune_koop_model)
+        model.to(device)
+        model.eval()
+        all_latent_errs = []
+        with torch.no_grad():
+            for states, actions in aug_trajectories:
+                states_t = torch.tensor(states, dtype=torch.float32, device=device)
+                actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
+                T_act = len(actions)
+                z_all = model.encode(states_t[:T_act])
+                z_next = model.encode(states_t[1:T_act + 1])
+                z_pred = model.predict(z_all, actions_t[:T_act])
+                errs = torch.linalg.norm(z_next - z_pred, dim=-1)
+                all_latent_errs.append(errs.cpu())
+        all_latent_errs = torch.cat(all_latent_errs)
+        err_mean = all_latent_errs.mean().item()
+        err_std = all_latent_errs.std().item()
     err_2sigma = err_mean + 2 * err_std
     print(f"  " + "-" * 48)
     print(f"  One-step latent error mean:            {err_mean:.6f}")
@@ -527,7 +540,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
             eta_lat = state_error_to_latent_error(d, m)
             Z[i, j] = max_tolerable_model_error(rho, C, eps_lat, eta_lat)
 
-    norm = TwoSlopeNorm(vmin=Z.min(), vcenter=0, vmax=max(Z.max(), 1e-6))
+    norm = TwoSlopeNorm(vmin=min(Z.min(), -1e-6), vcenter=0, vmax=max(Z.max(), 1e-6))
     fig3, ax3 = plt.subplots(figsize=(8, 6))
     from matplotlib.colors import LinearSegmentedColormap
     cmap = LinearSegmentedColormap.from_list("RdWtGn", ["red", "white", "green"])
@@ -574,7 +587,7 @@ def phase_3_compute_variables(model, cfg, phase_dir, aug_trajectories,
 
 
 def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
-                     tuning_config=None):
+                     tuning_config=None, error_stats=None):
     """Phase 3 (Lyapunov): compute stability variables using Lyapunov bound."""
     import math
     import matplotlib.pyplot as plt
@@ -746,23 +759,28 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     else:
         print(f"\033[92m  δ_max (Lyapunov):                      {delta_max_lyap:.6f}\033[0m")
 
-    # One-step prediction error in latent space
-    model_on_device = model.to(device)
-    model_on_device.eval()
-    all_latent_errs = []
-    with torch.no_grad():
-        for states, actions in aug_trajectories:
-            states_t = torch.tensor(states, dtype=torch.float32, device=device)
-            actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
-            T_act = len(actions)
-            z_all = model_on_device.encode(states_t[:T_act])
-            z_next = model_on_device.encode(states_t[1:T_act + 1])
-            z_pred = model_on_device.predict(z_all, actions_t[:T_act])
-            errs = torch.linalg.norm(z_next - z_pred, dim=-1)
-            all_latent_errs.append(errs.cpu())
-    all_latent_errs = torch.cat(all_latent_errs)
-    err_mean = all_latent_errs.mean().item()
-    err_std = all_latent_errs.std().item()
+    # One-step prediction error in latent space (from Phase 2 eval stats)
+    if error_stats is not None:
+        err_mean = error_stats["mean_pred_error_latent"]
+        err_std = error_stats["std_pred_error_latent"]
+    else:
+        # Fallback: recompute (e.g. when called from tune_koop_model)
+        model_on_device = model.to(device)
+        model_on_device.eval()
+        all_latent_errs = []
+        with torch.no_grad():
+            for states, actions in aug_trajectories:
+                states_t = torch.tensor(states, dtype=torch.float32, device=device)
+                actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
+                T_act = len(actions)
+                z_all = model_on_device.encode(states_t[:T_act])
+                z_next = model_on_device.encode(states_t[1:T_act + 1])
+                z_pred = model_on_device.predict(z_all, actions_t[:T_act])
+                errs = torch.linalg.norm(z_next - z_pred, dim=-1)
+                all_latent_errs.append(errs.cpu())
+        all_latent_errs = torch.cat(all_latent_errs)
+        err_mean = all_latent_errs.mean().item()
+        err_std = all_latent_errs.std().item()
     err_2sigma = err_mean + 2 * err_std
     print(f"  " + "-" * 48)
     print(f"  One-step latent error mean:                {err_mean:.6f}")
@@ -783,7 +801,8 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
             eta_lat = state_error_to_latent_error(d, m)
             Z[i, j] = math.sqrt(max(eps_lat**2 * (1.0 - rho_sq) / kappa_P, 0.0)) - eta_lat
 
-    norm = TwoSlopeNorm(vmin=Z.min(), vcenter=0, vmax=max(Z.max(), 1e-6))
+    z_min, z_max = Z.min(), Z.max()
+    norm = TwoSlopeNorm(vmin=min(z_min, -1e-6), vcenter=0, vmax=max(z_max, 1e-6))
     fig, ax = plt.subplots(figsize=(8, 6))
     cmap = LinearSegmentedColormap.from_list("RdWtGn", ["red", "white", "green"])
     im = ax.imshow(Z, origin='lower', aspect='auto',
@@ -825,6 +844,298 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     print(f"Variables saved to {stats_path}")
 
     print(f"Phase 3 (Lyapunov) complete. Results in {phase_dir}")
+    return variables, lqr
+
+
+def lipschitz_m_free(model, cfg, phase_dir, aug_trajectories, env,
+                     error_stats=None):
+    """Lyapunov stability analysis without Lipschitz constant m.
+
+    Derives all latent-space bounds from measured model errors and control
+    limits rather than converting from state-space via m.
+
+    Args:
+        model: KoopmanAutoencoder (on device)
+        cfg: config dict
+        phase_dir: output directory
+        aug_trajectories: list of (koopman_states, actions)
+        env: single gym environment (for action bounds)
+    """
+    import math
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm, LinearSegmentedColormap
+
+    print("\n" + "=" * 60)
+    print("  Phase 3: Lipschitz-m-Free Stability Analysis")
+    print("=" * 60)
+    os.makedirs(phase_dir, exist_ok=True)
+
+    from controllers.lqr import LQR
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    # Extract A and B from trained model
+    A = model.A.detach().cpu()
+    B_mat = model.B_matrix.detach().cpu()
+
+    # =====================================================================
+    #  Control Analysis
+    # =====================================================================
+    print("\n" + "=" * 50)
+    print("  Control Analysis")
+    print("=" * 50)
+
+    A_np = A.numpy()
+    B_np = B_mat.numpy()
+    C_mat = np.hstack([np.linalg.matrix_power(A_np, i) @ B_np
+                       for i in range(A_np.shape[0])])
+    ctrl_rank = np.linalg.matrix_rank(C_mat)
+    print(f"  Controllability rank:                  {ctrl_rank} / {A_np.shape[0]}")
+
+    eigenvalues, V = torch.linalg.eig(A)
+    unstable_mask = eigenvalues.abs() > 1.0
+    if unstable_mask.any():
+        for i, (ev, unstable) in enumerate(zip(eigenvalues, unstable_mask)):
+            if unstable:
+                proj = (V[:, i].conj() @ B_mat.to(torch.cfloat)).abs()
+                print(f"      Unstable mode λ={ev.abs():.4f}, B projection={proj.item():.4f}")
+    else:
+        print("      No unstable modes detected")
+
+    # =====================================================================
+    #  Set Constants
+    # =====================================================================
+    print("\n" + "=" * 50)
+    print("  Set Constants")
+    print("=" * 50)
+
+    latent_dim = cfg["latent_dim"]
+    action_dim = cfg["action_dim"]
+    q_scale = cfg.get("q_scale", 1.0)
+    r_scale = cfg["r_scale"]
+    u_max = float(np.max(np.abs(env.action_space.high)))
+
+    print(f"  Q scale:                               {q_scale}")
+    print(f"  R scale:                               {r_scale}")
+    print(f"  u_max:                                 {u_max:.6f}")
+
+    # Max latent space difference between extreme states
+    with torch.no_grad():
+        obs_type = cfg.get("obs_type", "cos_sin")
+        if obs_type == "cos_sin":
+            x_origin = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32, device=device)  # theta=0
+            x_extreme = torch.tensor([[-1.0, 0.0, 8.0]], dtype=torch.float32, device=device)  # theta=pi, thdot=8
+        else:
+            x_origin = torch.tensor([[0.0, 0.0]], dtype=torch.float32, device=device)
+            x_extreme = torch.tensor([[np.pi, 8.0]], dtype=torch.float32, device=device)
+        z_origin = model.encode(x_origin)
+        z_extreme = model.encode(x_extreme)
+        max_latent_diff = torch.linalg.norm(z_extreme - z_origin).item()
+    print(f"  max latent space difference:           {max_latent_diff:.6f}")
+
+    # =====================================================================
+    #  One-Step Latent Error (from Phase 2 eval stats)
+    # =====================================================================
+    print("  " + "-" * 48)
+
+    if error_stats is not None:
+        err_mean = error_stats["mean_pred_error_latent"]
+        err_std = error_stats["std_pred_error_latent"]
+    else:
+        # Fallback: recompute (e.g. when called from tune_koop_model)
+        model.to(device)
+        model.eval()
+        all_latent_errs = []
+        with torch.no_grad():
+            for states, actions in aug_trajectories:
+                states_t = torch.tensor(states, dtype=torch.float32, device=device)
+                actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
+                T_act = len(actions)
+                z_all = model.encode(states_t[:T_act])
+                z_next = model.encode(states_t[1:T_act + 1])
+                z_pred = model.predict(z_all, actions_t[:T_act])
+                errs = torch.linalg.norm(z_next - z_pred, dim=-1)
+                all_latent_errs.append(errs.cpu())
+        all_latent_errs = torch.cat(all_latent_errs)
+        err_mean = all_latent_errs.mean().item()
+        err_std = all_latent_errs.std().item()
+    R_val = err_mean + 2 * err_std
+
+    print(f"  One-step latent error mean:             {err_mean:.6f}")
+    print(f"  One-step latent error std:              {err_std:.6f}")
+    print(f"  R (mean + 2σ):                          {R_val:.6f}")
+    print(f"  R / max_latent_diff:                    {R_val / max_latent_diff:.6f}")
+
+    # =====================================================================
+    #  LQR Stability
+    # =====================================================================
+    print("\n" + "=" * 50)
+    print("  LQR Stability")
+    print("=" * 50)
+
+    Q = torch.eye(latent_dim) * q_scale
+    R_lqr = torch.eye(action_dim) * r_scale
+    scale_B = cfg.get("scale_B", False)
+    if scale_B:
+        print("  Scaling B")
+        B_scale_val = torch.norm(B_mat, p=2)
+        B_for_lqr = B_mat / B_scale_val
+    else:
+        B_scale_val = 1.0
+        B_for_lqr = B_mat
+
+    lqr = LQR(A, B_for_lqr, Q, R_lqr, q_scale=q_scale,
+              controllable_subspace=cfg.get("controllable_subspace", False),
+              ctrl_threshold=cfg.get("ctrl_threshold", None))
+    gain_norm = lqr.gain_norm.item()
+    P = lqr.P
+    F = lqr.F
+
+    # Condition number of P
+    P_eigvals = torch.linalg.eigvalsh(P)
+    kappa_P = (P_eigvals.max() / P_eigvals.min()).item()
+
+    # Lyapunov contraction rate
+    Q_for_cert = getattr(lqr, 'Q_ctrl', lqr.Q)
+    Q_eigvals = torch.linalg.eigvalsh(Q_for_cert)
+    rho_sq = 1.0 - Q_eigvals.min().item() / P_eigvals.max().item()
+
+    if lqr.V_ctrl is not None:
+        B_for_P = (lqr.V_ctrl @ B_mat)
+    else:
+        B_for_P = B_mat
+    BtPB = (B_for_P.T @ P @ B_for_P).item()
+
+    print(f"  B^T P B:                               {BtPB:.6f}")
+    print(f"  LQR gain norm (||F||):                 {gain_norm:.6f}")
+    print(f"  ρ² (Lyapunov):                         {rho_sq:.6f}")
+    print(f"  κ(P) = λ_max(P)/λ_min(P):             {kappa_P:.6f}")
+
+    # =====================================================================
+    #  Derived Quantities
+    # =====================================================================
+    print("\n" + "=" * 50)
+    print("  Derived Quantities")
+    print("=" * 50)
+
+    # z_ref_limit
+    z_ref_limit = u_max / gain_norm
+    print(f"  z_ref_limit = u_max / ||F||:           {z_ref_limit:.6f}")
+
+    # eta = ||B @ F||_2 * z_ref_limit
+    BF = B_mat @ F
+    BF_norm = torch.norm(BF, p=2).item()
+    eta = BF_norm * z_ref_limit
+    print(f"  ||B @ F||_2:                           {BF_norm:.6f}")
+    print(f"  eta = ||BF|| * z_ref_limit:            {eta:.6f}")
+
+    # epsilon_max = (R + eta) * sqrt(kappa_P / (1 - rho_sq))
+    if rho_sq < 1.0:
+        epsilon_max = (R_val + eta) * math.sqrt(kappa_P / (1.0 - rho_sq))
+    else:
+        epsilon_max = float('inf')
+    if epsilon_max > max_latent_diff / 2:
+        print(f"\033[91m  ε_max (max tracking error latent):     {epsilon_max:.6f}\033[0m")
+    else:
+        print(f"\033[92m  ε_max (max tracking error latent):     {epsilon_max:.6f}\033[0m")
+    print(f"  ε_max / max_latent_diff:               {epsilon_max / max_latent_diff:.6f}")
+
+    # gamma_max = sqrt(epsilon_max^2 * (1 - rho_sq) / kappa_P) - eta
+    gamma_max = math.sqrt(max(epsilon_max**2 * (1.0 - rho_sq) / kappa_P, 0.0)) - eta
+    if gamma_max < 0:
+        print(f"\033[91m  γ_max (Lyapunov):                      {gamma_max:.6f}\033[0m")
+    else:
+        print(f"\033[92m  γ_max (Lyapunov):                      {gamma_max:.6f}\033[0m")
+
+    # =====================================================================
+    #  Heatmap: R vs Residual Control → ε_max / max_latent_diff
+    # =====================================================================
+    n_heatmap = 200
+    R_max = err_mean + 3 * err_std
+    R_sweep = np.linspace(0, R_max, n_heatmap)
+    u_res_sweep = np.linspace(0, u_max, n_heatmap)
+    Z = np.zeros((n_heatmap, n_heatmap))
+
+    for i, u_res in enumerate(u_res_sweep):
+        z_ref_i = u_res / gain_norm if gain_norm > 0 else 0.0
+        eta_i = BF_norm * z_ref_i
+        for j, R_j in enumerate(R_sweep):
+            if rho_sq < 1.0:
+                eps_j = (R_j + eta_i) * math.sqrt(kappa_P / (1.0 - rho_sq))
+                Z[i, j] = np.clip(eps_j / max_latent_diff, 0.0, 1.0)
+            else:
+                Z[i, j] = 1.0  # unstable → worst case
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    cmap = LinearSegmentedColormap.from_list("WtGn", ["white", "green"])
+    im = ax.pcolormesh(R_sweep, u_res_sweep, Z, cmap=cmap, vmin=0, vmax=1, shading="nearest")
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("ε_max / max_latent_diff")
+
+    # Vertical lines at every std dev from mean (both directions)
+    ax.axvline(x=err_mean, color="red", linestyle="-", linewidth=1.5, label=f"mean={err_mean:.4f}")
+    for k in range(1, 4):
+        x_pos = err_mean + k * err_std
+        x_neg = err_mean - k * err_std
+        if x_pos <= R_max:
+            ax.axvline(x=x_pos, color="red", linestyle="--", linewidth=1.0,
+                       label=f"+{k}σ={x_pos:.4f}")
+        if x_neg >= 0:
+            ax.axvline(x=x_neg, color="red", linestyle="--", linewidth=1.0,
+                       label=f"-{k}σ={x_neg:.4f}")
+
+    # Contour lines at key levels
+    contour_levels = [0.05, 0.1, 0.15, 0.2, 0.5]
+    contour_colors = ["darkgreen", "blue", "darkorange", "purple", "red"]
+    cs = ax.contour(R_sweep, u_res_sweep, Z, levels=contour_levels,
+                     colors=contour_colors, linestyles="dotted", linewidths=1.5)
+    # Legend for contour lines only
+    contour_handles = [plt.Line2D([], [], color=c, linestyle="dotted", linewidth=1.5,
+                                   label=f"{lvl:.0%}") for lvl, c in zip(contour_levels, contour_colors)]
+    ax.legend(handles=contour_handles, loc="upper left", fontsize=8, title="ε_max / Δz_max")
+
+    # Blue X at operating point
+    ax.plot(R_val, u_max, 'bx', markersize=12, markeredgewidth=2)
+
+    ax.set_xlabel("R (one-step latent error)")
+    ax.set_ylabel("Residual Control Budget (N·m)")
+    ax.set_title("ε_max / max_latent_diff vs Model Error & Control Budget")
+    ax.text(0.5, -0.10,
+            f"κ(P)={kappa_P:.4f}  ρ²={rho_sq:.4f}  ||F||={gain_norm:.4f}  ||BF||={BF_norm:.4f}  "
+            f"Q={q_scale}  R_lqr={r_scale}",
+            transform=ax.transAxes, ha='center', fontsize=8)
+    fig.tight_layout()
+    heatmap_name = "m_free_gamma_max_heatmap.png"
+    fig.savefig(os.path.join(phase_dir, heatmap_name), dpi=150)
+    plt.close(fig)
+    print(f"Saved {heatmap_name}")
+
+    # Save variables
+    variables = {
+        "u_max": float(u_max),
+        "max_latent_diff": float(max_latent_diff),
+        "gain_norm": float(gain_norm),
+        "BF_norm": float(BF_norm),
+        "kappa_P": float(kappa_P),
+        "rho_sq_lyapunov": float(rho_sq),
+        "R_model_error": float(R_val),
+        "latent_error_mean": float(err_mean),
+        "latent_error_std": float(err_std),
+        "z_ref_limit": float(z_ref_limit),
+        "eta": float(eta),
+        "max_tracking_error_latent": float(epsilon_max),
+        "gamma_max_lyapunov": float(gamma_max),
+        "ctrl_rank": int(ctrl_rank),
+        "A": A.numpy().tolist(),
+        "B": B_mat.numpy().tolist(),
+    }
+    stats_path = os.path.join(phase_dir, "m_free_variables.yaml")
+    with open(stats_path, "w") as f:
+        yaml.dump(variables, f, default_flow_style=False, sort_keys=False)
+    print(f"Variables saved to {stats_path}")
+
+    print(f"Phase 3 (m-free) complete. Results in {phase_dir}")
     return variables, lqr
 
 
@@ -882,7 +1193,7 @@ def phase_5_final_eval(env, base_policy, residual_model, lqr, cfg, run_dir, base
         print(f"{key:<25} {base_val:>12.3f} {final_val:>12.3f} {color}{delta:>+12.3f}{RESET}")
 
     print()
-    print(f"Phase 5 complete. Results in {phase_dir}")
+    print(f"Phase 5 complete. Results in {run_dir}")
     return results
 
 
@@ -896,6 +1207,8 @@ def main():
                         help="Skip Phase 1 (A-only training), go straight to joint A+B training")
     parser.add_argument("--keep-all-ckpts", action="store_true", default=False,
                         help="Save every residual policy checkpoint (not just best)")
+    parser.add_argument("--no-residual", action="store_true", default=False,
+                        help="Skip Phases 4-5 (residual policy training and final eval)")
     args = parser.parse_args()
 
     exp_name = input("Enter experiment name: ").strip()
@@ -970,22 +1283,31 @@ def main():
     if not args.skip_pretrain:
         phase_1_train_koopman(model, train_env, policy, cfg, run_dir, augment, obs_scale,
                               act_scale)
-    aug_trajectories = phase_2_train_B(model, train_env, policy, cfg, run_dir, augment, obs_scale,
+    aug_trajectories, error_stats = phase_2_train_B(model, train_env, policy, cfg, run_dir, augment, obs_scale,
                                        act_scale)
     variables = {}
     lqr = None
     if cfg.get("use_eigen_bound", False):
-        eigen_vars, lqr = phase_3_compute_variables(model, cfg, run_dir, aug_trajectories)
+        eigen_vars, lqr = phase_3_compute_variables(model, cfg, run_dir, aug_trajectories,
+                                                     error_stats=error_stats)
         variables.update(eigen_vars)
     if cfg.get("use_lyapunov_bound", False):
-        lyap_vars, lyap_lqr = phase_3_lyapunov(model, cfg, run_dir, aug_trajectories)
+        lyap_vars, lyap_lqr = phase_3_lyapunov(model, cfg, run_dir, aug_trajectories,
+                                                error_stats=error_stats)
         variables.update(lyap_vars)
         if lqr is None:
             lqr = lyap_lqr
+    if cfg.get("use_m_free_bound", False):
+        mfree_vars, mfree_lqr = lipschitz_m_free(model, cfg, run_dir, aug_trajectories, train_env,
+                                                    error_stats=error_stats)
+        variables.update(mfree_vars)
+        if lqr is None:
+            lqr = mfree_lqr
 
     # Check stability feasibility before proceeding
     delta_max = variables.get("max_runtime_error_latent",
-                              variables.get("delta_max_lyapunov", None))
+                              variables.get("delta_max_lyapunov",
+                              variables.get("gamma_max_lyapunov", None)))
     if delta_max is not None and delta_max < 0:
         print(f"\n\033[91mStopping after Phase 3: delta_max = {delta_max:.6f} < 0 "
               f"(infeasible error budget). Tune Q/R scales or retrain.\033[0m")
@@ -996,7 +1318,9 @@ def main():
 
     # Phase 4: Residual policy training
     # Phase 5: Final combined benchmark
-    if lqr is not None:
+    if args.no_residual:
+        print("\nSkipping Phases 4-5 (--no-residual)")
+    elif lqr is not None:
         z_ref_limit = variables.get("eta", 1.0)
         residual_model = phase_4_residual_policy(policy, lqr, cfg, run_dir, z_ref_limit=z_ref_limit,
                                                     keep_all_ckpts=args.keep_all_ckpts)
