@@ -1,0 +1,146 @@
+run_name: no_losses
+env_name: Pendulum-v1
+num_trajectories: 1000
+max_episode_steps: 50
+obs_type: theta
+state_dim: 2
+action_dim: 1
+latent_dim: 2
+k_type: unbounded
+rho: 0.95
+encoder_type: linear
+encoder_spec_norm: false
+encoder_latent: 160
+init_b_in_a: false
+base_policy: bang_energy
+kp: 10
+kd: 2
+ke: 0.5
+sa: 40
+analytical_B_policy: none
+perturb_scale: 1.0
+normalize_analytical_B: false
+train_for_B: true
+analytical_B_ctrl_lambda: 0.2
+analytical_B_train_steps: 200
+analytical_B_lr: 0.001
+fix_perturb_range: true
+hold_steps: 5
+
+use_eigen_bound: false
+use_lyapunov_bound: false
+use_m_free_bound: true
+controllable_subspace: false
+ctrl_threshold: null
+
+q_scale: 10000
+r_scale: 1.0e-05
+scale_B: false
+max_tracking_error_x: 0.5
+max_displacement_x: 0.1
+
+horizon: 5
+batch_size: 2048
+num_workers: 8
+lr: 0.001
+num_epochs: 1000
+
+recon_pretrain_epochs: 10
+recon_pretrain_lr: 0.01
+recon_pretrain_bilip: false
+recon_pretrain_bilip_weight: 1.0
+
+scheduler_step: 100
+scheduler_gamma: 0.5
+
+cosine_scheduler: false
+cosine_T_max: 50
+cosine_eta_min: 5.0e-05
+
+loss_threshold: 0.0009
+riemannian_optimizer: false
+vectorize_rollout: true
+torch_compile: true
+grad_clip: true
+grad_clip_type: norm
+grad_clip_value: 1.0
+
+weight_decay: 0.0001
+recon_weight: 0.1
+pred_weight: 0.1
+latent_consistency_weight: 1.0
+
+latent_rollout_loss: false
+latent_rollout_weight: 1.0
+
+l_inf_pred_loss: true
+l_inf_pred_weight: 1.0e-09
+
+bi_lipschitz_loss: true
+bilip_weight: 3.0
+bilip_m_target: 1.2
+
+controllability_loss: false
+ctrl_weight: 0.5
+
+spectral_loss: false
+spectral_weight: 0.1
+
+normality_loss: false
+cl_normality_loss: false
+upper_lipschitz_loss: false
+
+b_eigen_loss: false
+b_eigen_weight: 1.0
+b_eigen_min_scale: 0.3
+
+b_scale_loss: false
+b_scale_weight: 2.0
+b_scale_target: 1.0
+
+b_min_sv_loss: false
+b_min_sv_weight: 1.0
+b_min_sv_target: 0.3
+
+eig_spread_loss: false
+eig_spread_weight: 1.0
+eig_spread_min_gap: 0.1
+
+unstable_ctrl_loss: false
+unstable_ctrl_weight: 1.0
+
+unit_circle_gap_loss: false
+num_parallel_evals: 200
+
+eval_num_trajectories: 200
+eval_max_steps: 200
+eval_seed: 42
+success_angle_deg: 15.0
+success_max_thdot: 1.0
+success_hold_steps: 20
+
+residual_z_ref_limit: 1.0
+residual_num_envs: 256
+residual_total_timesteps: 100000
+residual_eval_interval: 5000
+residual_batch_size: 256
+residual_lr: 0.0003
+residual_actor_hidden_size: 64
+residual_actor_hidden_layers: 2
+residual_critic_hidden_size: 256
+residual_critic_hidden_layers: 4
+residual_gamma: 0.99
+residual_tau: 0.005
+residual_initial_entropy_value: 1.0
+residual_random_timesteps: 1000
+residual_learning_starts: 1000
+residual_memory_size: 100000
+log_interval: 10
+checkpoint_dir: checkpoints/pendulum_h20
+seed: 42
+augment_state: false
+obs_scale:
+- 3.1415927410125732
+- 8.0
+act_scale:
+- 2.0

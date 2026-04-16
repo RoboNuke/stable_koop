@@ -5,18 +5,30 @@ run_name: "no_losses"
 env_name: "Pendulum-v1"
 num_trajectories: 1000
 max_episode_steps: 50
+limited_spawn: false       # limit initial angle range on reset
+spawn_angle_range: 45     # max angle in degrees (symmetric about 0)
 
 # Model
 obs_type: "theta"  # "cos_sin" = [cos_th, sin_th, thdot] (3D), "theta" = [theta, thdot] (2D)
 state_dim: 2
 action_dim: 1
-latent_dim: 4
-k_type: "unbounded" #"cayley", "schur", "normalized"
-rho: 0.95
-encoder_type: "linear"  # "linear" or "cayley"
+latent_dim: 2
+k_type: "unbounded" #"unbounded" #"cayley", "schur", "normalized"
+rho: 0.6
+encoder_type: "trig"  # "linear" or "cayley"
 encoder_spec_norm: false
-encoder_latent: 8
+encoder_latent: 80
 init_b_in_a: false  # initialize B in A eigenbasis (only effective with two-step training)
+prepend_state: true   # prepend raw state x to latent: z = [x; g(x)]
+prepend_control: false # include u_base in prepended dims (requires prepend_state + augment)
+
+#  Best total: 0.004104 (epoch 1000)
+#  Final total: 0.004104
+#   Recon: 0.009372
+#    Pred: 0.025851
+#   L_inf: 1.721150
+#      LC: 0.000582
+
 
 # Policy
 
@@ -31,21 +43,29 @@ sa: 40
 analytical_B_policy: "none"  # policy for analytical B data collection: "none", "energy", "bang_energy"
 perturb_scale: 1.0
 normalize_analytical_B: false  # normalize analytical B to unit spectral norm
+train_for_B: True
+analytical_B_ctrl_lambda: 0.2
+analytical_B_train_steps: 200
+analytical_B_lr: 1.0e-4
 fix_perturb_range: true
 hold_steps: 5  # number of steps to hold each sampled perturbation before resampling
 
 # LQR / Stability
 use_eigen_bound: false  # spectral radius / transient constant bound
 use_lyapunov_bound: false  # Lyapunov-based bound
-use_m_free_bound: true   # Lipschitz-m-free stability bound
+use_m_free_bound: false  # this is based on bad derivation - Lipschitz-m-free stability bound
+optimize_lyapunov_P: true # SDP optimization of Lyapunov P matrix
+use_alpha_bound: true
+alpha_epsilon_x: 0.3
+alpha_eta: 0.1
 controllable_subspace: false  # if true, solve LQR only in controllable subspace
 ctrl_threshold: null          # controllability singular value threshold (null = machine epsilon default)
 
-q_scale: 1
-r_scale: 1
+q_scale: 1000
+r_scale: .0001
 scale_B: false
 max_tracking_error_x: 0.5 #0.3 # define by success bounds (1-cos(15), sin(15), 1)
-max_displacement_x: 0.1 #0.57 # define as maximum possible displacement of system (0.4, 0.4, 0.8)
+max_displacement_x: 1.41 #0.1 #0.57 # define as maximum possible displacement of system (0.4, 0.4, 0.8)
 
 # Training
 horizon: 5
@@ -54,8 +74,8 @@ num_workers: 8
 lr: 1.0e-3
 num_epochs: 1000
 
-recon_pretrain_epochs: 10
-recon_pretrain_lr: 1.0e-2  # learning rate for recon pretraining (default: same as lr)
+recon_pretrain_epochs: 0
+recon_pretrain_lr: 1.0e-3  # learning rate for recon pretraining (default: same as lr)
 recon_pretrain_bilip: false  # include BiLip loss during recon pretraining
 recon_pretrain_bilip_weight: 1.0  # weight for BiLip during pretraining
 
@@ -67,7 +87,7 @@ cosine_scheduler: false
 cosine_T_max: 50
 cosine_eta_min: 5.0e-5
 
-loss_threshold: 0.003 #0.02 #0.003 works with pred_weight=10
+loss_threshold: 0.0009 #0.02 #0.003 works with pred_weight=10
 riemannian_optimizer: false  # use geoopt RiemannianAdam instead of Adam
 vectorize_rollout: true  # use closed-form vectorized prediction rollout (faster but more memory)
 torch_compile: true  # use torch.compile to fuse GPU kernels (slower first epoch, faster after)
@@ -89,14 +109,14 @@ l_inf_pred_loss: true
 l_inf_pred_weight: 1.0e-9
 
 bi_lipschitz_loss: false
-bilip_weight: 10.0
+bilip_weight: 3.0
 bilip_m_target: 1.2
 
 controllability_loss: false
 ctrl_weight: 0.5
 
 spectral_loss: false
-spectral_weight: 0.1
+spectral_weight: 0.01
 
 normality_loss: false
 cl_normality_loss: false

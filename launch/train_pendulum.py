@@ -170,7 +170,7 @@ def b_eigen_loss(b_eigen, min_scale=0.1):
 
 def b_scale_loss(B_matrix, target_scale=1.0):
     """Penalize B spectral norm exceeding target_scale."""
-    current_scale = torch.norm(B_matrix, p=2)
+    current_scale = torch.linalg.norm(B_matrix, ord=2)
     return torch.relu(current_scale - target_scale)
 
 

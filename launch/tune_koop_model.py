@@ -25,7 +25,7 @@ from launch.run import (
     lipschitz_m_free,
     save_config,
 )
-from model.autoencoder import KoopmanAutoencoder
+from launch.pipeline_utils import make_device, build_koopman_model, load_checkpoint
 
 
 def main():
@@ -71,29 +71,9 @@ def main():
     print(f"Observation scale: {obs_scale}")
 
     # Build model and load weights
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    checkpoint = torch.load(weights_path, map_location=device)
-    koopman_state_dim = cfg["state_dim"] + cfg["action_dim"] if augment else cfg["state_dim"]
-    model = KoopmanAutoencoder(
-        state_dim=koopman_state_dim,
-        latent_dim=cfg["latent_dim"],
-        action_dim=cfg["action_dim"],
-        k_type=cfg["k_type"],
-        encoder_type=cfg.get("encoder_type", "linear"),
-        rho=cfg["rho"],
-        encoder_spec_norm=cfg["encoder_spec_norm"],
-        encoder_latent=cfg["encoder_latent"],
-    ).to(device)
-
-    # Strip _orig_mod. prefix from torch.compile'd state_dicts
-    state_dict = checkpoint["model"]
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
-    print(f"Loaded weights from {weights_path}")
-    print(f"Koopman model: state_dim={koopman_state_dim}, action_dim={cfg['action_dim']}, "
-          f"latent_dim={cfg['latent_dim']}")
+    device = make_device()
+    model, koopman_state_dim = build_koopman_model(cfg, augment, device)
+    load_checkpoint(model, weights_path, device)
 
     # Collect perturbed data for Lipschitz computation
     print("\nCollecting perturbed trajectories for Lipschitz bound...")
@@ -110,6 +90,8 @@ def main():
     with open(args.config) as f:
         tune_cfg = yaml.safe_load(f)
     for key in ("use_eigen_bound", "use_lyapunov_bound", "use_m_free_bound",
+                "use_alpha_bound", "optimize_lyapunov_P",
+                "alpha_epsilon_x", "alpha_eta",
                 "controllable_subspace", "ctrl_threshold",
                 "q_scale", "r_scale", "scale_B",
                 "max_tracking_error_x", "max_displacement_x"):
@@ -129,6 +111,12 @@ def main():
     if cfg.get("use_m_free_bound", False):
         mfree_vars, _ = lipschitz_m_free(model, cfg, run_dir, aug_trajectories, env)
         variables.update(mfree_vars)
+    if cfg.get("use_alpha_bound", False):
+        from launch.stability_utils import alpha_bound, setup_lqr
+        # Need LQR for alpha bound
+        lqr_ab, _, _, _ = setup_lqr(model.A.detach().cpu(), model.B_matrix.detach().cpu(), cfg)
+        alpha_vars = alpha_bound(model, lqr_ab, cfg, aug_trajectories, env)
+        variables.update(alpha_vars)
 
     env.close()
     print(f"\n=== Done. All outputs in {run_dir} ===")

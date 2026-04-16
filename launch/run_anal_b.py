@@ -26,8 +26,9 @@ from launch.run import (
     collect_perturbed_data, augment_perturbed_trajectories,
     phase_0_base_eval, phase_3_lyapunov, lipschitz_m_free,
 )
+from launch.pipeline_utils import Tee, make_device, build_koopman_model, save_checkpoint
+from launch.stability_utils import alpha_bound, setup_lqr
 from launch.analy_b_tuning import run_analytical_b
-from model.autoencoder import KoopmanAutoencoder
 
 
 def phase_1_train_A_only(model, env, policy, cfg, run_dir, augment=True,
@@ -58,40 +59,32 @@ def phase_1_train_A_only(model, env, policy, cfg, run_dir, augment=True,
     #    (recon_pretrain_epochs in config handles recon-only pretraining inside train())
     model = train(model, aug_trajectories, cfg)
 
-    # 4. Save checkpoint
+    # 4. Print and save A matrix
+    with torch.no_grad():
+        A = model.A.detach().cpu()
+        print(f"\nTrained A matrix ({A.shape[0]}x{A.shape[1]}):")
+        print(A.numpy())
+        print(f"  ||A|| (spectral norm): {torch.linalg.norm(A, ord=2).item():.6f}")
+        eigvals = torch.linalg.eigvals(A)
+        print(f"  Spectral radius: {eigvals.abs().max().item():.6f}")
+
+    # 5. Save checkpoint
     ckpt_path = os.path.join(run_dir, "koop_a_checkpoint.pt")
-    save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
-    torch.save({"model": save_dict, "config": cfg}, ckpt_path)
+    save_checkpoint(model, cfg, ckpt_path)
     print(f"Checkpoint saved to {ckpt_path}")
 
-    # 5. Evaluate on training data
-    train_horizon = cfg["horizon"]
-    fig, error_stats, heatmap_data = evaluate_model(
-        model, aug_trajectories, train_horizon, eval_horizon=train_horizon,
-        title="Prediction Error (A only, no B, no perturbations)",
-        obs_scale=cfg.get("obs_scale"), obs_type=cfg.get("obs_type", "cos_sin"))
-
-    # 6. Save heatmap
-    plot_path = os.path.join(run_dir, "koop_a_prediction_error.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    print(f"Heatmap saved to {plot_path}")
-
-    # 7. Save eval stats
-    eval_stats = {
-        **error_stats,
-        "heatmap": heatmap_data,
-    }
-    stats_path = os.path.join(run_dir, "koop_a_eval_stats.yaml")
-    with open(stats_path, "w") as f:
-        yaml.dump(eval_stats, f, default_flow_style=False, sort_keys=False)
-    print(f"Eval stats saved to {stats_path}")
+    # 5. Evaluate on training data and save
+    from launch.pipeline_utils import evaluate_and_save
+    evaluate_and_save(model, aug_trajectories, cfg, run_dir, "koop_a_",
+                      "Prediction Error (A only, no B, no perturbations)")
 
     print("Phase 1 complete.")
     return aug_trajectories, trajectories
 
 
 def phase_2_analytical_B(model, env, policy, cfg, run_dir, augment=True,
-                         obs_scale=None, base_aug_trajectories=None,
+                         obs_scale=None, act_scale=None,
+                         base_aug_trajectories=None,
                          base_raw_trajectories=None):
     """Phase 2: Analytically derive B matrix from perturbed trajectory data.
 
@@ -102,7 +95,7 @@ def phase_2_analytical_B(model, env, policy, cfg, run_dir, augment=True,
 
     B_final = run_analytical_b(
         model, env, policy, cfg, run_dir,
-        augment=augment, obs_scale=obs_scale,
+        augment=augment, obs_scale=obs_scale, act_scale=act_scale,
         base_aug_trajectories=base_aug_trajectories,
         base_raw_trajectories=base_raw_trajectories,
     )
@@ -158,10 +151,16 @@ def phase_3_stability(model, env, policy, cfg, run_dir, B_final,
         if lqr is None:
             lqr = mfree_lqr
 
+    if cfg.get("use_alpha_bound", False):
+        if lqr is None:
+            lqr_ab, _, _, _ = setup_lqr(model.A.detach().cpu(), model.B_matrix.detach().cpu(), cfg)
+            lqr = lqr_ab
+        alpha_vars = alpha_bound(model, lqr, cfg, aug_trajectories, env)
+        variables.update(alpha_vars)
+
     # 5. Save checkpoint with analytical B included
     ckpt_path = os.path.join(run_dir, "koopman_ckpt.pt")
-    save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
-    torch.save({"model": save_dict, "config": cfg}, ckpt_path)
+    save_checkpoint(model, cfg, ckpt_path)
     print(f"Checkpoint (with analytical B) saved to {ckpt_path}")
 
     print("Phase 3 complete.")
@@ -191,19 +190,6 @@ def main():
 
     # Tee stdout to log file
     import sys
-    class Tee:
-        def __init__(self, filepath, stream):
-            self.file = open(filepath, "w")
-            self.stream = stream
-        def write(self, data):
-            self.stream.write(data)
-            self.file.write(data)
-            self.file.flush()
-        def flush(self):
-            self.stream.flush()
-            self.file.flush()
-        def close(self):
-            self.file.close()
     log_path = os.path.join(run_dir, "run.log")
     tee = Tee(log_path, sys.stdout)
     sys.stdout = tee
@@ -236,31 +222,8 @@ def main():
     print(f"Action scale: {act_scale}")
 
     # Build Koopman model
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-        print(f"{RED}WARNING: CUDA not available.{RESET}")
-        print(f"{RED}FALLBACK: Using CPU. Training will be significantly slower.{RESET}")
-    print(f"Using device: {device}")
-    koopman_state_dim = cfg["state_dim"] + cfg["action_dim"] if augment else cfg["state_dim"]
-    encoder_type = cfg.get("encoder_type", None)
-    if encoder_type is None:
-        encoder_type = "linear"
-        print(f"{RED}WARNING: encoder_type not specified in config.{RESET}")
-        print(f"{RED}FALLBACK: Using encoder_type='linear'.{RESET}")
-    model = KoopmanAutoencoder(
-        state_dim=koopman_state_dim,
-        latent_dim=cfg["latent_dim"],
-        action_dim=cfg["action_dim"],
-        k_type=cfg["k_type"],
-        encoder_type=encoder_type,
-        rho=cfg["rho"],
-        encoder_spec_norm=cfg["encoder_spec_norm"],
-        encoder_latent=cfg["encoder_latent"],
-    ).to(device)
-    print(f"Koopman model: state_dim={koopman_state_dim}, action_dim={cfg['action_dim']}, "
-          f"latent_dim={cfg['latent_dim']}")
+    device = make_device()
+    model, koopman_state_dim = build_koopman_model(cfg, augment, device)
 
     # --- Execute phases ---
     baseline_results = phase_0_base_eval(eval_env, policy, cfg, run_dir)
@@ -269,6 +232,7 @@ def main():
     anal_b_policy = make_analytical_b_policy(cfg)
     B_final = phase_2_analytical_B(
         model, train_env, anal_b_policy, cfg, run_dir, augment, obs_scale,
+        act_scale=act_scale,
         base_aug_trajectories=base_aug_trajectories,
         base_raw_trajectories=base_raw_trajectories)
     variables, lqr = phase_3_stability(

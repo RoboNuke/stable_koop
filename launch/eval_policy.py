@@ -195,8 +195,12 @@ def _wrap_obs(env, cfg):
 
 
 def make_single_env(cfg, render_mode=None):
-    """Create a single environment with optional obs wrapper."""
+    """Create a single environment with optional wrappers."""
     env = gym.make(cfg["env_name"], render_mode=render_mode) if render_mode else gym.make(cfg["env_name"])
+    if cfg.get("limited_spawn", False):
+        from wrappers.limited_spawn import LimitedSpawnWrapper
+        max_angle = cfg.get("spawn_angle_range", 180.0) * np.pi / 180.0
+        env = LimitedSpawnWrapper(env, max_angle=max_angle)
     return _wrap_obs(env, cfg)
 
 

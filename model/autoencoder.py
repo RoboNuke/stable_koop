@@ -35,11 +35,18 @@ class SchurK(nn.Module):
 
     @torch.no_grad()
     def project(self):
-        """Project K onto the Schur-stable set: K = K * rho / max(rho, spectral_radius(K))."""
-        eigvals = torch.linalg.eigvals(self.K_param)
-        spectral_radius = eigvals.abs().max().item()
-        if spectral_radius > self.rho:
-            self.K_param.mul_(self.rho / spectral_radius)
+        U, S, Vh = torch.linalg.svd(self.K_param)
+        if S[0].item() > self.rho:
+            S = S.clamp(max=self.rho)
+            self.K_param.copy_(U @ torch.diag(S) @ Vh)
+
+    #@torch.no_grad()
+    #def project(self):
+    #    """Project K onto the Schur-stable set: K = K * rho / max(rho, spectral_radius(K))."""
+    #    eigvals = torch.linalg.eigvals(self.K_param)
+    #    spectral_radius = eigvals.abs().max().item()
+    #    if spectral_radius > self.rho:
+    #        self.K_param.mul_(self.rho / spectral_radius)
 
     def forward(self, z):
         return z @ self.K.T
@@ -130,14 +137,42 @@ class ComplexNormalK(nn.Module):
 
     def forward(self, z):
         return z @ self.K.T    
-    
+
+
+
 class KoopmanAutoencoder(nn.Module):
-    def __init__(self, state_dim=2, latent_dim=32, action_dim=1, 
-                 k_type="cayley", encoder_type="linear", rho=0.95, 
-                 encoder_spec_norm=False, encoder_latent=64):
+    def __init__(self, state_dim=2, latent_dim=32, action_dim=1,
+                 k_type="cayley", encoder_type="linear", rho=0.95,
+                 encoder_spec_norm=False, encoder_latent=64,
+                 prepend_state=False, prepend_control=False,
+                 real_state_dim=None):
         super().__init__()
 
-        if encoder_type == "cayley":
+        self.prepend_state = prepend_state
+        self.prepend_control = prepend_control
+        self.raw_state_dim = state_dim  # full input dim (includes action_dim if augmented)
+        self.action_dim = action_dim
+        self.real_state_dim = real_state_dim if real_state_dim is not None else state_dim
+        # p = number of dims prepended to latent
+        # Always prepend the real state dims (e.g. [θ, θ̇])
+        # If prepend_control, also include u_base
+        if prepend_state:
+            self.prepend_dim = self.real_state_dim
+            if prepend_control:
+                self.prepend_dim += action_dim
+        else:
+            self.prepend_dim = 0
+        self.encoder_latent_dim = latent_dim  # q (encoder output dim)
+
+        # Encoder network: state_dim → latent_dim
+        self.encoder_type = encoder_type
+        self._trig_encoder = (encoder_type == "trig")
+
+        if self._trig_encoder:
+            # Fixed trigonometric lifting: x → [sin(x[0]), cos(x[0])]
+            # No learned parameters. latent_dim should be 2.
+            self.encoder = None
+        elif encoder_type == "cayley":
             self.encoder = nn.Sequential(
                 SemiOrthogonalLinear(state_dim, encoder_latent),
                 #nn.ReLU(),
@@ -148,50 +183,80 @@ class KoopmanAutoencoder(nn.Module):
                 SemiOrthogonalLinear(encoder_latent, latent_dim)
             )
         elif encoder_type == "linear":
+            bias = True
             self.encoder = nn.Sequential(
-                nn.Linear(state_dim, encoder_latent), 
-                nn.Tanh(),
-                #nn.ReLU(),
-                nn.Linear(encoder_latent, encoder_latent),        
-                nn.Tanh(),
-                #nn.ReLU(),
-                nn.Linear(encoder_latent, latent_dim)
+                nn.Linear(state_dim, encoder_latent, bias=bias),
+                #nn.Tanh(),
+                nn.ReLU(),
+                nn.Linear(encoder_latent, encoder_latent, bias=bias),
+                #nn.Tanh(),
+                nn.ReLU(),
+                nn.Linear(encoder_latent, encoder_latent, bias=bias),
+                nn.ReLU(),
+                nn.Linear(encoder_latent, latent_dim, bias=bias)
             )
 
-        if encoder_spec_norm:
+        if not self._trig_encoder and encoder_spec_norm:
             for layer in self.encoder:
                 if hasattr(layer, 'weight'):
                     nn.utils.parametrizations.spectral_norm(layer)
-        
-        # making the decoder lower capacity forces the encoder to do better work
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, encoder_latent),       
-            nn.Tanh(),
-            #nn.ReLU(),
-            nn.Linear(encoder_latent, encoder_latent),            
-            nn.Tanh(),
-            #nn.ReLU(),
-            nn.Linear(encoder_latent, state_dim)
-        )
+
+        # Decoder
+        if self._trig_encoder:
+            # Decode = extract first state_dim elements from latent
+            self.decoder = None
+        else:
+            decoder_size = encoder_latent//2
+            self.decoder = nn.Sequential(
+                nn.Linear(latent_dim, decoder_size),
+                #nn.Tanh(),
+                nn.ReLU(),
+                nn.Linear(decoder_size,decoder_size),
+                #nn.Tanh(),
+                nn.ReLU(),
+                nn.Linear(decoder_size, decoder_size),
+                nn.ReLU(),
+                nn.Linear(decoder_size, decoder_size),
+                nn.ReLU(),
+                nn.Linear(decoder_size, state_dim)
+            )
+
+        # A and B operate on the full latent: [prepended; g(x)] if prepend_state, else g(x)
+        actual_latent = self.prepend_dim + latent_dim if prepend_state else latent_dim
+
         self.b_from_k_mod = False
         if k_type == "cayley":
-            self.K_module = CayleyK(latent_dim, rho)
+            self.K_module = CayleyK(actual_latent, rho)
         elif k_type == "schur":
-            self.K_module = SchurK(latent_dim, rho)
+            self.K_module = SchurK(actual_latent, rho)
         elif k_type == "unbounded":
-            self.K_module = nn.Linear(latent_dim, latent_dim, bias=False)
+            self.K_module = nn.Linear(actual_latent, actual_latent, bias=False)
         elif k_type == "normalized":
             self.b_from_k_mod = True
-            self.K_module = ComplexNormalK(latent_dim, action_dim, rho)
+            self.K_module = ComplexNormalK(actual_latent, action_dim, rho)
         else:
             raise NotImplementedError
-        
 
-        self.B = nn.Linear(action_dim, latent_dim, bias=False)
+
+        self.B = nn.Linear(action_dim, actual_latent, bias=False)
         #nn.init.zeros_(self.B.weight)
 
-    def encode(self, x):    return self.encoder(x)
-    def decode(self, z):    return self.decoder(z)
+    def encode(self, x):
+        if self._trig_encoder:
+            # Fixed lifting: [sin(θ), cos(θ)] where θ = x[..., 0]
+            theta = x[..., 0:1]
+            g = torch.cat([torch.sin(theta), torch.cos(theta)], dim=-1)
+        else:
+            g = self.encoder(x)
+        if self.prepend_state:
+            return torch.cat([x[..., :self.prepend_dim], g], dim=-1)
+        return g
+
+    def decode(self, z):
+        if self.prepend_state or self._trig_encoder:
+            # Return first state_dim elements (the raw state)
+            return z[..., :self.raw_state_dim]
+        return self.decoder(z)
     def predict(self, z, u):
         if self.b_from_k_mod:
             return self.K_module(z) + u @ self.K_module.B_from_eigen.T

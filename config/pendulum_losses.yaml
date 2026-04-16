@@ -6,6 +6,8 @@ obs_type: "cos_sin"
 env_name: "Pendulum-v1"
 num_trajectories: 2000
 max_episode_steps: 200
+limited_spawn: false
+spawn_angle_range: 180
 
 # Model
 state_dim: 3
@@ -17,6 +19,8 @@ encoder_type: "linear"  # "linear" or "cayley"
 encoder_spec_norm: false
 encoder_latent: 32
 init_b_in_a: false  # initialize B in A eigenbasis (only effective with two-step training)
+prepend_state: false
+prepend_control: false
 
 # Policy
 
@@ -30,6 +34,10 @@ sa: 40
 # Perturbation (random actions to excite the system that represent possible residual actions)
 analytical_B_policy: "none"  # policy for analytical B data collection: "none", "energy", "bang_energy"
 normalize_analytical_B: false  # normalize analytical B to unit spectral norm
+train_for_B: false
+analytical_B_ctrl_lambda: 0.1
+analytical_B_train_steps: 500
+analytical_B_lr: 1.0e-3
 perturb_scale: 1.0
 fix_perturb_range: false
 hold_steps: 5  # number of steps to hold each sampled perturbation before resampling
@@ -38,6 +46,10 @@ hold_steps: 5  # number of steps to hold each sampled perturbation before resamp
 use_eigen_bound: false  # spectral radius / transient constant bound
 use_lyapunov_bound: true  # Lyapunov-based bound
 use_m_free_bound: false   # Lipschitz-m-free stability bound
+optimize_lyapunov_P: true # SDP optimization of Lyapunov P matrix
+use_alpha_bound: false
+alpha_epsilon_x: 0.3
+alpha_eta: 0.1
 controllable_subspace: true  # if true, solve LQR only in controllable subspace
 ctrl_threshold: 0.1          # controllability singular value threshold (null = machine epsilon default)
 

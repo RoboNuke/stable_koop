@@ -206,6 +206,71 @@ def project_for_controllability(A, B_ls, n):
     return B_aug.astype(np.float32)
 
 
+def solve_B_with_controllability(A_np, R, U, n, latent_dim,
+                                 lambda_ctrl=0.1, n_steps=500, lr=1e-3):
+    """Solve for B via gradient descent with controllability regularization.
+
+    loss = ||R - B @ U||² / N - lambda_ctrl * σ_min([B, AB, ..., A^{n-1}B])
+
+    Starts from least-squares B_ls as initialization.
+
+    Args:
+        A_np: (n, n) numpy array
+        R: (latent_dim, N) residual matrix
+        U: (action_dim, N) action matrix
+        n: latent dimension (for controllability matrix)
+        latent_dim: latent dimension
+        lambda_ctrl: weight on controllability regularization
+        n_steps: number of optimization steps
+        lr: learning rate
+
+    Returns:
+        B_final: (latent_dim, action_dim) numpy float32
+        B_ls: (latent_dim, action_dim) numpy float32 (initial least-squares)
+    """
+    import torch.optim as optim
+
+    # Least-squares initialization
+    B_ls = R @ np.linalg.pinv(U)  # (latent_dim, action_dim)
+
+    A_t = torch.tensor(A_np, dtype=torch.float64)
+    R_t = torch.tensor(R, dtype=torch.float64)   # (latent_dim, N)
+    U_t = torch.tensor(U, dtype=torch.float64)   # (action_dim, N)
+
+    B = torch.tensor(B_ls, dtype=torch.float64, requires_grad=True)
+    optimizer = optim.Adam([B], lr=lr)
+
+    for step in range(n_steps):
+        optimizer.zero_grad()
+
+        # Reconstruction loss: ||R - B @ U||² / N
+        recon_loss = torch.norm(R_t - B @ U_t, p='fro')**2 / U_t.shape[1]
+
+        # Controllability loss: -σ_min([B, AB, ..., A^{n-1}B])
+        cols = [B]
+        Ak = A_t
+        for _ in range(latent_dim - 1):
+            cols.append(Ak @ B)
+            Ak = Ak @ A_t
+        C_mat = torch.cat(cols, dim=1)
+        sigma_min = torch.linalg.svdvals(C_mat)[-1]
+        ctrl_loss = -sigma_min
+
+        loss = recon_loss + lambda_ctrl * ctrl_loss
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0:
+            print(f"  step {step:4d} | recon={recon_loss.item():.4f} | "
+                  f"σ_min={sigma_min.item():.4f} | ctrl={ctrl_loss.item():.4f}")
+
+    # Final stats
+    print(f"  step {n_steps:4d} | recon={recon_loss.item():.4f} | "
+          f"σ_min={sigma_min.item():.4f} | ctrl={ctrl_loss.item():.4f}")
+
+    return B.detach().numpy().astype(np.float32), B_ls.astype(np.float32)
+
+
 def compute_analytical_B(model, trajectories, cfg,
                          base_trajectories=None):
     """Compute B analytically from trajectory data.
@@ -221,7 +286,7 @@ def compute_analytical_B(model, trajectories, cfg,
         B_final: (latent_dim, action_dim) numpy array
     """
     device = next(model.parameters()).device
-    n = cfg["latent_dim"]
+    n = model.A.shape[0]  # actual latent dim (includes prepended state if enabled)
     m = cfg["action_dim"]
 
     # Collect all z_t, z_{t+1}, u_t from trajectories
@@ -262,8 +327,10 @@ def compute_analytical_B(model, trajectories, cfg,
 
     R = np.concatenate(all_residuals, axis=0).T  # (latent_dim, N)
     U = np.concatenate(all_actions, axis=0).T     # (action_dim, N)
+    R_per_sample = np.linalg.norm(R, axis=0)  # (N,) per-sample residual before B
     print(f"Data matrix shapes: R={R.shape}, U={U.shape}")
     print(f"  R norm (perturbed): {np.linalg.norm(R):.4f}, U norm: {np.linalg.norm(U):.4f}")
+    print(f"  R per-sample (before B): max={R_per_sample.max():.6f}  mean={R_per_sample.mean():.6f}  std={R_per_sample.std():.6f}")
 
     # Compare with A-only fit on base (unperturbed) data
     if base_trajectories is not None:
@@ -281,16 +348,40 @@ def compute_analytical_B(model, trajectories, cfg,
 
     A_np = A.cpu().numpy()
 
-    # Step 1: Solve unconstrained least-squares  R = B @ U  =>  B = R @ pinv(U)
-    B_ls = R @ np.linalg.pinv(U)  # (latent_dim, action_dim)
-    print(f"\nStep 1 - Least-squares B:")
-    print(f"  B_ls shape: {B_ls.shape}")
-    print(f"  B_ls spectral norm: {np.linalg.norm(B_ls, ord=2):.3f}")
-    print(f"  Reconstruction error: {np.linalg.norm(R - B_ls @ U):.3f}")
+    train_for_B = cfg.get("train_for_B", False)
+    if train_for_B:
+        # Step 1+2 combined: gradient descent with controllability regularization
+        lambda_ctrl = cfg.get("analytical_B_ctrl_lambda", 0.1)
+        n_steps = cfg.get("analytical_B_train_steps", 500)
+        b_lr = cfg.get("analytical_B_lr", 1e-3)
+        print(f"\nStep 1+2 - Gradient descent B (lambda_ctrl={lambda_ctrl}, "
+              f"steps={n_steps}, lr={b_lr}):")
+        B_proj, B_ls = solve_B_with_controllability(
+            A_np, R, U, n, n,
+            lambda_ctrl=lambda_ctrl, n_steps=n_steps, lr=b_lr,
+        )
+        print(f"  B shape: {B_proj.shape}")
+        print(f"  B spectral norm: {np.linalg.norm(B_proj, ord=2):.3f}")
+        print(f"  B_ls spectral norm: {np.linalg.norm(B_ls, ord=2):.3f}")
+        per_sample_err = np.linalg.norm(R - B_proj @ U, axis=0)  # (N,)
+        print(f"  Reconstruction error (trained): {np.linalg.norm(R - B_proj @ U):.3f}")
+        print(f"    per-sample: max={per_sample_err.max():.6f}  mean={per_sample_err.mean():.6f}  std={per_sample_err.std():.6f}")
+        per_sample_ls = np.linalg.norm(R - B_ls @ U, axis=0)
+        print(f"  Reconstruction error (ls): {np.linalg.norm(R - B_ls @ U):.3f}")
+        print(f"    per-sample: max={per_sample_ls.max():.6f}  mean={per_sample_ls.mean():.6f}  std={per_sample_ls.std():.6f}")
+    else:
+        # Step 1: Solve unconstrained least-squares  R = B @ U  =>  B = R @ pinv(U)
+        B_ls = R @ np.linalg.pinv(U)  # (latent_dim, action_dim)
+        print(f"\nStep 1 - Least-squares B:")
+        print(f"  B_ls shape: {B_ls.shape}")
+        print(f"  B_ls spectral norm: {np.linalg.norm(B_ls, ord=2):.3f}")
+        per_sample_err = np.linalg.norm(R - B_ls @ U, axis=0)  # (N,)
+        print(f"  Reconstruction error: {np.linalg.norm(R - B_ls @ U):.3f}")
+        print(f"    per-sample: max={per_sample_err.max():.6f}  mean={per_sample_err.mean():.6f}  std={per_sample_err.std():.6f}")
 
-    # Step 2: Project onto maximally controllable subspace
-    print(f"\nStep 2 - Controllability projection:")
-    B_proj = B_ls #project_for_controllability(A_np, B_ls, n)
+        # Step 2: Project onto maximally controllable subspace
+        print(f"\nStep 2 - Controllability projection:")
+        B_proj = project_for_controllability(A_np, B_ls, n)
 
     # Step 3: Optionally normalize to unit spectral norm
     normalize_B = cfg.get("normalize_analytical_B", True)
@@ -403,7 +494,6 @@ def make_prediction_heatmap(model, B_final, aug_trajectories, raw_trajectories,
     path = os.path.join(run_dir, "prediction_heatmap.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Prediction heatmap saved to {path}")
 
     return vmin, vmax
 
@@ -489,7 +579,6 @@ def make_prediction_heatmap_a_only(model, aug_trajectories, raw_trajectories,
     path = os.path.join(run_dir, filename)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"A-only prediction heatmap saved to {path}")
 
 
 def make_latent_recon_heatmap(model, B_final, aug_trajectories, raw_trajectories,
@@ -583,7 +672,6 @@ def make_latent_recon_heatmap(model, B_final, aug_trajectories, raw_trajectories
     path = os.path.join(run_dir, "latent_recon_heatmap.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Latent reconstruction heatmap saved to {path}")
 
     return vmin, vmax
 
@@ -669,7 +757,6 @@ def make_a_only_heatmap(model, aug_trajectories, raw_trajectories, cfg, run_dir,
     path = os.path.join(run_dir, filename)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"A-only perturbation heatmap saved to {path}")
 
 
 def make_latent_diff_heatmap(model, B_final, aug_trajectories, raw_trajectories,
@@ -752,7 +839,6 @@ def make_latent_diff_heatmap(model, B_final, aug_trajectories, raw_trajectories,
     path = os.path.join(run_dir, "latent_diff_heatmap.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Latent diff heatmap saved to {path}")
 
 
 def make_prediction_diff_heatmap(model, B_final, aug_trajectories, raw_trajectories,
@@ -837,7 +923,6 @@ def make_prediction_diff_heatmap(model, B_final, aug_trajectories, raw_trajector
     path = os.path.join(run_dir, "prediction_diff_heatmap.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Prediction diff heatmap saved to {path}")
 
 
 def _compute_recon_errors_theta_thdot(model, aug_trajectories, raw_trajectories,
@@ -953,7 +1038,6 @@ def _make_theta_thdot_heatmap(thetas, thdots, errors, title, filepath,
     fig.tight_layout()
     fig.savefig(filepath, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Heatmap saved to {filepath}")
 
     return np.nanmin(heatmap) if not np.all(np.isnan(heatmap)) else 0, \
            np.nanmax(heatmap) if not np.all(np.isnan(heatmap)) else 1
@@ -1061,11 +1145,10 @@ def make_theta_thdot_heatmaps(model, B_ls, aug_trajectories, raw_trajectories,
     path = os.path.join(run_dir, "recon_theta_thdot_diff.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Diff heatmap saved to {path}")
 
 
 def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
-                     obs_scale=None, num_trajectories=None,
+                     obs_scale=None, act_scale=None, num_trajectories=None,
                      base_aug_trajectories=None, base_raw_trajectories=None):
     """Analytically derive B matrix for a pre-trained Koopman model.
 
@@ -1106,7 +1189,7 @@ def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
         hold_steps=cfg.get("hold_steps", 1),
     )
     aug_trajectories = augment_perturbed_trajectories(
-        trajectories, augment=augment, obs_scale=obs_scale)
+        trajectories, augment=augment, obs_scale=obs_scale, act_scale=act_scale)
 
     # Compute analytical B
     print(f"\n{'='*60}")
@@ -1115,38 +1198,38 @@ def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
     B_final, B_ls = compute_analytical_B(model, aug_trajectories, cfg,
                                          base_trajectories=base_aug_trajectories)
 
-    # Generate heatmaps (use B_ls for prediction/recon — unnormalized, data-scale B)
-    print(f"\nGenerating heatmaps...")
-    train_horizon = cfg.get("horizon", 5)
-    pred_vmin, pred_vmax = make_prediction_heatmap(
-        model, B_ls, aug_trajectories, trajectories, cfg, run_dir,
-        eval_horizon=train_horizon)
-    make_prediction_heatmap_a_only(
-        model, aug_trajectories, trajectories, cfg, run_dir,
-        eval_horizon=train_horizon)
-    make_prediction_heatmap_a_only(
-        model, aug_trajectories, trajectories, cfg, run_dir,
-        eval_horizon=train_horizon,
-        vmin=pred_vmin, vmax=pred_vmax,
-        filename="A_only_prediction_heatmap-scaled.png")
-    recon_vmin, recon_vmax = make_latent_recon_heatmap(
-        model, B_ls, aug_trajectories, trajectories, cfg, run_dir)
-    make_a_only_heatmap(model, aug_trajectories, trajectories, cfg, run_dir)
-    make_a_only_heatmap(model, aug_trajectories, trajectories, cfg, run_dir,
-                        vmin=recon_vmin, vmax=recon_vmax,
-                        filename="A_with_pert_heatmap-scaled.png")
-    make_latent_diff_heatmap(model, B_ls, aug_trajectories, trajectories,
-                             cfg, run_dir)
-    make_prediction_diff_heatmap(model, B_ls, aug_trajectories, trajectories,
-                                 cfg, run_dir, eval_horizon=train_horizon)
-
-    # Theta vs thdot reconstruction heatmaps
-    if base_aug_trajectories is not None and base_raw_trajectories is not None:
-        make_theta_thdot_heatmaps(model, B_ls, aug_trajectories, trajectories,
-                                   base_aug_trajectories, base_raw_trajectories,
-                                   cfg, run_dir)
-    else:
-        print("  Skipping theta-thdot heatmaps (no base trajectory data provided)")
+    # # Generate heatmaps (use B_ls for prediction/recon — unnormalized, data-scale B)
+    # print(f"\nGenerating heatmaps...")
+    # train_horizon = cfg.get("horizon", 5)
+    # pred_vmin, pred_vmax = make_prediction_heatmap(
+    #     model, B_ls, aug_trajectories, trajectories, cfg, run_dir,
+    #     eval_horizon=train_horizon)
+    # make_prediction_heatmap_a_only(
+    #     model, aug_trajectories, trajectories, cfg, run_dir,
+    #     eval_horizon=train_horizon)
+    # make_prediction_heatmap_a_only(
+    #     model, aug_trajectories, trajectories, cfg, run_dir,
+    #     eval_horizon=train_horizon,
+    #     vmin=pred_vmin, vmax=pred_vmax,
+    #     filename="A_only_prediction_heatmap-scaled.png")
+    # recon_vmin, recon_vmax = make_latent_recon_heatmap(
+    #     model, B_ls, aug_trajectories, trajectories, cfg, run_dir)
+    # make_a_only_heatmap(model, aug_trajectories, trajectories, cfg, run_dir)
+    # make_a_only_heatmap(model, aug_trajectories, trajectories, cfg, run_dir,
+    #                     vmin=recon_vmin, vmax=recon_vmax,
+    #                     filename="A_with_pert_heatmap-scaled.png")
+    # make_latent_diff_heatmap(model, B_ls, aug_trajectories, trajectories,
+    #                          cfg, run_dir)
+    # make_prediction_diff_heatmap(model, B_ls, aug_trajectories, trajectories,
+    #                              cfg, run_dir, eval_horizon=train_horizon)
+    #
+    # # Theta vs thdot reconstruction heatmaps
+    # if base_aug_trajectories is not None and base_raw_trajectories is not None:
+    #     make_theta_thdot_heatmaps(model, B_ls, aug_trajectories, trajectories,
+    #                                base_aug_trajectories, base_raw_trajectories,
+    #                                cfg, run_dir)
+    # else:
+    #     print("  Skipping theta-thdot heatmaps (no base trajectory data provided)")
 
     # Save results
     A_f64 = A.astype(np.float64)
@@ -1165,12 +1248,9 @@ def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
     results_path = os.path.join(run_dir, "analytical_b_results.yaml")
     with open(results_path, "w") as f:
         yaml.dump(results, f, default_flow_style=False, sort_keys=False)
-    print(f"\nResults saved to {results_path}")
-
     # Also save B as a .npy file for easy loading
     b_path = os.path.join(run_dir, "B_analytical.npy")
     np.save(b_path, B_final)
-    print(f"B matrix saved to {b_path}")
 
     # Inject analytical B into model and save as koopman_ckpt.pt
     B_tensor = torch.tensor(B_final, dtype=torch.float32, device=next(model.parameters()).device)
@@ -1184,8 +1264,6 @@ def run_analytical_b(model, env, policy, cfg, run_dir, augment=True,
     ckpt_path = os.path.join(run_dir, "koopman_ckpt.pt")
     save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
     torch.save({"model": save_dict, "config": cfg}, ckpt_path)
-    print(f"Model checkpoint saved to {ckpt_path}")
-
     # Save updated config
     save_config(cfg, run_dir)
 
@@ -1224,10 +1302,15 @@ def main():
         with open(args.config) as f:
             tune_cfg = yaml.safe_load(f)
         for key in ("use_m_free_bound", "use_lyapunov_bound", "use_eigen_bound",
+                     "use_alpha_bound", "optimize_lyapunov_P",
+                     "alpha_epsilon_x", "alpha_eta",
                      "controllable_subspace", "ctrl_threshold",
                      "q_scale", "r_scale", "scale_B",
                      "max_tracking_error_x", "max_displacement_x",
-                     "perturb_scale", "fix_perturb_range", "hold_steps"):
+                     "perturb_scale", "fix_perturb_range", "hold_steps",
+                     "train_for_B", "analytical_B_ctrl_lambda",
+                     "analytical_B_train_steps", "analytical_B_lr",
+                     "normalize_analytical_B"):
             if key in tune_cfg:
                 cfg[key] = tune_cfg[key]
 
@@ -1246,35 +1329,27 @@ def main():
 
     # Environment and policy
     from launch.eval_policy import make_single_env, make_analytical_b_policy
+    from launch.run import compute_act_scale
     env = make_single_env(cfg)
     obs_scale = compute_obs_scale(env, augment)
+    act_scale = compute_act_scale(env)
     cfg["obs_scale"] = obs_scale.tolist()
+    cfg["act_scale"] = act_scale.tolist()
     print(f"Observation scale: {obs_scale}")
+    print(f"Action scale: {act_scale}")
 
     # Build model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    koopman_state_dim = cfg["state_dim"] + cfg["action_dim"] if augment else cfg["state_dim"]
-    model = KoopmanAutoencoder(
-        state_dim=koopman_state_dim,
-        latent_dim=cfg["latent_dim"],
-        action_dim=cfg["action_dim"],
-        k_type=cfg["k_type"],
-        encoder_type=cfg.get("encoder_type", "linear"),
-        rho=cfg["rho"],
-        encoder_spec_norm=cfg["encoder_spec_norm"],
-        encoder_latent=cfg["encoder_latent"],
-    ).to(device)
+    from launch.pipeline_utils import make_device, build_koopman_model, save_checkpoint, load_checkpoint
+    device = make_device()
+    model, koopman_state_dim = build_koopman_model(cfg, augment, device)
 
     if args.train_a:
         # Train A from scratch
         print("\n=== Training A matrix from scratch ===")
         from launch.train_pendulum import collect_data, train
-        from launch.run import augment_trajectories, compute_act_scale
+        from launch.run import augment_trajectories
 
         policy = make_base_policy(cfg)
-        act_scale = compute_act_scale(env)
 
         trajectories = collect_data(
             env, cfg["num_trajectories"],
@@ -1288,8 +1363,7 @@ def main():
 
         # Save A checkpoint
         ckpt_path = os.path.join(run_dir, "koop_a_checkpoint.pt")
-        save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
-        torch.save({"model": save_dict, "config": cfg}, ckpt_path)
+        save_checkpoint(model, cfg, ckpt_path)
         print(f"A checkpoint saved to {ckpt_path}")
     else:
         # Load existing checkpoint
@@ -1304,12 +1378,7 @@ def main():
                 weights_path = ab_path
 
         print(f"Checkpoint: {weights_path}")
-        checkpoint = torch.load(weights_path, map_location=device)
-        state_dict = checkpoint["model"]
-        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict)
-        model.eval()
-        print(f"Loaded weights from {weights_path}")
+        load_checkpoint(model, weights_path, device)
 
     print(f"Koopman model: state_dim={koopman_state_dim}, action_dim={cfg['action_dim']}, "
           f"latent_dim={cfg['latent_dim']}, k_type={cfg['k_type']}")
@@ -1318,6 +1387,7 @@ def main():
     anal_b_policy = make_analytical_b_policy(cfg)
     B_final = run_analytical_b(model, env, anal_b_policy, cfg, run_dir,
                                augment=augment, obs_scale=obs_scale,
+                               act_scale=act_scale,
                                num_trajectories=args.num_trajectories)
 
     # Run stability analysis if config provided
@@ -1358,6 +1428,26 @@ def main():
 
         variables, lqr = phase_3_lyapunov(model, cfg, stability_dir,
                                            aug_trajectories)
+
+    if args.config and cfg.get("use_alpha_bound", False):
+        from launch.stability_utils import alpha_bound, setup_lqr
+        stability_dir = os.path.join(run_dir, "stability")
+
+        if 'aug_trajectories' not in dir():
+            from launch.run import collect_perturbed_data, augment_perturbed_trajectories
+            trajectories = collect_perturbed_data(
+                env, anal_b_policy, cfg["num_trajectories"],
+                cfg["max_episode_steps"], cfg["seed"],
+                perturb_scale=cfg.get("perturb_scale", None),
+                fix_perturb_range=cfg.get("fix_perturb_range", False),
+                hold_steps=cfg.get("hold_steps", 1),
+            )
+            aug_trajectories = augment_perturbed_trajectories(
+                trajectories, augment=augment, obs_scale=obs_scale)
+
+        if 'lqr' not in dir() or lqr is None:
+            lqr, _, _, _ = setup_lqr(model.A.detach().cpu(), model.B_matrix.detach().cpu(), cfg)
+        alpha_vars = alpha_bound(model, lqr, cfg, aug_trajectories, env)
 
     env.close()
 
