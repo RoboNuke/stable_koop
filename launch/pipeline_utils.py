@@ -71,6 +71,7 @@ def build_koopman_model(cfg, augment, device):
         prepend_state=cfg.get("prepend_state", False),
         prepend_control=cfg.get("prepend_control", False),
         real_state_dim=cfg["state_dim"],
+        obs_type=cfg.get("obs_type", "theta"),
     ).to(device)
     print(f"Koopman model: state_dim={koopman_state_dim}, action_dim={cfg['action_dim']}, "
           f"latent_dim={cfg['latent_dim']}, prepend_state={cfg.get('prepend_state', False)}, "
@@ -112,7 +113,7 @@ def evaluate_and_save(model, aug_trajectories, cfg, run_dir, prefix, title):
     train_horizon = cfg["horizon"]
     fig, error_stats, heatmap_data = evaluate_model(
         model, aug_trajectories, train_horizon,
-        eval_horizon=max(25, train_horizon),
+        eval_horizon=train_horizon + 1,
         title=title,
         obs_scale=cfg.get("obs_scale"),
         obs_type=cfg.get("obs_type", "cos_sin"))

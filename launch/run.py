@@ -23,7 +23,7 @@ from launch.pipeline_utils import (
 from launch.stability_utils import (
     control_analysis, compute_encoder_lipschitz_bounds, setup_lqr, compute_lyapunov_params,
     compute_BtPB, compute_latent_errors, compute_max_latent_diff,
-    run_sdp_optimization, lyapunov_gamma, alpha_bound,
+    run_sdp_optimization, lyapunov_gamma, alpha_bound, count_steps_under_threshold,
 )
 from model.autoencoder import KoopmanAutoencoder
 
@@ -660,6 +660,10 @@ def phase_3_lyapunov(model, cfg, phase_dir, aug_trajectories,
     else:
         print(f"\033[92m  One-step latent error mean+2σ:             {err_2sigma:.6f}\033[0m")
 
+    count_under, total, fraction = count_steps_under_threshold(
+        model, aug_trajectories, device, delta_max_lyap, space="latent")
+    print(f"  Steps under δ_max:                        {count_under}/{total} ({fraction*100:.1f}%)")
+
     # # Heatmap: delta_max_lyap over (max_tracking_error_x, max_displacement_x)
     # n_heatmap = 200
     # track_sweep = np.linspace(0.0, 1.0, n_heatmap)
@@ -881,6 +885,10 @@ def lipschitz_m_free(model, cfg, phase_dir, aug_trajectories, env,
         print(f"\033[91m  γ_max (Lyapunov):                      {gamma_max:.6f}\033[0m")
     else:
         print(f"\033[92m  γ_max (Lyapunov):                      {gamma_max:.6f}\033[0m")
+
+    count_under, total, fraction = count_steps_under_threshold(
+        model, aug_trajectories, device, gamma_max, space="latent")
+    print(f"  Steps under γ_max:                     {count_under}/{total} ({fraction*100:.1f}%)")
 
     # # =====================================================================
     # #  Heatmap: R vs Residual Control → ε_max / max_latent_diff

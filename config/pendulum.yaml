@@ -49,6 +49,7 @@ alpha_eta: 0.1             # disturbance bound in latent space (alpha bound)
 controllable_subspace: false  # if true, solve LQR only in controllable subspace
 ctrl_threshold: null          # controllability singular value threshold (null = machine epsilon default)
 q_scale: 1
+q_epsilon_scale: 0.0
 r_scale: 1
 scale_B: false
 max_tracking_error_x: 0.3 # define by success bounds (1-cos(15), sin(15), 1)
@@ -85,6 +86,7 @@ latent_consistency_weight: 0.5
 
 latent_rollout_loss: false
 latent_rollout_weight: 1.0
+x_pred_weight: 1.0
 
 l_inf_pred_loss: false
 l_inf_pred_weight: 1.0

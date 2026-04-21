@@ -201,6 +201,10 @@ def make_single_env(cfg, render_mode=None):
         from wrappers.limited_spawn import LimitedSpawnWrapper
         max_angle = cfg.get("spawn_angle_range", 180.0) * np.pi / 180.0
         env = LimitedSpawnWrapper(env, max_angle=max_angle)
+    friction = cfg.get("friction_coeff", 0.0)
+    if friction != 0.0:
+        from wrappers.pendulum import FrictionPendulumWrapper
+        env = FrictionPendulumWrapper(env, friction_coeff=friction)
     return _wrap_obs(env, cfg)
 
 

@@ -54,6 +54,7 @@ controllable_subspace: true  # if true, solve LQR only in controllable subspace
 ctrl_threshold: 0.1          # controllability singular value threshold (null = machine epsilon default)
 
 q_scale: 1000
+q_epsilon_scale: 0.0
 r_scale: 0.0001
 scale_B: false
 max_tracking_error_x: 0.5 #0.3 # define by success bounds (1-cos(15), sin(15), 1)
@@ -87,6 +88,7 @@ latent_consistency_weight: 2.0 #0.1
 
 latent_rollout_loss: false
 latent_rollout_weight: 1.0
+x_pred_weight: 1.0
 
 l_inf_pred_loss: false
 l_inf_pred_weight: 1.0

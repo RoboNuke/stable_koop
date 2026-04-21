@@ -419,10 +419,34 @@ def build_loss_fns(cfg, model):
     lc_w = cfg.get("latent_consistency_weight", 1.0)
     vectorize = cfg.get("vectorize_rollout", False)
 
-    def _recon(model, states_seq, actions_seq, all_states):
-        all_z = model.encode(all_states)
-        return F.mse_loss(model.decode(all_z), all_states)
-    losses["Recon"] = (_recon, recon_w)
+    if model.decoder is not None:
+        def _recon(model, states_seq, actions_seq, all_states):
+            all_z = model.encode(all_states)
+            return F.mse_loss(model.decode(all_z), all_states)
+        losses["Recon"] = (_recon, recon_w)
+
+    # State prediction loss: compare x-portion of predicted z to encoded x_{t+1}
+    # Automatically enabled when prepend_state is True
+    if getattr(model, 'prepend_state', False):
+        xpred_w = cfg.get("x_pred_weight", 1.0)
+        p_dim = model.prepend_dim
+        def _xpred(model, states_seq, actions_seq, all_states):
+            B_batch, Hp1, S = states_seq.shape
+            H = Hp1 - 1
+            device = states_seq.device
+            all_states_flat = states_seq.reshape(B_batch * Hp1, S)
+            all_z = model.encode(all_states_flat).reshape(B_batch, Hp1, -1)
+            total_loss = torch.tensor(0.0, device=device)
+            n_predictions = 0
+            for t_start in range(H):
+                z = all_z[:, t_start, :]
+                for t in range(t_start, H):
+                    z = model.predict(z, actions_seq[:, t, :])
+                    z_target = all_z[:, t + 1, :]
+                    total_loss = total_loss + F.mse_loss(z[:, :p_dim], z_target[:, :p_dim])
+                    n_predictions += 1
+            return total_loss / n_predictions
+        losses["XPred"] = (_xpred, xpred_w)
 
     def _pred(model, states_seq, actions_seq, all_states):
         if vectorize:
@@ -604,7 +628,12 @@ def train(model, trajectories, cfg):
         print("Model compiled with torch.compile")
 
     # 3. Reconstruction pretraining (encoder/decoder only)
+    #    Skip for fixed encoders (trig, identity) that have no learnable encoder/decoder.
     recon_pretrain_epochs = cfg.get("recon_pretrain_epochs", 0)
+    has_learned_encoder = hasattr(model, 'encoder') and model.encoder is not None
+    if recon_pretrain_epochs > 0 and not has_learned_encoder:
+        print(f"Skipping reconstruction pretraining (encoder is fixed, no learnable params)")
+        recon_pretrain_epochs = 0
     if recon_pretrain_epochs > 0:
         pretrain_lr = cfg.get("recon_pretrain_lr", cfg["lr"])
         pretrain_bilip = cfg.get("recon_pretrain_bilip", False)

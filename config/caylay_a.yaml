@@ -3,19 +3,20 @@ run_name: "no_losses"
 
 # Environment
 env_name: "Pendulum-v1"
+friction_coeff: 0.0
 num_trajectories: 1000
 max_episode_steps: 50
 limited_spawn: false       # limit initial angle range on reset
 spawn_angle_range: 45     # max angle in degrees (symmetric about 0)
 
 # Model
-obs_type: "theta"  # "cos_sin" = [cos_th, sin_th, thdot] (3D), "theta" = [theta, thdot] (2D)
-state_dim: 2
+obs_type: "cos_sin"  # "cos_sin" = [cos_th, sin_th, thdot] (3D), "theta" = [theta, thdot] (2D)
+state_dim: 3
 action_dim: 1
 latent_dim: 2
 k_type: "unbounded" #"unbounded" #"cayley", "schur", "normalized"
-rho: 0.6
-encoder_type: "trig"  # "linear" or "cayley"
+rho: 0.95
+encoder_type: "trig"  # "trig", "linear" or "cayley"
 encoder_spec_norm: false
 encoder_latent: 80
 init_b_in_a: false  # initialize B in A eigenbasis (only effective with two-step training)
@@ -56,13 +57,15 @@ use_lyapunov_bound: false  # Lyapunov-based bound
 use_m_free_bound: false  # this is based on bad derivation - Lipschitz-m-free stability bound
 optimize_lyapunov_P: true # SDP optimization of Lyapunov P matrix
 use_alpha_bound: true
+alpha_r_space: "latent"
 alpha_epsilon_x: 0.3
 alpha_eta: 0.1
 controllable_subspace: false  # if true, solve LQR only in controllable subspace
 ctrl_threshold: null          # controllability singular value threshold (null = machine epsilon default)
 
-q_scale: 1000
-r_scale: .0001
+q_scale: 1
+q_epsilon_scale: 0.0  # small cost on non-state latent dims for LQR
+r_scale: 1
 scale_B: false
 max_tracking_error_x: 0.5 #0.3 # define by success bounds (1-cos(15), sin(15), 1)
 max_displacement_x: 1.41 #0.1 #0.57 # define as maximum possible displacement of system (0.4, 0.4, 0.8)
@@ -71,16 +74,16 @@ max_displacement_x: 1.41 #0.1 #0.57 # define as maximum possible displacement of
 horizon: 5
 batch_size: 2048
 num_workers: 8
-lr: 1.0e-3
+lr: 5.0e-4
 num_epochs: 1000
 
-recon_pretrain_epochs: 0
+recon_pretrain_epochs: 20
 recon_pretrain_lr: 1.0e-3  # learning rate for recon pretraining (default: same as lr)
 recon_pretrain_bilip: false  # include BiLip loss during recon pretraining
 recon_pretrain_bilip_weight: 1.0  # weight for BiLip during pretraining
 
 
-scheduler_step: 100
+scheduler_step: 250
 scheduler_gamma: 0.5
 
 cosine_scheduler: false
@@ -101,6 +104,8 @@ weight_decay: 1.0e-4
 recon_weight: 0.1
 pred_weight: 0.1
 latent_consistency_weight: 1.0
+x_pred_weight: 0.1  # state-portion prediction loss (auto-enabled with prepend_state)
+
 
 latent_rollout_loss: false
 latent_rollout_weight: 1.0

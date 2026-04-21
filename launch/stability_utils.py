@@ -95,9 +95,10 @@ def setup_lqr(A, B_mat, cfg):
     q_scale = cfg.get("q_scale", 1.0)
     r_scale = cfg["r_scale"]
 
-    # Q penalizes only real state dims (θ, θ̇), not u_base or g(x) dims
+    # Q penalizes real state dims (θ, θ̇) at q_scale, other dims at q_epsilon_scale
     real_state_dim = cfg["state_dim"]
-    Q = torch.zeros(actual_latent, actual_latent)
+    q_eps = cfg.get("q_epsilon_scale", 0.0)
+    Q = torch.eye(actual_latent) * q_eps
     Q[:real_state_dim, :real_state_dim] = torch.eye(real_state_dim) * q_scale
     R_cost = torch.eye(action_dim) * r_scale
 
@@ -191,6 +192,82 @@ def compute_latent_errors(model, aug_trajectories, device, error_stats=None):
             all_latent_errs.append(errs.cpu())
     all_latent_errs = torch.cat(all_latent_errs)
     return all_latent_errs.mean().item(), all_latent_errs.std().item()
+
+
+def compute_state_recon_errors(model, aug_trajectories, device):
+    """Compute one-step state-space reconstruction error statistics.
+
+    For each transition (x_t, u_t, x_{t+1}), computes:
+        x_pred = decode(predict(encode(x_t), u_t))
+        error  = ||x_{t+1} - x_pred||
+
+    All computations are in normalized state space (same space as epsilon_x).
+
+    Args:
+        model: KoopmanAutoencoder
+        aug_trajectories: list of (states, actions) where states are normalized
+        device: torch device
+
+    Returns:
+        err_mean: float
+        err_std: float
+    """
+    model.to(device)
+    model.eval()
+    all_state_errs = []
+    with torch.no_grad():
+        for states, actions in aug_trajectories:
+            states_t = torch.tensor(states, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
+            T_act = len(actions)
+            z_all = model.encode(states_t[:T_act])
+            z_pred = model.predict(z_all, actions_t[:T_act])
+            x_pred = model.decode(z_pred)
+            x_next = states_t[1:T_act + 1]
+            errs = torch.linalg.norm(x_next - x_pred, dim=-1)
+            all_state_errs.append(errs.cpu())
+    all_state_errs = torch.cat(all_state_errs)
+    return all_state_errs.mean().item(), all_state_errs.std().item()
+
+
+def count_steps_under_threshold(model, aug_trajectories, device, threshold, space="state"):
+    """Count transitions with one-step prediction error below a threshold.
+
+    Args:
+        model: KoopmanAutoencoder
+        aug_trajectories: list of (states, actions)
+        device: torch device
+        threshold: max error threshold
+        space: "state" for ||x_{t+1} - decode(predict(encode(x_t), u_t))||,
+               "latent" for ||z_{t+1} - predict(z_t, u_t)||
+
+    Returns:
+        count_under: int, number of steps under threshold
+        total: int, total number of steps
+        fraction: float, count_under / total
+    """
+    model.to(device)
+    model.eval()
+    all_errs = []
+    with torch.no_grad():
+        for states, actions in aug_trajectories:
+            states_t = torch.tensor(states, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
+            T_act = len(actions)
+            z_all = model.encode(states_t[:T_act])
+            z_pred = model.predict(z_all, actions_t[:T_act])
+            if space == "latent":
+                z_next = model.encode(states_t[1:T_act + 1])
+                errs = torch.linalg.norm(z_next - z_pred, dim=-1)
+            else:
+                x_pred = model.decode(z_pred)
+                x_next = states_t[1:T_act + 1]
+                errs = torch.linalg.norm(x_next - x_pred, dim=-1)
+            all_errs.append(errs.cpu())
+    all_errs = torch.cat(all_errs)
+    count_under = int((all_errs < threshold).sum().item())
+    total = len(all_errs)
+    return count_under, total, count_under / total
 
 
 def compute_max_latent_diff(model, cfg, device):
@@ -350,13 +427,40 @@ def alpha_bound(model, lqr, cfg, aug_trajectories, env, error_stats=None):
     # =====================================================================
     print("  " + "-" * 48)
 
-    err_mean, err_std = compute_latent_errors(model, aug_trajectories, device, error_stats)
-    R_val = err_mean + 2 * err_std
+    err_mean_latent, err_std_latent = compute_latent_errors(
+        model, aug_trajectories, device, error_stats)
+    R_latent = err_mean_latent + 2 * err_std_latent
 
-    print(f"  One-step latent error mean:             {err_mean:.6f}")
-    print(f"  One-step latent error std:              {err_std:.6f}")
-    print(f"  R (mean + 2σ):                          {R_val:.6f}")
-    print(f"  R / max_latent_diff:                    {R_val / max_latent_diff:.6f}")
+    print(f"  One-step latent error mean:             {err_mean_latent:.6f}")
+    print(f"  One-step latent error std:              {err_std_latent:.6f}")
+    print(f"  R_latent (mean + 2σ):                   {R_latent:.6f}")
+    print(f"  R_latent / max_latent_diff:             {R_latent / max_latent_diff:.6f}")
+
+    # =====================================================================
+    #  One-Step State Reconstruction Error
+    # =====================================================================
+    print("  " + "-" * 48)
+
+    err_mean_state, err_std_state = compute_state_recon_errors(
+        model, aug_trajectories, device)
+    R_state = err_mean_state + 2 * err_std_state
+
+    print(f"  One-step state recon error mean:        {err_mean_state:.6f}")
+    print(f"  One-step state recon error std:         {err_std_state:.6f}")
+    print(f"  R_state (mean + 2σ):                    {R_state:.6f}")
+
+    # Select R based on config
+    alpha_r_space = cfg.get("alpha_r_space", "state")
+    if alpha_r_space == "latent":
+        R_val = R_latent
+        print(f"  R = R_latent (alpha_r_space='latent'):  {R_val:.6f}")
+    else:
+        R_val = R_state
+        print(f"  R = R_state (alpha_r_space='state'):    {R_val:.6f}")
+
+    count_under, total, fraction = count_steps_under_threshold(
+        model, aug_trajectories, device, R_val, space=alpha_r_space)
+    print(f"  Steps under R:                         {count_under}/{total} ({fraction*100:.1f}%)")
 
     # # Δt distribution: ||z_{t+1}^ref - A * z_t^ref||
     # print("  " + "-" * 48)
@@ -406,7 +510,8 @@ def alpha_bound(model, lqr, cfg, aug_trajectories, env, error_stats=None):
     BtPB = compute_BtPB(lqr, B_mat, P_lqr)
 
     # Compute LQR rho_sq for reference (Q only on real state dims)
-    Q_lqr = torch.zeros(A.shape[0], A.shape[0])
+    q_eps_local = cfg.get("q_epsilon_scale", 0.0)
+    Q_lqr = torch.eye(A.shape[0]) * q_eps_local
     Q_lqr[:real_state_dim, :real_state_dim] = torch.eye(real_state_dim) * cfg.get("q_scale", 1.0)
     R_lqr_cost = torch.eye(cfg["action_dim"]) * cfg["r_scale"]
     Q_plus_FRF = Q_lqr + F_lqr.T @ R_lqr_cost @ F_lqr
@@ -493,6 +598,8 @@ def alpha_bound(model, lqr, cfg, aug_trajectories, env, error_stats=None):
     else:
         print(f"{GREEN}  γ_max (control-free, η=0):             {gamma_no_eta:.6f}{RESET}")
     print(f"  γ_max / R:                             {gamma_no_eta / R_val:.6f}" if R_val > 0 else "  γ_max / R:                             N/A")
+    c, t, f = count_steps_under_threshold(model, aug_trajectories, device, gamma_no_eta, space=alpha_r_space)
+    print(f"  Steps under γ_max:                     {c}/{t} ({f*100:.1f}%)")
     print(f"  " + "-" * 48)
 
     # gamma with config eta
@@ -502,6 +609,8 @@ def alpha_bound(model, lqr, cfg, aug_trajectories, env, error_stats=None):
     else:
         print(f"{GREEN}  γ_max (config η={eta:.4f}):              {gamma_config_eta:.6f}{RESET}")
     print(f"  γ_max / R:                             {gamma_config_eta / R_val:.6f}" if R_val > 0 else "  γ_max / R:                             N/A")
+    c, t, f = count_steps_under_threshold(model, aug_trajectories, device, gamma_config_eta, space=alpha_r_space)
+    print(f"  Steps under γ_max:                     {c}/{t} ({f*100:.1f}%)")
 
     # gamma with computed eta = max_displacement_x * L * (1 + ||A||)
     max_displacement_x = cfg.get("max_displacement_x", 0.1)
@@ -516,6 +625,8 @@ def alpha_bound(model, lqr, cfg, aug_trajectories, env, error_stats=None):
     else:
         print(f"{GREEN}  γ_max (computed η={eta_computed:.4f}):     {gamma_computed_eta:.6f}{RESET}")
     print(f"  γ_max / R:                             {gamma_computed_eta / R_val:.6f}" if R_val > 0 else "  γ_max / R:                             N/A")
+    c, t, f = count_steps_under_threshold(model, aug_trajectories, device, gamma_computed_eta, space=alpha_r_space)
+    print(f"  Steps under γ_max:                     {c}/{t} ({f*100:.1f}%)")
 
     variables = {
         "alpha_epsilon_x": float(epsilon_x),
@@ -529,8 +640,11 @@ def alpha_bound(model, lqr, cfg, aug_trajectories, env, error_stats=None):
         "gamma_max_alpha_config_eta": float(gamma_config_eta),
         "gamma_max_alpha_computed_eta": float(gamma_computed_eta),
         "ctrl_rank": int(ctrl_rank),
-        "latent_error_mean": float(err_mean),
-        "latent_error_std": float(err_std),
+        "latent_error_mean": float(err_mean_latent),
+        "latent_error_std": float(err_std_latent),
+        "state_recon_error_mean": float(err_mean_state),
+        "state_recon_error_std": float(err_std_state),
+        "alpha_r_space": alpha_r_space,
         "m_gx": float(m_gx) if m_gx is not None else None,
         "L_gx": float(L_gx) if L_gx is not None else None,
         "m_full": float(m_full) if m_full is not None else None,

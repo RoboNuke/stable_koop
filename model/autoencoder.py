@@ -26,7 +26,7 @@ class SchurK(nn.Module):
     def __init__(self, latent_dim, rho=0.95):
         super().__init__()
         self.rho = rho
-        self.K_param = nn.Parameter(torch.randn(latent_dim, latent_dim) * 0.01)
+        self.K_param = nn.Parameter(torch.randn(latent_dim, latent_dim))# * 0.01)
         self.latent_dim = latent_dim
 
     @property
@@ -72,12 +72,12 @@ class NormalK(nn.Module):
         d = torch.tanh(self.log_d) * self.rho
         return self.Q @ torch.diag(d) @ self.Q.T
 
+    def forward(self, z):
+        return z @ self.K.T
+
     @property
     def B_from_eigen(self):
         return self.Q @ self.b_eigen  # (latent_dim, action_dim)
-
-    def forward(self, z):
-        return z @ self.K.T
 
 
 class ComplexNormalK(nn.Module):
@@ -145,11 +145,12 @@ class KoopmanAutoencoder(nn.Module):
                  k_type="cayley", encoder_type="linear", rho=0.95,
                  encoder_spec_norm=False, encoder_latent=64,
                  prepend_state=False, prepend_control=False,
-                 real_state_dim=None):
+                 real_state_dim=None, obs_type="theta"):
         super().__init__()
 
         self.prepend_state = prepend_state
         self.prepend_control = prepend_control
+        self.obs_type = obs_type
         self.raw_state_dim = state_dim  # full input dim (includes action_dim if augmented)
         self.action_dim = action_dim
         self.real_state_dim = real_state_dim if real_state_dim is not None else state_dim
@@ -168,9 +169,16 @@ class KoopmanAutoencoder(nn.Module):
         self.encoder_type = encoder_type
         self._trig_encoder = (encoder_type == "trig")
 
+        self._identity_encoder = (encoder_type == "identity")
+
         if self._trig_encoder:
-            # Fixed trigonometric lifting: x → [sin(x[0]), cos(x[0])]
-            # No learned parameters. latent_dim should be 2.
+            # Fixed trigonometric lifting: pairs of (cos(θ)*θ̇^n, sin(θ)*θ̇^n)
+            # latent_dim must be even.
+            assert latent_dim % 2 == 0, \
+                f"trig encoder requires even latent_dim, got {latent_dim}"
+            self.encoder = None
+        elif self._identity_encoder:
+            # Identity: encoder and decoder are pass-through
             self.encoder = None
         elif encoder_type == "cayley":
             self.encoder = nn.Sequential(
@@ -196,14 +204,13 @@ class KoopmanAutoencoder(nn.Module):
                 nn.Linear(encoder_latent, latent_dim, bias=bias)
             )
 
-        if not self._trig_encoder and encoder_spec_norm:
+        if not self._trig_encoder and not self._identity_encoder and encoder_spec_norm:
             for layer in self.encoder:
                 if hasattr(layer, 'weight'):
                     nn.utils.parametrizations.spectral_norm(layer)
 
         # Decoder
-        if self._trig_encoder:
-            # Decode = extract first state_dim elements from latent
+        if self._trig_encoder or self._identity_encoder:
             self.decoder = None
         else:
             decoder_size = encoder_latent//2
@@ -231,8 +238,17 @@ class KoopmanAutoencoder(nn.Module):
             self.K_module = SchurK(actual_latent, rho)
         elif k_type == "unbounded":
             self.K_module = nn.Linear(actual_latent, actual_latent, bias=False)
+            # TEMP: initialize A with physics-informed structure
+            if actual_latent == 5:
+                dt = 0.01
+                with torch.no_grad():
+                    A_init = torch.rand(5, 5)
+                    A_init[0] = torch.tensor([1.0, 0.0, 0.0, 0.0, -dt/8.0])
+                    A_init[1] = torch.tensor([0.0, 1.0, 0.0, dt/8.0, 0.0])
+                    A_init[2] = torch.tensor([0.0, 0.75/8.0, 1.0, 0.0, 0.0])
+                    self.K_module.weight.copy_(A_init)
         elif k_type == "normalized":
-            self.b_from_k_mod = True
+            self.b_from_k_mod = False #True
             self.K_module = ComplexNormalK(actual_latent, action_dim, rho)
         else:
             raise NotImplementedError
@@ -243,9 +259,32 @@ class KoopmanAutoencoder(nn.Module):
 
     def encode(self, x):
         if self._trig_encoder:
-            # Fixed lifting: [sin(θ), cos(θ)] where θ = x[..., 0]
-            theta = x[..., 0:1]
-            g = torch.cat([torch.sin(theta), torch.cos(theta)], dim=-1)
+            # Fixed lifting: pairs of (cos(θ)*θ̇^n, sin(θ)*θ̇^n) for n=0,1,2,...
+            # Total: latent_dim dims (must be even)
+            if self.obs_type == "cos_sin":
+                # Input is [cos(θ), sin(θ), θ̇, ...]
+                # cos/sin and θ̇ are already in the prepended state,
+                # so start from n=1 to avoid redundancy
+                cos_th = x[..., 0:1]
+                sin_th = x[..., 1:2]
+                thdot = x[..., 2:3]
+                n_start = 1
+            else:
+                # Input is [θ, θ̇, ...]
+                theta = x[..., 0:1]
+                thdot = x[..., 1:2]
+                cos_th = torch.cos(theta)
+                sin_th = torch.sin(theta)
+                n_start = 0
+            n_pairs = self.encoder_latent_dim // 2
+            parts = []
+            for n in range(n_start, n_start + n_pairs):
+                scale = thdot ** n  # θ̇^n
+                parts.append(scale * cos_th)
+                parts.append(scale * sin_th)
+            g = torch.cat(parts, dim=-1)
+        elif self._identity_encoder:
+            g = x  # pass-through
         else:
             g = self.encoder(x)
         if self.prepend_state:
@@ -253,9 +292,15 @@ class KoopmanAutoencoder(nn.Module):
         return g
 
     def decode(self, z):
-        if self.prepend_state or self._trig_encoder:
-            # Return first state_dim elements (the raw state)
+        if self._identity_encoder:
+            return z
+        if self._trig_encoder:
+            # Trig: return first state_dim elements (the prepended raw state)
             return z[..., :self.raw_state_dim]
+        if self.prepend_state:
+            # Learned encoder with prepend: decode from g(x) portion
+            g = z[..., self.prepend_dim:]
+            return self.decoder(g)
         return self.decoder(z)
     def predict(self, z, u):
         if self.b_from_k_mod:

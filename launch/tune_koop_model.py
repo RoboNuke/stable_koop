@@ -94,7 +94,7 @@ def main():
                 "alpha_epsilon_x", "alpha_eta",
                 "controllable_subspace", "ctrl_threshold",
                 "q_scale", "r_scale", "scale_B",
-                "max_tracking_error_x", "max_displacement_x"):
+                "max_tracking_error_x", "max_displacement_x","alpha_r_space"):
         if key in tune_cfg:
             cfg[key] = tune_cfg[key]
 
