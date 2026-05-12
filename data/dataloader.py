@@ -1,7 +1,8 @@
-"""PyTorch dataset + canonical .npz reader for stable_koop datasets.
+"""Single canonical reader for raw stable_koop datasets.
 
-``load_dataset`` is the single point through which training scripts read
-stored trajectories — they never touch raw .npz files directly.
+The dataset on disk is just trajectories + per-dimension bounds — no
+augmentation, no normalization. Consumers (train_koopman, controller/lqr,
+eval) apply their own augmentation/normalization.
 """
 
 from __future__ import annotations
@@ -16,16 +17,33 @@ from torch.utils.data import Dataset
 
 @dataclass
 class LoadedDataset:
-    """In-memory dataset returned by :func:`load_dataset`."""
+    """In-memory raw dataset returned by :func:`load_dataset`."""
 
-    base_trajectories: list  # list of (states, actions)
-    perturbed_trajectories: list  # list of (states, base_actions, perturbations)
-    obs_scale: np.ndarray
-    act_scale: np.ndarray
+    trajectories: list
+    """List of ``(states, actions, base_actions, rewards)`` per trajectory."""
+
     state_dim: int
     action_dim: int
+
+    obs_space_low: np.ndarray
+    obs_space_high: np.ndarray
+    act_space_low: np.ndarray
+    act_space_high: np.ndarray
+    """Env action / observation space bounds (per dimension)."""
+
+    obs_min: np.ndarray
+    obs_max: np.ndarray
+    act_min: np.ndarray
+    act_max: np.ndarray
+    """Per-dimension min/max observed in the collected trajectories."""
+
+    perturbations_enabled: bool
     config_yaml: str
-    """Snapshot of the GatherDataCfg used to produce this dataset, as YAML text."""
+    """YAML snapshot of the GatherDataCfg used to produce this dataset."""
+
+    @property
+    def num_trajectories(self) -> int:
+        return len(self.trajectories)
 
 
 def load_dataset(dataset_name: str, datasets_dir: str | Path = "data/datasets") -> LoadedDataset:
@@ -35,28 +53,31 @@ def load_dataset(dataset_name: str, datasets_dir: str | Path = "data/datasets") 
         raise FileNotFoundError(f"Dataset not found: {path}")
     arr = np.load(path, allow_pickle=False)
 
-    num_base = int(arr["num_base_trajectories"])
-    num_pert = int(arr["num_pert_trajectories"])
-
-    base = []
-    for i in range(num_base):
-        base.append((arr[f"base_states_{i}"], arr[f"base_actions_{i}"]))
-    pert = []
-    for i in range(num_pert):
-        pert.append(
+    num = int(arr["num_trajectories"])
+    trajectories = []
+    for i in range(num):
+        trajectories.append(
             (
-                arr[f"pert_states_{i}"],
-                arr[f"pert_base_actions_{i}"],
-                arr[f"pert_perturbations_{i}"],
+                arr[f"states_{i}"],
+                arr[f"actions_{i}"],
+                arr[f"base_actions_{i}"],
+                arr[f"rewards_{i}"],
             )
         )
+
     return LoadedDataset(
-        base_trajectories=base,
-        perturbed_trajectories=pert,
-        obs_scale=arr["obs_scale"].astype(np.float32),
-        act_scale=arr["act_scale"].astype(np.float32),
-        state_dim=int(arr["state_dim"]) if "state_dim" in arr else int(arr["obs_scale"].shape[0]),
-        action_dim=int(arr["action_dim"]) if "action_dim" in arr else int(arr["act_scale"].shape[0]),
+        trajectories=trajectories,
+        state_dim=int(arr["state_dim"]),
+        action_dim=int(arr["action_dim"]),
+        obs_space_low=arr["obs_space_low"].astype(np.float32),
+        obs_space_high=arr["obs_space_high"].astype(np.float32),
+        act_space_low=arr["act_space_low"].astype(np.float32),
+        act_space_high=arr["act_space_high"].astype(np.float32),
+        obs_min=arr["obs_min"].astype(np.float32),
+        obs_max=arr["obs_max"].astype(np.float32),
+        act_min=arr["act_min"].astype(np.float32),
+        act_max=arr["act_max"].astype(np.float32),
+        perturbations_enabled=bool(arr["perturbations_enabled"]),
         config_yaml=str(arr["config_yaml"]),
     )
 
@@ -66,16 +87,15 @@ from data.gather_data import save_dataset  # noqa: E402
 
 
 class TrajectoryDataset(Dataset):
-    """Sliding-window dataset of ``(states[H+1], actions[H])`` per item.
+    """Sliding-window torch dataset of ``(states[H+1], actions[H])`` per item.
 
-    Consumes the (koopman_states, actions) pairs produced by
-    :func:`data.gather_data.augment_trajectories` /
-    :func:`data.gather_data.augment_perturbed_trajectories`.
+    Consumes a list of ``(koopman_states, koopman_actions)`` pairs produced
+    by ``train_koopman/augmentation.py``.
     """
 
-    def __init__(self, trajectories, horizon: int):
+    def __init__(self, augmented_trajectories, horizon: int):
         self.windows = []
-        for states, actions in trajectories:
+        for states, actions in augmented_trajectories:
             T = len(actions)
             for start in range(T - horizon + 1):
                 self.windows.append(

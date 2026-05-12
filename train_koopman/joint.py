@@ -1,13 +1,18 @@
-"""Joint training paradigm: encoder + A + B trained together on base trajectories.
+"""Joint training paradigm: encoder + A + B trained together.
 
-Base policy actions are the control input to B (no state augmentation).
-Used by ``TrainKoopmanCfg.approach = "joint"``.
+The applied actions drive B directly (no state augmentation). Used by
+``TrainKoopmanCfg.approach = "joint"``.
 """
 
 from __future__ import annotations
 
 from config.manager import TrainKoopmanCfg
 from data.dataloader import load_dataset
+from train_koopman.augmentation import (
+    env_act_scale,
+    env_obs_scale,
+    koopman_augment_joint,
+)
 from train_koopman.checkpointing import (
     build_koopman_model,
     make_device,
@@ -27,20 +32,19 @@ def run(cfg: TrainKoopmanCfg) -> str:
     flat["state_dim"] = ds.state_dim
     flat["action_dim"] = ds.action_dim
 
-    augment = False
-    model, _ = build_koopman_model(flat, augment=augment, device=device)
+    model, _ = build_koopman_model(flat, augment=False, device=device)
 
-    print(f"Observation scale: {ds.obs_scale}")
-    print(f"Action scale: {ds.act_scale}")
+    obs_scale = env_obs_scale(ds.obs_space_low, ds.obs_space_high)
+    act_scale = env_act_scale(ds.act_space_low, ds.act_space_high)
+    print(f"Observation scale: {obs_scale}")
+    print(f"Action scale: {act_scale}")
 
-    norm_trajectories = []
-    for states, actions in ds.base_trajectories:
-        norm_states = states / ds.obs_scale
-        norm_actions = actions / ds.act_scale
-        norm_trajectories.append((norm_states, norm_actions))
+    aug_trajectories = koopman_augment_joint(
+        ds.trajectories, obs_scale=obs_scale, act_scale=act_scale
+    )
 
     print("\n=== Joint Training: A + B + Encoder Together ===")
-    model = train(model, norm_trajectories, flat)
+    model = train(model, aug_trajectories, flat)
 
     save_checkpoint(model, flat, out_dir / "koopman_ckpt.pt")
     print(f"Checkpoint saved to {out_dir / 'koopman_ckpt.pt'}")

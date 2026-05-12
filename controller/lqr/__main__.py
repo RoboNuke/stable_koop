@@ -36,7 +36,11 @@ from controller.lqr.lqr_analysis import (
     setup_lqr,
 )
 from data.dataloader import load_dataset
-from data.gather_data import augment_perturbed_trajectories
+from train_koopman.augmentation import (
+    env_act_scale,
+    env_obs_scale,
+    koopman_augment_two_phase,
+)
 from train_koopman.checkpointing import build_koopman_model, load_checkpoint, make_device
 
 
@@ -81,14 +85,10 @@ def run(cfg: LQRControllerCfg) -> str:
 
     # Encoder Lipschitz against the dataset used for training.
     ds = load_dataset(koop_cfg["dataset_name"])
-    import numpy as np
-
-    koopman_obs_scale = np.concatenate([ds.obs_scale, ds.act_scale])
-    aug_trajectories = augment_perturbed_trajectories(
-        ds.perturbed_trajectories,
-        augment=True,
-        obs_scale=koopman_obs_scale,
-        act_scale=ds.act_scale,
+    obs_scale = env_obs_scale(ds.obs_space_low, ds.obs_space_high)
+    act_scale = env_act_scale(ds.act_space_low, ds.act_space_high)
+    aug_trajectories = koopman_augment_two_phase(
+        ds.trajectories, obs_scale=obs_scale, act_scale=act_scale
     )
     m_gx, L_gx, m_full, L_full = compute_encoder_lipschitz_bounds(
         model, aug_trajectories, device

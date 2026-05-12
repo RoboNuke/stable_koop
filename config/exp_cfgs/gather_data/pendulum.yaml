@@ -1,4 +1,6 @@
 # Data gathering for the pendulum experiment.
+# One call → one dataset. Toggle `perturbations.enabled` to switch between
+# base-policy-only data and perturbed data without changing anything else.
 
 gather_data_cfg:
   env_name: "Pendulum-v1"
@@ -20,15 +22,8 @@ gather_data_cfg:
       gamma: 0.9
       switch_angle: 30.0
 
-  perturbation:
-    analytical_B_policy: "none"   # "none", "energy", "bang_energy"
-    params:
-      kp: 10.0
-      kd: 2.0
-      ke: 1.0
-      gamma: 0.9
-      switch_angle: 30.0
-    normalize_analytical_B: false
+  perturbations:
+    enabled: true                 # set false for base-policy-only data
     perturb_scale: 1.0
     fix_perturb_range: false
     hold_steps: 5

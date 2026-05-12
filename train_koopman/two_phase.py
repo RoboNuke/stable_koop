@@ -15,7 +15,11 @@ import torch.nn as nn
 
 from config.manager import TrainKoopmanCfg
 from data.dataloader import load_dataset
-from data.gather_data import augment_perturbed_trajectories
+from train_koopman.augmentation import (
+    env_act_scale,
+    env_obs_scale,
+    koopman_augment_two_phase,
+)
 from train_koopman.checkpointing import (
     build_koopman_model,
     make_device,
@@ -71,22 +75,14 @@ def run(cfg: TrainKoopmanCfg) -> str:
     flat["state_dim"] = ds.state_dim
     flat["action_dim"] = ds.action_dim
 
-    # Currently the two-phase paradigm always augments the state with the
-    # base action. This matches the legacy run.py default behavior.
-    augment = True
-    model, _ = build_koopman_model(flat, augment=augment, device=device)
+    # Two-phase always augments the Koopman state with the base action,
+    # absorbing the base policy into the autonomous dynamics.
+    model, _ = build_koopman_model(flat, augment=True, device=device)
 
-    # When augmenting, the Koopman state is [obs; base_action]; its scale
-    # vector is the concatenation of obs_scale and act_scale.
-    import numpy as np
-    koopman_obs_scale = (
-        np.concatenate([ds.obs_scale, ds.act_scale]) if augment else ds.obs_scale
-    )
-    aug_trajectories = augment_perturbed_trajectories(
-        ds.perturbed_trajectories,
-        augment=augment,
-        obs_scale=koopman_obs_scale,
-        act_scale=ds.act_scale,
+    obs_scale = env_obs_scale(ds.obs_space_low, ds.obs_space_high)
+    act_scale = env_act_scale(ds.act_space_low, ds.act_space_high)
+    aug_trajectories = koopman_augment_two_phase(
+        ds.trajectories, obs_scale=obs_scale, act_scale=act_scale
     )
 
     # --- Phase 1: core losses only ---

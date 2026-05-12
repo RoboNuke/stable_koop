@@ -1,10 +1,29 @@
-"""Data-collection config: env, policy, perturbation, dataset I/O.
+"""Data-collection config: env, policy, optional perturbations, dataset I/O.
 
-The framework is environment-agnostic: env-specific knobs go in the
-free-form ``env_kwargs`` dict and are forwarded verbatim to the wrapper
-builder registered under :data:`data.env_builder.ENV_WRAPPERS`. Similarly,
-``BasePolicyCfg.params`` carries whatever per-policy kwargs the chosen
-policy expects.
+One gather call produces one dataset. The dataset is *raw*: just states,
+actions, rewards, and per-dimension bounds — no observation normalization,
+no state augmentation. Consumers (Koopman training, residual training,
+controller analysis) apply their own normalization and augmentation, so the
+same dataset can be reused across many configurations.
+
+Examples
+--------
+
+Base-policy data, no perturbations (for the Koopman model)::
+
+    gather_data_cfg:
+      env_name: "Pendulum-v1"
+      base_policy: {name: "bang_energy", params: {...}}
+      perturbations: {enabled: false}
+      dataset_name: "pendulum_bang_clean"
+
+Same base policy, with random perturbations (e.g., for residual seeding)::
+
+    gather_data_cfg:
+      env_name: "Pendulum-v1"
+      base_policy: {name: "bang_energy", params: {...}}
+      perturbations: {enabled: true, perturb_scale: 1.0, hold_steps: 5}
+      dataset_name: "pendulum_bang_perturbed"
 """
 
 from __future__ import annotations
@@ -15,46 +34,40 @@ from typing import Any
 
 @dataclasses.dataclass(kw_only=True)
 class BasePolicyCfg:
-    """Hand-designed policy used during data collection."""
+    """Hand-designed policy used to drive the env during data collection."""
 
     name: str
-    """Policy name registered in ``policy/__init__.py`` (e.g. ``none``,
-    ``energy``, ``bang_energy``, ``pd``). Required."""
+    """Policy name registered in ``policy/__init__.py``. Required."""
 
     params: dict[str, Any] = dataclasses.field(default_factory=dict)
-    """Free-form policy-specific kwargs forwarded to the policy constructor.
-    For pendulum: ``kp``, ``kd``, ``ke``, ``gamma``, ``switch_angle``. New
-    envs add their own keys; unknown keys are swallowed by the policy
-    classes' ``**_unused``."""
+    """Free-form policy-specific kwargs (e.g. ``kp``, ``kd``, ``ke`` for pendulum)."""
 
 
 @dataclasses.dataclass(kw_only=True)
 class PerturbationCfg:
-    """Action perturbation used to excite the system for B-matrix data."""
+    """Random action perturbations layered on top of the base policy."""
 
-    analytical_B_policy: str
-    """Underlying policy on which to layer perturbations. Required."""
+    enabled: bool = False
+    """When false, the base policy drives the env directly (no perturbations)."""
 
-    params: dict[str, Any] = dataclasses.field(default_factory=dict)
-    """Same shape as ``BasePolicyCfg.params``: forwarded to the policy."""
-
-    normalize_analytical_B: bool = False
     perturb_scale: float = 1.0
+    """Multiplier on env action-space bounds for sampled perturbations."""
     fix_perturb_range: bool = False
+    """If true, restrict perturbations to a range that won't saturate the
+    actuator given the current base action."""
     hold_steps: int = 5
+    """Number of env steps a sampled perturbation is held before resampling."""
 
 
 @dataclasses.dataclass(kw_only=True)
 class GatherDataCfg:
-    """Top-level data-gathering config."""
+    """Top-level data-gathering config — one call produces one dataset."""
 
     env_name: str
-    """Gymnasium env id (e.g. ``Pendulum-v1``). Required."""
+    """Gymnasium env id. Required."""
 
     env_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
-    """Env-specific wrapper kwargs forwarded to the builder registered in
-    :data:`data.env_builder.ENV_WRAPPERS` for ``env_name``. Empty is fine
-    for unwrapped envs."""
+    """Env-specific wrapper kwargs forwarded to the registered builder."""
 
     num_trajectories: int = 200
     max_episode_steps: int = 200
@@ -62,9 +75,7 @@ class GatherDataCfg:
     base_policy: BasePolicyCfg = dataclasses.field(
         default_factory=lambda: BasePolicyCfg(name="none")
     )
-    perturbation: PerturbationCfg = dataclasses.field(
-        default_factory=lambda: PerturbationCfg(analytical_B_policy="none")
-    )
+    perturbations: PerturbationCfg = dataclasses.field(default_factory=PerturbationCfg)
 
-    dataset_name: str = "pendulum_default"
+    dataset_name: str = "default"
     seed: int = 42

@@ -5,7 +5,7 @@ from config.manager.gather_data_cfg import (
     BasePolicyCfg,
     GatherDataCfg,
     PerturbationCfg,
-)
+)  # PerturbationCfg now carries `enabled: bool`
 from config.manager.train_koopman_cfg import (
     BFittingCfg,
     LossesCfg,

@@ -59,16 +59,19 @@ def run(cfg: EvalCfg) -> str:
     flat = _flat_eval_cfg(cfg)
 
     if cfg.eval_koopman_accuracy:
-        from data.gather_data import augment_perturbed_trajectories
         from eval.koopman_accuracy import evaluate_model
-
-        koopman_obs_scale = np.concatenate([ds.obs_scale, ds.act_scale])
-        aug_trajectories = augment_perturbed_trajectories(
-            ds.perturbed_trajectories,
-            augment=True,
-            obs_scale=koopman_obs_scale,
-            act_scale=ds.act_scale,
+        from train_koopman.augmentation import (
+            env_act_scale,
+            env_obs_scale,
+            koopman_augment_two_phase,
         )
+
+        obs_scale = env_obs_scale(ds.obs_space_low, ds.obs_space_high)
+        act_scale = env_act_scale(ds.act_space_low, ds.act_space_high)
+        aug_trajectories = koopman_augment_two_phase(
+            ds.trajectories, obs_scale=obs_scale, act_scale=act_scale
+        )
+        koopman_obs_scale = np.concatenate([obs_scale, act_scale])
         fig, error_stats, heatmap_data = evaluate_model(
             model,
             aug_trajectories,
