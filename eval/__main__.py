@@ -53,6 +53,8 @@ def run(cfg: EvalCfg) -> str:
     model, koop_cfg = _load_koopman(cfg.koopman_experiment_name, device)
     ds = load_dataset(koop_cfg["dataset_name"])
     gather_snap = yaml.safe_load(ds.config_yaml)["gather_data_cfg"]
+    env_name = gather_snap["env_name"]
+    env_kwargs = gather_snap.get("env_kwargs", {}) or {}
 
     flat = _flat_eval_cfg(cfg)
 
@@ -72,10 +74,12 @@ def run(cfg: EvalCfg) -> str:
             aug_trajectories,
             train_horizon=koop_cfg.get("horizon", 5),
             eval_horizon=koop_cfg.get("horizon", 5) + 1,
+            env_name=env_name,
             obs_scale=koopman_obs_scale.tolist(),
-            obs_type=koop_cfg.get("obs_type", "cos_sin"),
+            obs_type=env_kwargs.get("obs_type", "cos_sin"),
         )
-        fig.savefig(out_dir / "koopman_prediction_error.png", dpi=150, bbox_inches="tight")
+        if fig is not None:
+            fig.savefig(out_dir / "koopman_prediction_error.png", dpi=150, bbox_inches="tight")
         with (out_dir / "koopman_eval_stats.yaml").open("w") as f:
             yaml.dump(
                 {**error_stats, "heatmap": heatmap_data},
@@ -89,26 +93,23 @@ def run(cfg: EvalCfg) -> str:
         from eval.policy_rollout import evaluate
 
         env = make_eval_env(
-            env_name=gather_snap["env_name"],
+            env_name=env_name,
             num_parallel_evals=cfg.num_parallel_evals,
-            obs_type=gather_snap["obs_type"],
-            limited_spawn=gather_snap["limited_spawn"],
-            spawn_angle_range=gather_snap["spawn_angle_range"],
+            env_kwargs=env_kwargs,
         )
 
-        base_policy_params = {
-            k: v for k, v in gather_snap["base_policy"].items() if k != "name"
-        }
-        policy = make_policy(gather_snap["base_policy"]["name"], **base_policy_params)
+        base_policy_snap = gather_snap["base_policy"]
+        policy = make_policy(
+            base_policy_snap["name"], **base_policy_snap.get("params", {})
+        )
 
-        # Residual policy: not loaded by this minimal CLI; document hook.
         if cfg.residual_experiment_name is not None:
             print(
                 "[eval] Residual policy loading is not implemented in this entry; "
                 "use eval/comp_base_to_res_policy.py for combined eval."
             )
 
-        results, all_states, all_actions = evaluate(env, policy, flat)
+        results, all_states, all_actions = evaluate(env, policy, flat, env_name=env_name)
         with (out_dir / "base_eval_eval_stats.yaml").open("w") as f:
             yaml.dump(results, f, default_flow_style=False, sort_keys=False)
         save_dict = {}

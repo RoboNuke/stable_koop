@@ -219,27 +219,3 @@ def count_steps_under_threshold(model, aug_trajectories, device, threshold, spac
     return count_under, total, count_under / total
 
 
-def compute_max_latent_diff(model, cfg, device):
-    """Max latent-space distance between two pre-specified extreme states.
-
-    Uses ``(θ=0, θ̇=-8)`` and ``(θ=π, θ̇=8)``. Pendulum-specific extremes —
-    callers from other envs should provide their own analogue.
-    """
-    with torch.no_grad():
-        obs_type = cfg.get("obs_type", "cos_sin")
-        augment = cfg.get("augment_state", False)
-        if obs_type == "cos_sin":
-            x_origin = [1.0, 0.0, -8.0]
-            x_extreme = [-1.0, 0.0, 8.0]
-        else:
-            x_origin = [0.0, -8.0]
-            x_extreme = [np.pi, 8.0]
-        if augment:
-            action_dim = cfg["action_dim"]
-            x_origin = x_origin + [0.0] * action_dim
-            x_extreme = x_extreme + [0.0] * action_dim
-        x_origin = torch.tensor([x_origin], dtype=torch.float32, device=device)
-        x_extreme = torch.tensor([x_extreme], dtype=torch.float32, device=device)
-        z_origin = model.encode(x_origin)
-        z_extreme = model.encode(x_extreme)
-        return torch.linalg.norm(z_extreme - z_origin).item()

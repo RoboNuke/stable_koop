@@ -59,18 +59,18 @@ def run(cfg: TrainResidualCfg) -> str:
     lqr = _load_lqr(cfg.lqr_name)
     base_policy, gather_snap = _base_policy_from_dataset(koop_cfg["dataset_name"])
 
-    env_kwargs = dict(
-        env_name=gather_snap["env_name"],
-        obs_type=gather_snap["obs_type"],
-        limited_spawn=gather_snap["limited_spawn"],
-        spawn_angle_range=gather_snap["spawn_angle_range"],
-    )
+    env_name = gather_snap["env_name"]
+    env_kwargs = gather_snap.get("env_kwargs", {}) or {}
 
     def make_env_fn():
-        return make_single_env(**env_kwargs)
+        return make_single_env(env_name=env_name, env_kwargs=env_kwargs)
 
     def make_eval_env_fn():
-        return make_eval_env(num_parallel_evals=cfg.num_envs, **env_kwargs)
+        return make_eval_env(
+            env_name=env_name,
+            num_parallel_evals=cfg.num_envs,
+            env_kwargs=env_kwargs,
+        )
 
     # Build a flat cfg dict the legacy training code expects.
     flat = {
@@ -104,6 +104,9 @@ def run(cfg: TrainResidualCfg) -> str:
 
     from eval.policy_rollout import evaluate
 
+    def evaluate_for_env(env, policy, eval_cfg):
+        return evaluate(env, policy, eval_cfg, env_name=env_name)
+
     out_dir = Path("train_residual") / "weights" / cfg.experiment_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -116,7 +119,7 @@ def run(cfg: TrainResidualCfg) -> str:
         run_dir=str(out_dir),
         make_env_fn=make_env_fn,
         make_eval_env_fn=make_eval_env_fn,
-        evaluate_fn=evaluate,
+        evaluate_fn=evaluate_for_env,
         z_ref_limit=cfg.z_ref_limit,
     )
     return str(out_dir)
