@@ -1,0 +1,108 @@
+# Koopman training for the pendulum experiment.
+# Mirrors config/pendulum.yaml defaults verbatim.
+
+train_koopman_cfg:
+  approach: "two_phase"           # "two_phase" or "joint"
+  k_type: "normalized"            # "cayley", "schur", "normalized", "complex_normal", "unbounded"
+  encoder_type: "cayley"          # "linear" or "cayley"
+
+  state_dim: 3
+  action_dim: 1
+  latent_dim: 8
+  rho: 1.2
+  encoder_spec_norm: false
+  encoder_latent: 16
+  init_b_in_a: true
+  prepend_state: false
+  prepend_control: false
+
+  b_fitting:
+    method: "least_squares"       # "least_squares" or "gradient"
+    ctrl_lambda: 0.1
+    train_steps: 500
+    lr: 1.0e-3
+
+  horizon: 5
+  batch_size: 2048
+  num_workers: 4
+  lr: 1.0e-2
+  weight_decay: 1.0e-5
+  num_epochs: 100
+  recon_pretrain_epochs: 0
+  recon_pretrain_lr: 1.0e-3
+  recon_pretrain_bilip: false
+  recon_pretrain_bilip_weight: 1.0
+
+  loss_threshold: -10.0
+  scheduler_step: 100
+  scheduler_gamma: 0.5
+  cosine_scheduler: false
+  cosine_T_max: 200
+  cosine_eta_min: 1.0e-6
+  riemannian_optimizer: true
+  vectorize_rollout: true
+  torch_compile: false
+  grad_clip: false
+  grad_clip_type: "norm"
+  grad_clip_value: 1.0
+
+  losses:
+    recon_weight: 1.0
+    pred_weight: 1.0
+    latent_consistency_weight: 0.5
+
+    latent_rollout_loss: false
+    latent_rollout_weight: 1.0
+    x_pred_weight: 1.0
+
+    l_inf_pred_loss: false
+    l_inf_pred_weight: 1.0
+
+    controllability_loss: false
+    ctrl_weight: 0.1
+
+    bi_lipschitz_loss: true
+    bilip_weight: 2.0
+    bilip_m_target: 1.0
+
+    spectral_loss: false
+    spectral_weight: 0.01
+
+    normality_loss: false
+    normality_weight: 2.0
+
+    cl_normality_loss: false
+    cl_normality_weight: 1.0
+
+    b_eigen_loss: true
+    b_eigen_weight: 1.0
+    b_eigen_min_scale: 0.3
+
+    b_scale_loss: false
+    b_scale_weight: 1.0
+    b_scale_target: 1.0
+
+    b_min_sv_loss: false
+    b_min_sv_weight: 1.0
+    b_min_sv_target: 0.1
+
+    eig_spread_loss: true
+    eig_spread_weight: 1.0
+    eig_spread_min_gap: 0.1
+
+    unstable_ctrl_loss: true
+    unstable_ctrl_weight: 0.05
+    unstable_ctrl_threshold: 1.0
+
+    unit_circle_gap_loss: false
+    unit_circle_gap_weight: 1.0
+    unit_circle_gap: 0.05
+
+    upper_lipschitz_loss: false
+    upper_lip_weight: 1.0
+    upper_lip_m_max: 1.25
+
+  seed: 42
+  log_interval: 10
+  experiment_name: "pendulum_default"
+  dataset_name: "pendulum_default"

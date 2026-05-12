@@ -1,0 +1,18 @@
+# Evaluation for the pendulum experiment.
+
+eval_cfg:
+  num_parallel_evals: 16
+  eval_num_trajectories: 200
+  eval_max_steps: 200
+  eval_seed: 42
+
+  success_angle_deg: 15.0
+  success_max_thdot: 1.0
+  success_hold_steps: 20
+
+  eval_koopman_accuracy: true
+  eval_policy_rollout: true
+
+  koopman_experiment_name: "pendulum_default"
+  residual_experiment_name: null
+  results_name: "pendulum_default"
