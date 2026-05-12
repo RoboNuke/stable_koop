@@ -90,6 +90,18 @@ def compute_encoder_lipschitz(encoder, training_data):
     return m, L
 
 
+def compute_lower_lipschitz(encoder, training_data):
+    """Lower Lipschitz constant of ``encoder`` (min singular value of its Jacobian)."""
+    X = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in training_data])
+
+    def encode_single(x):
+        return encoder(x.unsqueeze(0)).squeeze(0)
+
+    J_batch = vmap(jacrev(encode_single))(X)
+    sigma_mins = torch.linalg.svdvals(J_batch)[:, -1]
+    return float(sigma_mins.min().detach())
+
+
 def compute_encoder_lipschitz_bounds(model, aug_trajectories, device):
     """Compute Lipschitz bounds for both ``g(x)`` and the full ``encode`` map."""
     if getattr(model, "_trig_encoder", False) or model.encoder is None:

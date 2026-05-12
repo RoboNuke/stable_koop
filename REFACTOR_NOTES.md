@@ -114,6 +114,8 @@ Deleted entirely. Add `output/` to `.gitignore` defensively in case any old code
 
 > **OPEN QUESTION 5**: Verification — `seed: 42` is currently used by `run.py` but the codebase has several `np.random`, `torch.manual_seed`, and `gymnasium.reset(seed=...)` call sites. Is the existing seed plumbing deterministic enough to expect bit-exact reproduction across old and new code, or should we relax the tolerance? (Plan: try bit-exact first; if it fails, present diff to Hunter and choose tolerance.)
 
+> **NOTE — pre-existing test failure**: `tests/test_koopman.py::TestKoopmanAutoencoder::test_b_init_zeros` fails on the refactor branch and on `main` alike. The test expects `B` to be initialized to zeros, but in `model/autoencoder.py` (legacy) and `models/koopman.py` (refactored) the `nn.init.zeros_(self.B.weight)` line is commented out — so kaiming-uniform init is used instead. This is a stale test, not a regression. 43 / 44 tests pass.
+
 ---
 
 ## 6. Migration progress (delete entries as done)

@@ -12,7 +12,7 @@ import os
 
 sys.path.insert(0, "/mnt/user-data/uploads")
 
-from model.utils import (
+from controller.controller_analysis import (
     spectral_radius,
     transient_constant,
     compute_lower_lipschitz,
@@ -20,8 +20,9 @@ from model.utils import (
     latent_error_to_state_error,
     state_error_to_latent_error,
 )
-from controllers.lqr import LQR
-from model.autoencoder import KoopmanAutoencoder, CayleyK, SchurK
+from controller.lqr.lqr import LQR
+from models.koopman import KoopmanAutoencoder
+from models.a_parameterizations import CayleyK, SchurK
 
 
 # ─────────────────────────────────────────────
