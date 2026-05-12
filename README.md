@@ -90,5 +90,10 @@ experiment name, edit the strings to match, and run ``launch/run_all.sh <name>``
 ## Tests
 
 ```
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_koopman.py
+bash launch/test.sh
 ```
+
+The launcher unsets ``PYTHONPATH`` before invoking ``pytest`` to keep a
+shell-sourced ROS humble ``PYTHONPATH`` (Python 3.10 site-packages) from
+leaking into ``koop_env``. All ``launch/*.sh`` do the same so the pipeline
+stages aren't affected either.

@@ -11,9 +11,9 @@ lqr_controller_cfg:
   ctrl_threshold: null            # null = machine epsilon default
 
   stability_analysis:
-    use_eigen_bound: true
+    use_eigen_bound: false
     use_lyapunov_bound: true
-    use_m_free_bound: false
+    use_m_free_bound: true
     optimize_lyapunov_P: true
     use_alpha_bound: false
     alpha_epsilon_x: 0.3
