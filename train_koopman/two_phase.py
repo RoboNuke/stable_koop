@@ -14,12 +14,8 @@ import dataclasses
 import torch.nn as nn
 
 from config.manager import TrainKoopmanCfg
+from data.augmentation import augment_trajectories
 from data.dataloader import load_dataset
-from train_koopman.augmentation import (
-    env_act_scale,
-    env_obs_scale,
-    koopman_augment_two_phase,
-)
 from train_koopman.checkpointing import (
     build_koopman_model,
     make_device,
@@ -47,8 +43,10 @@ _PHASE1_DISABLED_LOSSES = (
 def cfg_to_flat_dict(cfg: TrainKoopmanCfg) -> dict:
     """Flatten a :class:`TrainKoopmanCfg` into the legacy pendulum.yaml dict shape.
 
-    The loss-builder + training loop were written against a flat dict; flattening
-    here preserves bit-exact behavior with the legacy code paths.
+    The augmentation config is also flattened (``prepend_base_action``,
+    ``use_action_delta``, ``obs_scale_source``, ``act_scale_source``) so the
+    saved checkpoint cfg carries exactly the projection the model was trained
+    against — downstream consumers reload it.
     """
     flat = {}
     for f in dataclasses.fields(cfg):
@@ -57,7 +55,6 @@ def cfg_to_flat_dict(cfg: TrainKoopmanCfg) -> dict:
             flat.update(dataclasses.asdict(v))
         else:
             flat[f.name] = v
-    # Bring B-fitting subfields into top-level names matching the legacy YAML.
     flat["train_for_B"] = cfg.b_fitting.method != "least_squares"
     flat["analytical_B_ctrl_lambda"] = cfg.b_fitting.ctrl_lambda
     flat["analytical_B_train_steps"] = cfg.b_fitting.train_steps
@@ -75,15 +72,10 @@ def run(cfg: TrainKoopmanCfg) -> str:
     flat["state_dim"] = ds.state_dim
     flat["action_dim"] = ds.action_dim
 
-    # Two-phase always augments the Koopman state with the base action,
-    # absorbing the base policy into the autonomous dynamics.
-    model, _ = build_koopman_model(flat, augment=True, device=device)
+    augment = cfg.augmentation.prepend_base_action
+    model, _ = build_koopman_model(flat, augment=augment, device=device)
 
-    obs_scale = env_obs_scale(ds.obs_space_low, ds.obs_space_high)
-    act_scale = env_act_scale(ds.act_space_low, ds.act_space_high)
-    aug_trajectories = koopman_augment_two_phase(
-        ds.trajectories, obs_scale=obs_scale, act_scale=act_scale
-    )
+    aug_trajectories = augment_trajectories(ds, cfg.augmentation)
 
     # --- Phase 1: core losses only ---
     print("\n=== Phase 1: Pre-Train Koopman Model (Core Losses Only) ===")

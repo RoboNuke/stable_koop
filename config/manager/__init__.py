@@ -1,6 +1,7 @@
 """Re-exports for the stable_koop config manager."""
 
 from config.manager.manager import ConfigManager
+from config.manager.augmentation_cfg import AugmentationCfg
 from config.manager.gather_data_cfg import (
     BasePolicyCfg,
     GatherDataCfg,
@@ -19,6 +20,7 @@ from config.manager.train_residual_cfg import TrainResidualCfg
 from config.manager.eval_cfg import EvalCfg
 
 __all__ = [
+    "AugmentationCfg",
     "ConfigManager",
     "BasePolicyCfg",
     "GatherDataCfg",

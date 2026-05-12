@@ -59,19 +59,24 @@ def run(cfg: EvalCfg) -> str:
     flat = _flat_eval_cfg(cfg)
 
     if cfg.eval_koopman_accuracy:
+        from config.manager import AugmentationCfg
+        from data.augmentation import augment_trajectories, compute_act_scale, compute_obs_scale
         from eval.koopman_accuracy import evaluate_model
-        from train_koopman.augmentation import (
-            env_act_scale,
-            env_obs_scale,
-            koopman_augment_two_phase,
-        )
 
-        obs_scale = env_obs_scale(ds.obs_space_low, ds.obs_space_high)
-        act_scale = env_act_scale(ds.act_space_low, ds.act_space_high)
-        aug_trajectories = koopman_augment_two_phase(
-            ds.trajectories, obs_scale=obs_scale, act_scale=act_scale
+        aug_cfg = AugmentationCfg(
+            prepend_base_action=koop_cfg["prepend_base_action"],
+            use_action_delta=koop_cfg["use_action_delta"],
+            obs_scale_source=koop_cfg.get("obs_scale_source", "env"),
+            act_scale_source=koop_cfg.get("act_scale_source", "env"),
         )
-        koopman_obs_scale = np.concatenate([obs_scale, act_scale])
+        aug_trajectories = augment_trajectories(ds, aug_cfg)
+        obs_scale = compute_obs_scale(aug_cfg, ds)
+        act_scale = compute_act_scale(aug_cfg, ds)
+        koopman_obs_scale = (
+            np.concatenate([obs_scale, act_scale])
+            if aug_cfg.prepend_base_action and obs_scale is not None and act_scale is not None
+            else obs_scale
+        )
         fig, error_stats, heatmap_data = evaluate_model(
             model,
             aug_trajectories,

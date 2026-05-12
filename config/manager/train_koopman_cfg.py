@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import dataclasses
 
+from config.manager.augmentation_cfg import AugmentationCfg
+
 
 @dataclasses.dataclass(kw_only=True)
 class LossesCfg:
@@ -119,6 +121,11 @@ class TrainKoopmanCfg:
     """Prepend raw state x to latent: z = [x; g(x)]."""
     prepend_control: bool = False
     """Include u_base in prepended dims."""
+
+    # Data projection from raw dataset → (koopman_state, koopman_action).
+    augmentation: AugmentationCfg
+    """Required — paradigm-specific. Two-phase uses
+    ``prepend_base_action=True, use_action_delta=True``; joint uses both False."""
 
     # B fitting
     b_fitting: BFittingCfg = dataclasses.field(

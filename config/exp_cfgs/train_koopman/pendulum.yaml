@@ -14,6 +14,12 @@ train_koopman_cfg:
   prepend_state: false
   prepend_control: false
 
+  augmentation:                   # how the dataset is projected for training
+    prepend_base_action: true     # two-phase: state ← [obs; base_action]
+    use_action_delta: true        # koopman action ← (action − base_action)
+    obs_scale_source: "env"       # "env", "observed", or "none"
+    act_scale_source: "env"
+
   b_fitting:
     method: "least_squares"       # "least_squares" or "gradient"
     ctrl_lambda: 0.1

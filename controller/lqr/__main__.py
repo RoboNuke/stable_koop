@@ -35,12 +35,9 @@ from controller.lqr.lqr_analysis import (
     run_sdp_optimization,
     setup_lqr,
 )
+from config.manager import AugmentationCfg
+from data.augmentation import augment_trajectories
 from data.dataloader import load_dataset
-from train_koopman.augmentation import (
-    env_act_scale,
-    env_obs_scale,
-    koopman_augment_two_phase,
-)
 from train_koopman.checkpointing import build_koopman_model, load_checkpoint, make_device
 
 
@@ -83,13 +80,16 @@ def run(cfg: LQRControllerCfg) -> str:
     print(f"  B largest singular value:              {B_sigma_max:.6f}")
     ctrl_rank = control_analysis(A, B_mat)
 
-    # Encoder Lipschitz against the dataset used for training.
+    # Encoder Lipschitz against the dataset used for training. Augmentation
+    # matches what the Koopman checkpoint was trained with.
     ds = load_dataset(koop_cfg["dataset_name"])
-    obs_scale = env_obs_scale(ds.obs_space_low, ds.obs_space_high)
-    act_scale = env_act_scale(ds.act_space_low, ds.act_space_high)
-    aug_trajectories = koopman_augment_two_phase(
-        ds.trajectories, obs_scale=obs_scale, act_scale=act_scale
+    aug_cfg = AugmentationCfg(
+        prepend_base_action=koop_cfg["prepend_base_action"],
+        use_action_delta=koop_cfg["use_action_delta"],
+        obs_scale_source=koop_cfg.get("obs_scale_source", "env"),
+        act_scale_source=koop_cfg.get("act_scale_source", "env"),
     )
+    aug_trajectories = augment_trajectories(ds, aug_cfg)
     m_gx, L_gx, m_full, L_full = compute_encoder_lipschitz_bounds(
         model, aug_trajectories, device
     )
