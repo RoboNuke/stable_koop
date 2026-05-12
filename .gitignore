@@ -1,6 +1,24 @@
 __pycache__/
 *.pyc
-*.png
-*.npz
-checkpoints/
+
+# Stage outputs (gitignored — produced by running the pipeline)
+data/datasets/
+train_koopman/weights/
+train_residual/weights/
+controller/lqr/weights/
+eval/results/
+
+# Legacy artifacts (kept ignored defensively)
 output/
+checkpoints/
+
+# Binary artifacts
+*.pt
+*.npz
+*.npy
+*.png
+
+# Tooling
+wandb/
+.venv/
+.DS_Store
