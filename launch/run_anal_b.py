@@ -204,7 +204,7 @@ def main():
     train_env = make_single_env(cfg)
 
     RED = "\033[91m"
-    RESET = "\033[0m"
+    RESET = "\033[0m"alpha_r_space
 
     policy = make_base_policy(cfg)
     if cfg.get("base_policy", "none") == "none":
