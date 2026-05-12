@@ -22,3 +22,4 @@ checkpoints/
 wandb/
 .venv/
 .DS_Store
+.claude/
