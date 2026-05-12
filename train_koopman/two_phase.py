@@ -55,10 +55,6 @@ def cfg_to_flat_dict(cfg: TrainKoopmanCfg) -> dict:
             flat.update(dataclasses.asdict(v))
         else:
             flat[f.name] = v
-    flat["train_for_B"] = cfg.b_fitting.method != "least_squares"
-    flat["analytical_B_ctrl_lambda"] = cfg.b_fitting.ctrl_lambda
-    flat["analytical_B_train_steps"] = cfg.b_fitting.train_steps
-    flat["analytical_B_lr"] = cfg.b_fitting.lr
     return flat
 
 

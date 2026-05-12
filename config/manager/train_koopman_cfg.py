@@ -1,8 +1,14 @@
-"""Koopman-training config: paradigm, model parameterization, B-fitting, losses.
+"""Koopman-training config: paradigm, model parameterization, losses.
 
 Field defaults mirror ``config/pendulum.yaml`` exactly. Enum-like choices
-(``approach``, ``k_type``, ``encoder_type``, ``b_fitting_method``) are required
-(no default) so a YAML must name them explicitly.
+(``approach``, ``k_type``, ``encoder_type``) are required (no default) so a
+YAML must name them explicitly.
+
+B is learned by the gradient-descent training loop alongside the rest of
+the model — there is no separate B-fitting step in either paradigm. Standalone
+B-fit routines (least-squares pseudoinverse, gradient with controllability
+regularization) live in :mod:`train_koopman.b_fitting` for ad-hoc use against
+a saved Koopman A, but they are not invoked by the training pipeline.
 """
 
 from __future__ import annotations
@@ -79,22 +85,6 @@ class LossesCfg:
 
 
 @dataclasses.dataclass(kw_only=True)
-class BFittingCfg:
-    """B-matrix fitting method + hyperparameters."""
-
-    method: str
-    """``least_squares`` (closed-form pseudoinverse) or ``gradient`` (gradient
-    descent with controllability regularization). Required."""
-
-    ctrl_lambda: float = 0.1
-    """Controllability regularization weight (gradient method only)."""
-    train_steps: int = 500
-    """Optimization steps (gradient method only)."""
-    lr: float = 1.0e-3
-    """Learning rate (gradient method only)."""
-
-
-@dataclasses.dataclass(kw_only=True)
 class TrainKoopmanCfg:
     """Top-level Koopman-training config."""
 
@@ -126,11 +116,6 @@ class TrainKoopmanCfg:
     augmentation: AugmentationCfg
     """Required — paradigm-specific. Two-phase uses
     ``prepend_base_action=True, use_action_delta=True``; joint uses both False."""
-
-    # B fitting
-    b_fitting: BFittingCfg = dataclasses.field(
-        default_factory=lambda: BFittingCfg(method="least_squares")
-    )
 
     # Training
     horizon: int = 5

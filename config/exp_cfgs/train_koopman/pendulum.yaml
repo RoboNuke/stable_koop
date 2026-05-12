@@ -20,12 +20,6 @@ train_koopman_cfg:
     obs_scale_source: "env"       # "env", "observed", or "none"
     act_scale_source: "env"
 
-  b_fitting:
-    method: "least_squares"       # "least_squares" or "gradient"
-    ctrl_lambda: 0.1
-    train_steps: 500
-    lr: 1.0e-3
-
   horizon: 5
   batch_size: 2048
   num_workers: 4
