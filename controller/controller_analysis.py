@@ -193,6 +193,32 @@ def compute_state_recon_errors(model, aug_trajectories, device):
     return all_errs.mean().item(), all_errs.std().item()
 
 
+def compute_max_latent_diff_observed(model, aug_trajectories, device) -> float:
+    """Latent-space diameter approximated from the encoded training data.
+
+    Encodes every state in ``aug_trajectories``, takes the per-dimension
+    min and max across the resulting latent vectors, and returns the
+    Euclidean distance between those corners. Env-agnostic — no hand-picked
+    extremes.
+    """
+    model.to(device)
+    model.eval()
+    z_min = None
+    z_max = None
+    with torch.no_grad():
+        for states, _actions in aug_trajectories:
+            z = model.encode(
+                torch.tensor(states, dtype=torch.float32, device=device)
+            )
+            if z_min is None:
+                z_min = z.min(dim=0).values
+                z_max = z.max(dim=0).values
+            else:
+                z_min = torch.minimum(z_min, z.min(dim=0).values)
+                z_max = torch.maximum(z_max, z.max(dim=0).values)
+    return torch.linalg.norm(z_max - z_min).item()
+
+
 def count_steps_under_threshold(model, aug_trajectories, device, threshold, space="state"):
     """Count transitions with one-step prediction error below ``threshold``."""
     model.to(device)

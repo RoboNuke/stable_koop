@@ -19,7 +19,7 @@ from controller.lqr.lqr import LQR
 from data.dataloader import load_dataset
 from data.env_builder import make_eval_env
 from policy import make_policy
-from train_koopman.checkpointing import build_koopman_model, make_device
+from train_koopman.checkpointing import load_koopman_experiment, make_device
 
 
 def _flat_eval_cfg(cfg: EvalCfg) -> dict:
@@ -34,23 +34,12 @@ def _flat_eval_cfg(cfg: EvalCfg) -> dict:
     }
 
 
-def _load_koopman(experiment_name: str, device):
-    ckpt_path = Path("train_koopman") / "weights" / experiment_name / "koopman_ckpt.pt"
-    raw = torch.load(ckpt_path, map_location=device)
-    koop_cfg = raw["config"]
-    model, _ = build_koopman_model(koop_cfg, augment=True, device=device)
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw["model"].items()}
-    model.load_state_dict(state_dict)
-    model.eval()
-    return model, koop_cfg
-
-
 def run(cfg: EvalCfg) -> str:
     device = make_device()
     out_dir = Path("eval") / "results" / cfg.results_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model, koop_cfg = _load_koopman(cfg.koopman_experiment_name, device)
+    model, koop_cfg = load_koopman_experiment(cfg.koopman_experiment_name, device)
     ds = load_dataset(koop_cfg["dataset_name"])
     gather_snap = yaml.safe_load(ds.config_yaml)["gather_data_cfg"]
     env_name = gather_snap["env_name"]

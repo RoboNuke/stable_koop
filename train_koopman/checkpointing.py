@@ -83,3 +83,25 @@ def weights_dir(experiment_name: str) -> Path:
     out = Path("train_koopman") / "weights" / experiment_name
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def load_koopman_experiment(experiment_name: str, device: torch.device):
+    """Canonical one-call loader for a trained Koopman experiment.
+
+    Reads ``train_koopman/weights/<experiment_name>/koopman_ckpt.pt``,
+    builds a :class:`KoopmanAutoencoder` with the matching augmentation
+    (``augment = cfg["prepend_base_action"]`` so joint-trained models
+    don't get an extra augmented dim), loads the state dict (stripping
+    ``_orig_mod.`` from torch-compiled keys), and returns
+    ``(model, koop_cfg_flat)``.
+    """
+    ckpt_path = Path("train_koopman") / "weights" / experiment_name / "koopman_ckpt.pt"
+    raw = torch.load(ckpt_path, map_location=device)
+    koop_cfg = raw["config"]
+    augment = bool(koop_cfg.get("prepend_base_action", True))
+    model, _ = build_koopman_model(koop_cfg, augment=augment, device=device)
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw["model"].items()}
+    model.load_state_dict(state_dict)
+    model.eval()
+    print(f"Loaded Koopman weights from {ckpt_path} (augment={augment})")
+    return model, koop_cfg

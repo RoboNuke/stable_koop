@@ -19,18 +19,7 @@ from data.dataloader import load_dataset
 from data.env_builder import make_eval_env, make_single_env
 from controller.lqr.lqr import LQR
 from policy import make_policy
-from train_koopman.checkpointing import build_koopman_model, make_device
-
-
-def _load_koopman_artifacts(experiment_name: str, device):
-    ckpt_path = Path("train_koopman") / "weights" / experiment_name / "koopman_ckpt.pt"
-    raw = torch.load(ckpt_path, map_location=device)
-    koop_cfg = raw["config"]
-    model, _ = build_koopman_model(koop_cfg, augment=True, device=device)
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw["model"].items()}
-    model.load_state_dict(state_dict)
-    model.eval()
-    return model, koop_cfg
+from train_koopman.checkpointing import load_koopman_experiment, make_device
 
 
 def _load_lqr(name: str):
@@ -55,7 +44,7 @@ def _base_policy_from_dataset(dataset_name: str):
 
 def run(cfg: TrainResidualCfg) -> str:
     device = make_device()
-    model, koop_cfg = _load_koopman_artifacts(cfg.koopman_experiment_name, device)
+    model, koop_cfg = load_koopman_experiment(cfg.koopman_experiment_name, device)
     lqr = _load_lqr(cfg.lqr_name)
     base_policy, gather_snap = _base_policy_from_dataset(koop_cfg["dataset_name"])
 
