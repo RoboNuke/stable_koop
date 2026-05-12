@@ -106,8 +106,8 @@ class TrainKoopmanCfg:
     """Encoder family: ``linear`` or ``cayley``. Required."""
 
     # Architecture
-    state_dim: int = 3
-    action_dim: int = 1
+    # state_dim and action_dim are derived from the dataset at training time
+    # (env.observation_space and env.action_space, captured by gather_data).
     latent_dim: int = 8
     rho: float = 1.2
     """Spectral-radius bound for stable A parameterizations."""

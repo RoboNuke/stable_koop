@@ -68,6 +68,8 @@ def run(cfg: TrainKoopmanCfg) -> str:
 
     device = make_device()
     ds = load_dataset(cfg.dataset_name)
+    flat["state_dim"] = ds.state_dim
+    flat["action_dim"] = ds.action_dim
 
     # Currently the two-phase paradigm always augments the state with the
     # base action. This matches the legacy run.py default behavior.

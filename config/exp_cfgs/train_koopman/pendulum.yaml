@@ -6,8 +6,6 @@ train_koopman_cfg:
   k_type: "normalized"            # "cayley", "schur", "normalized", "complex_normal", "unbounded"
   encoder_type: "cayley"          # "linear" or "cayley"
 
-  state_dim: 3
-  action_dim: 1
   latent_dim: 8
   rho: 1.2
   encoder_spec_norm: false

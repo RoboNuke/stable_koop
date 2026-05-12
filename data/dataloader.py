@@ -22,6 +22,8 @@ class LoadedDataset:
     perturbed_trajectories: list  # list of (states, base_actions, perturbations)
     obs_scale: np.ndarray
     act_scale: np.ndarray
+    state_dim: int
+    action_dim: int
     config_yaml: str
     """Snapshot of the GatherDataCfg used to produce this dataset, as YAML text."""
 
@@ -53,6 +55,8 @@ def load_dataset(dataset_name: str, datasets_dir: str | Path = "data/datasets") 
         perturbed_trajectories=pert,
         obs_scale=arr["obs_scale"].astype(np.float32),
         act_scale=arr["act_scale"].astype(np.float32),
+        state_dim=int(arr["state_dim"]) if "state_dim" in arr else int(arr["obs_scale"].shape[0]),
+        action_dim=int(arr["action_dim"]) if "action_dim" in arr else int(arr["act_scale"].shape[0]),
         config_yaml=str(arr["config_yaml"]),
     )
 

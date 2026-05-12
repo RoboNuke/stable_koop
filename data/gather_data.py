@@ -193,27 +193,18 @@ def gather(cfg: GatherDataCfg) -> Path:
 
     Returns the written file path.
     """
-    env = make_single_env(
-        env_name=cfg.env_name,
-        obs_type=cfg.obs_type,
-        limited_spawn=cfg.limited_spawn,
-        spawn_angle_range=cfg.spawn_angle_range,
-    )
+    env = make_single_env(env_name=cfg.env_name, env_kwargs=cfg.env_kwargs)
 
-    policy_params = {
-        k: v
-        for k, v in dataclasses.asdict(cfg.base_policy).items()
-        if k != "name"
-    }
-    base_policy = make_policy(cfg.base_policy.name, **policy_params)
-
-    perturb_policy_params = policy_params  # share kp/kd/etc. with base
+    base_policy = make_policy(cfg.base_policy.name, **cfg.base_policy.params)
     perturb_policy = make_policy(
-        cfg.perturbation.analytical_B_policy, **perturb_policy_params
+        cfg.perturbation.analytical_B_policy, **cfg.perturbation.params
     )
 
-    print(f"[gather_data] env={cfg.env_name} obs_type={cfg.obs_type} "
-          f"base_policy={cfg.base_policy.name} perturb_policy={cfg.perturbation.analytical_B_policy}")
+    print(
+        f"[gather_data] env={cfg.env_name} env_kwargs={cfg.env_kwargs} "
+        f"base_policy={cfg.base_policy.name} "
+        f"perturb_policy={cfg.perturbation.analytical_B_policy}"
+    )
 
     base_trajs = collect_data(
         env,
@@ -267,6 +258,8 @@ def save_dataset(
     save_dict = {
         "obs_scale": obs_scale,
         "act_scale": act_scale,
+        "state_dim": np.array(int(obs_scale.shape[0])),
+        "action_dim": np.array(int(act_scale.shape[0])),
         "num_base_trajectories": np.array(len(base_trajectories)),
         "num_pert_trajectories": np.array(len(perturbed_trajectories)),
         "config_yaml": np.array(

@@ -24,6 +24,8 @@ def run(cfg: TrainKoopmanCfg) -> str:
 
     device = make_device()
     ds = load_dataset(cfg.dataset_name)
+    flat["state_dim"] = ds.state_dim
+    flat["action_dim"] = ds.action_dim
 
     augment = False
     model, _ = build_koopman_model(flat, augment=augment, device=device)

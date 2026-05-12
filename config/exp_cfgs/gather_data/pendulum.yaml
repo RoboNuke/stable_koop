@@ -1,28 +1,33 @@
 # Data gathering for the pendulum experiment.
-# Mirrors config/pendulum.yaml defaults so the gather stage reproduces existing behavior.
 
 gather_data_cfg:
   env_name: "Pendulum-v1"
-  obs_type: "cos_sin"            # "cos_sin" (3D) or "theta" (2D)
+  env_kwargs:
+    obs_type: "cos_sin"            # "cos_sin" (3D) or "theta" (2D)
+    limited_spawn: false
+    spawn_angle_range: 180.0
+    friction_coeff: 0.0
 
   num_trajectories: 200
   max_episode_steps: 200
-  limited_spawn: false
-  spawn_angle_range: 180.0
-
-  state_dim: 3
-  action_dim: 1
 
   base_policy:
     name: "none"                  # "none", "energy", "bang_energy", "pd"
-    kp: 10.0
-    kd: 2.0
-    ke: 1.0
-    gamma: 0.9
-    switch_angle: 30.0
+    params:
+      kp: 10.0
+      kd: 2.0
+      ke: 1.0
+      gamma: 0.9
+      switch_angle: 30.0
 
   perturbation:
     analytical_B_policy: "none"   # "none", "energy", "bang_energy"
+    params:
+      kp: 10.0
+      kd: 2.0
+      ke: 1.0
+      gamma: 0.9
+      switch_angle: 30.0
     normalize_analytical_B: false
     perturb_scale: 1.0
     fix_perturb_range: false
