@@ -1,52 +1,55 @@
-# Koopman training for the pendulum experiment.
-# Mirrors config/pendulum.yaml defaults verbatim.
+# Koopman training for InvertedPendulum-v4.
+# Joint paradigm with analytical B refit on the perturbed dataset (mirrors
+# the legacy A-then-B flow): the base dataset has identical action and
+# base_action, so `use_action_delta: true` produces a zero action channel
+# during joint training → only A learns. The analytical B refit then runs
+# on the perturbed dataset.
 
 train_koopman_cfg:
-  approach: "joint"           # "two_phase" or "joint"
-  k_type: "schur"            # "cayley", "schur", "normalized", "complex_normal", "unbounded"
-  encoder_type: "trig"          # "linear" or "trig"
+  approach: "joint"
+  k_type: "unbounded"
+  encoder_type: "linear"                # learned encoder (no env-specific trig lift)
 
-  latent_dim: 2 
-  rho: 0.95
+  latent_dim: 4
+  rho: 1.2
   encoder_spec_norm: false
-  encoder_latent: 16
-  init_b_in_a: false
-  # prepending on latent side
+  encoder_latent: 80
+  init_b_in_a: true
   prepend_state: true
   prepend_control: false
 
-  augmentation:                   # how the dataset is projected for training
-    #prepending on observation
-    prepend_base_action: false     # two-phase: state ← [obs; base_action]
-    use_action_delta: true        # koopman action ← (action − base_action)
-    obs_scale_source: "env"       # "env", "observed", or "none"
+  augmentation:
+    prepend_base_action: false
+    use_action_delta: true              # action=0 for base-only data → only A learns
+    obs_scale_source: "observed"
     act_scale_source: "env"
 
   horizon: 5
   batch_size: 2048
   num_workers: 4
-  lr: 1.0e-1 #5.0e-4
-  weight_decay: 1.0e-4
+  lr: 1.0e-2
+  weight_decay: 1.0e-5
   num_epochs: 1000
+
   recon_pretrain_epochs: 20
   recon_pretrain_lr: 1.0e-3
   recon_pretrain_bilip: false
   recon_pretrain_bilip_weight: 1.0
 
-  loss_threshold: 0.0009
+  loss_threshold: -10.0
 
-  scheduler_step: 200 #100
-  scheduler_gamma: 0.5 #0.1
+  scheduler_step: 100
+  scheduler_gamma: 0.5
 
   cosine_scheduler: false
   cosine_T_max: 200
   cosine_eta_min: 1.0e-6
 
-  riemannian_optimizer: false
+  riemannian_optimizer: false            # required by k_type=normalized
   vectorize_rollout: true
   torch_compile: true
 
-  grad_clip: false #true
+  grad_clip: false
   grad_clip_type: "norm"
   grad_clip_value: 1.0
 
@@ -57,17 +60,17 @@ train_koopman_cfg:
 
     latent_rollout_loss: false
     latent_rollout_weight: 1.0
-    x_pred_weight: 0.1
+    x_pred_weight: 1.0
 
-    l_inf_pred_loss: true
-    l_inf_pred_weight: 1.0e-9
+    l_inf_pred_loss: false
+    l_inf_pred_weight: 1.0
 
     controllability_loss: false
     ctrl_weight: 0.1
 
-    bi_lipschitz_loss: false
+    bi_lipschitz_loss: true
     bilip_weight: 2.0
-    bilip_m_target: 1.0
+    bilip_m_target: 1.2
 
     spectral_loss: false
     spectral_weight: 0.01
@@ -107,13 +110,15 @@ train_koopman_cfg:
     upper_lip_m_max: 1.25
 
   b_fitting:
-    enabled: true                       # joint paradigm only
-    perturbed_dataset_name: "bang_energy_pendulum"           # required when enabled
-    ctrl_lambda: 50.0
-    train_steps: 200
-    lr: 1.0e-4
+    enabled: true
+    perturbed_dataset_name: "inverted_pendulum_pert"
+    method: "least_squares_projected"
+    ctrl_lambda: 0.1
+    train_steps: 500
+    lr: 1.0e-3
+    log_interval: 100
 
   seed: 42
   log_interval: 10
-  experiment_name: "pendulum_baseline"
-  dataset_name: "basic_pendulum"
+  experiment_name: "inverted_pendulum"
+  dataset_name: "inverted_pendulum"

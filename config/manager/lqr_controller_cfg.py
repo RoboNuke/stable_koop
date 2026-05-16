@@ -1,4 +1,4 @@
-"""LQR-controller-fitting config: cost matrices, stability bounds, output paths.
+"""LQR-controller-fitting config: cost matrices, stability bound, output paths.
 
 Field defaults mirror ``config/pendulum.yaml`` exactly.
 """
@@ -10,23 +10,22 @@ import dataclasses
 
 @dataclasses.dataclass(kw_only=True)
 class StabilityAnalysisCfg:
-    """Which closed-loop stability bounds to compute on the fitted LQR."""
+    """Inputs to the unified γ_max bound.
 
-    use_eigen_bound: bool = True
-    """Spectral-radius / transient-constant bound."""
-    use_lyapunov_bound: bool = True
-    """Lyapunov-equation-based bound."""
-    use_m_free_bound: bool = False
-    """Lipschitz-m-free bound (does not assume encoder lower-Lipschitz)."""
-    optimize_lyapunov_P: bool = True
-    """Run SDP optimization to tighten the Lyapunov P matrix."""
+    The bound formula is picked automatically from the Koopman model's
+    ``prepend_state`` flag:
 
-    use_alpha_bound: bool = False
-    """Alpha-bound stability analysis (requires ``prepend_state`` in Koopman cfg)."""
-    alpha_epsilon_x: float = 0.3
-    """Max tracking error in state space (alpha bound)."""
-    alpha_eta: float = 0.1
-    """Disturbance bound in latent space (alpha bound)."""
+    * no-prepend → ``γ_max = (m·ε_x)(1−ρ)/√κ(P) − η``
+    * prepend    → ``γ_max = ε_x(1−ρ)/√(α·λ_max(P)) − η``
+    """
+
+    epsilon_x: float = 0.3
+    """Max tracking error in x-space. Scaled by encoder m for the no-prepend branch."""
+    eta: float = 0.1
+    """Disturbance / displacement bound in latent space (both branches)."""
+    use_optimization: bool = True
+    """Run the P-optimizer that matches the active branch (SDP for no-prepend,
+    L-BFGS α-optimizer for prepend)."""
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -41,14 +40,6 @@ class LQRControllerCfg:
     """Multiplier on identity R."""
     scale_B: bool = False
     """Normalize B to unit spectral norm before solving LQR."""
-    max_tracking_error_x: float = 0.3
-    """Max state-space tracking error tolerated (defines success bounds)."""
-    max_displacement_x: float = 0.57
-    """Max possible state displacement (defines normalization)."""
-    controllable_subspace: bool = False
-    """Solve LQR only in the controllable subspace."""
-    ctrl_threshold: float | None = None
-    """Controllability singular-value threshold (null = machine epsilon default)."""
 
     stability_analysis: StabilityAnalysisCfg = dataclasses.field(
         default_factory=StabilityAnalysisCfg

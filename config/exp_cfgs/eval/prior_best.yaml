@@ -1,7 +1,7 @@
-# Evaluation for the pendulum experiment.
+# Evaluation for the prior_best experiment.
 
 eval_cfg:
-  num_parallel_evals: 200
+  num_parallel_evals: 16
   eval_num_trajectories: 200
   eval_max_steps: 200
   eval_seed: 42
@@ -13,6 +13,6 @@ eval_cfg:
   eval_koopman_accuracy: true
   eval_policy_rollout: true
 
-  koopman_experiment_name: "pendulum_baseline"
-  residual_experiment_name: null
-  results_name: "pendulum_baseline"
+  koopman_experiment_name: "prior_best"
+  residual_experiment_name: "prior_best"
+  results_name: "prior_best"

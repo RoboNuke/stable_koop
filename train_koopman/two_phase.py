@@ -1,8 +1,9 @@
 """Two-phase Koopman training paradigm.
 
 Phase 1 — pretrain (encoder + A + B) with only the core losses (recon, pred,
-latent-consistency) disabled-optional. Phase 2 — reinitialize B, then run the
-full loss suite including BiLip / B-eigen / unstable-controllability / etc.
+latent-consistency); every optional loss is disabled via a
+:func:`dataclasses.replace` clone of the ``LossesCfg``. Phase 2 — reinit B,
+then run with the full loss suite.
 
 Both phases reuse the canonical :func:`train_koopman.training_loop.train`
 function so optimization details stay consistent.
@@ -11,6 +12,7 @@ function so optimization details stay consistent.
 from __future__ import annotations
 
 import dataclasses
+
 import torch.nn as nn
 
 from config.manager import TrainKoopmanCfg
@@ -25,6 +27,7 @@ from train_koopman.checkpointing import (
 from train_koopman.training_loop import train
 
 
+# Optional losses to disable during the phase-1 pretrain.
 _PHASE1_DISABLED_LOSSES = (
     "controllability_loss",
     "bi_lipschitz_loss",
@@ -40,58 +43,57 @@ _PHASE1_DISABLED_LOSSES = (
 )
 
 
-def cfg_to_flat_dict(cfg: TrainKoopmanCfg) -> dict:
-    """Flatten a :class:`TrainKoopmanCfg` into the legacy pendulum.yaml dict shape.
-
-    The augmentation config is also flattened (``prepend_base_action``,
-    ``use_action_delta``, ``obs_scale_source``, ``act_scale_source``) so the
-    saved checkpoint cfg carries exactly the projection the model was trained
-    against — downstream consumers reload it.
-    """
-    flat = {}
-    for f in dataclasses.fields(cfg):
-        v = getattr(cfg, f.name)
-        if dataclasses.is_dataclass(v):
-            flat.update(dataclasses.asdict(v))
-        else:
-            flat[f.name] = v
-    return flat
+def _phase1_cfg(train_cfg: TrainKoopmanCfg) -> TrainKoopmanCfg:
+    """Return a copy of ``train_cfg`` with every optional loss disabled."""
+    losses_off = dataclasses.replace(
+        train_cfg.losses,
+        **{name: False for name in _PHASE1_DISABLED_LOSSES},
+    )
+    return dataclasses.replace(train_cfg, losses=losses_off)
 
 
-def run(cfg: TrainKoopmanCfg) -> str:
+def run(train_cfg: TrainKoopmanCfg) -> str:
     """End-to-end two-phase training; returns the output weights directory."""
-    flat = cfg_to_flat_dict(cfg)
-    out_dir = weights_dir(cfg.experiment_name)
+    out_dir = weights_dir(train_cfg.experiment_name)
 
     device = make_device()
-    ds = load_dataset(cfg.dataset_name)
-    flat["state_dim"] = ds.state_dim
-    flat["action_dim"] = ds.action_dim
+    ds = load_dataset(train_cfg.dataset_name)
+    state_dim = ds.state_dim
+    action_dim = ds.action_dim
 
-    augment = cfg.augmentation.prepend_base_action
-    model, _ = build_koopman_model(flat, augment=augment, device=device)
-
-    aug_trajectories = augment_trajectories(ds, cfg.augmentation)
+    model, _ = build_koopman_model(
+        train_cfg, state_dim=state_dim, action_dim=action_dim, device=device
+    )
+    aug_trajectories = augment_trajectories(ds, train_cfg.augmentation)
 
     # --- Phase 1: core losses only ---
     print("\n=== Phase 1: Pre-Train Koopman Model (Core Losses Only) ===")
-    phase1_cfg = dict(flat)
-    for key in _PHASE1_DISABLED_LOSSES:
-        phase1_cfg[key] = False
-    model = train(model, aug_trajectories, phase1_cfg)
-    save_checkpoint(model, flat, out_dir / "koop_a_checkpoint.pt")
+    model = train(model, aug_trajectories, _phase1_cfg(train_cfg))
+    save_checkpoint(
+        model,
+        train_cfg,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        path=out_dir / "koop_a_checkpoint.pt",
+    )
     print(f"Phase 1 checkpoint saved to {out_dir / 'koop_a_checkpoint.pt'}")
 
     # --- Phase 2: reinit B, full loss suite ---
     print("\n=== Phase 2: Train B Matrix (All Losses) ===")
-    if cfg.init_b_in_a:
+    if train_cfg.init_b_in_a:
         model.initialize_B_in_eigenbasis()
         print("Initialized B matrix in A eigenbasis")
     else:
         nn.init.kaiming_uniform_(model.B.weight)
         print("Reinitialized B matrix with random weights")
-    model = train(model, aug_trajectories, flat)
-    save_checkpoint(model, flat, out_dir / "koopman_ckpt.pt")
+    model = train(model, aug_trajectories, train_cfg)
+    save_checkpoint(
+        model,
+        train_cfg,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        path=out_dir / "koopman_ckpt.pt",
+    )
     print(f"Phase 2 checkpoint saved to {out_dir / 'koopman_ckpt.pt'}")
 
     return str(out_dir)

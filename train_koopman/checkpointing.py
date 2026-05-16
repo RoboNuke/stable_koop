@@ -2,15 +2,30 @@
 
 Folded from the legacy ``launch/pipeline_utils.py`` so every consumer (LQR
 fitting, residual training, eval) reads/writes the same artifact shape.
+
+Saved checkpoint layout::
+
+    {
+        "model":      {param_name: tensor, ...},          # state_dict
+        "config":     dataclasses.asdict(train_cfg),       # nested TrainKoopmanCfg
+        "state_dim":  int,                                 # dataset state dim
+        "action_dim": int,                                 # dataset action dim
+    }
+
+The dataset-derived dims are stored alongside the cfg (rather than inside
+it) because they aren't user-configured — they're discovered at gather
+time. Pre-refactor flat-dict checkpoints will NOT load with this format.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
-from typing import Any
 
 import torch
 
+from config.manager import TrainKoopmanCfg
+from config.manager.manager import ConfigManager
 from models.koopman import KoopmanAutoencoder
 
 
@@ -28,50 +43,75 @@ def make_device() -> torch.device:
     return device
 
 
-def build_koopman_model(cfg: dict, augment: bool, device: torch.device):
-    """Build a ``KoopmanAutoencoder`` from a flat ``cfg`` dict.
+def build_koopman_model(
+    train_cfg: TrainKoopmanCfg,
+    *,
+    state_dim: int,
+    action_dim: int,
+    device: torch.device,
+    obs_type: str = "theta",
+):
+    """Build a :class:`KoopmanAutoencoder` from a :class:`TrainKoopmanCfg`.
 
-    ``augment`` is the dataset-augmentation flag (whether the base action is
-    appended to the state). Returns ``(model, koopman_state_dim)``.
+    The "augment" flag (whether the base action is appended to the obs) is
+    read from ``train_cfg.augmentation.prepend_base_action``. ``obs_type``
+    is a per-env knob (e.g. ``"cos_sin"`` for the pendulum) consumed by the
+    fixed trig lift; it defaults to ``"theta"`` to match the legacy
+    fallback in ``cfg.get("obs_type", "theta")``. Returns
+    ``(model, koopman_state_dim)``.
     """
-    koopman_state_dim = cfg["state_dim"] + cfg["action_dim"] if augment else cfg["state_dim"]
-    encoder_type = cfg["encoder_type"]
+    augment = train_cfg.augmentation.prepend_base_action
+    koopman_state_dim = state_dim + action_dim if augment else state_dim
     model = KoopmanAutoencoder(
         state_dim=koopman_state_dim,
-        latent_dim=cfg["latent_dim"],
-        action_dim=cfg["action_dim"],
-        k_type=cfg["k_type"],
-        encoder_type=encoder_type,
-        rho=cfg["rho"],
-        encoder_spec_norm=cfg["encoder_spec_norm"],
-        encoder_latent=cfg["encoder_latent"],
-        prepend_state=cfg.get("prepend_state", False),
-        prepend_control=cfg.get("prepend_control", False),
-        real_state_dim=cfg["state_dim"],
-        obs_type=cfg.get("obs_type", "theta"),
+        latent_dim=train_cfg.latent_dim,
+        action_dim=action_dim,
+        k_type=train_cfg.k_type,
+        encoder_type=train_cfg.encoder_type,
+        rho=train_cfg.rho,
+        encoder_spec_norm=train_cfg.encoder_spec_norm,
+        encoder_latent=train_cfg.encoder_latent,
+        prepend_state=train_cfg.prepend_state,
+        prepend_control=train_cfg.prepend_control,
+        real_state_dim=state_dim,
+        obs_type=obs_type,
     ).to(device)
     print(
         f"Koopman model: state_dim={koopman_state_dim}, "
-        f"action_dim={cfg['action_dim']}, latent_dim={cfg['latent_dim']}, "
-        f"prepend_state={cfg.get('prepend_state', False)}, "
-        f"prepend_control={cfg.get('prepend_control', False)}"
+        f"action_dim={action_dim}, latent_dim={train_cfg.latent_dim}, "
+        f"prepend_state={train_cfg.prepend_state}, "
+        f"prepend_control={train_cfg.prepend_control}"
     )
     return model, koopman_state_dim
 
 
-def save_checkpoint(model, cfg: dict, path: str | Path) -> None:
-    """Save model checkpoint to ``path``; strips ``torch.compile``'s ``_orig_mod.`` prefix."""
+def save_checkpoint(
+    model,
+    train_cfg: TrainKoopmanCfg,
+    *,
+    state_dim: int,
+    action_dim: int,
+    path: str | Path,
+) -> None:
+    """Persist ``model`` + the dataclass config + dataset dims."""
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_dict = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
-    torch.save({"model": save_dict, "config": cfg}, out_path)
+    torch.save(
+        {
+            "model": save_dict,
+            "config": dataclasses.asdict(train_cfg),
+            "state_dim": int(state_dim),
+            "action_dim": int(action_dim),
+        },
+        out_path,
+    )
 
 
-def load_checkpoint(model, path: str | Path, device: torch.device) -> dict[str, Any]:
-    """Load checkpoint into ``model``; returns the full dict (with ``"config"``)."""
+def load_checkpoint(model, path: str | Path, device: torch.device) -> dict:
+    """Load weights into ``model`` and return ``{config, state_dim, action_dim}``."""
     checkpoint = torch.load(path, map_location=device)
-    state_dict = checkpoint["model"]
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in checkpoint["model"].items()}
     model.load_state_dict(state_dict)
     model.eval()
     print(f"Loaded weights from {path}")
@@ -85,23 +125,33 @@ def weights_dir(experiment_name: str) -> Path:
     return out
 
 
-def load_koopman_experiment(experiment_name: str, device: torch.device):
-    """Canonical one-call loader for a trained Koopman experiment.
+def load_koopman_experiment(
+    experiment_name: str, device: torch.device
+) -> tuple[KoopmanAutoencoder, TrainKoopmanCfg, int, int]:
+    """Canonical loader.
 
-    Reads ``train_koopman/weights/<experiment_name>/koopman_ckpt.pt``,
-    builds a :class:`KoopmanAutoencoder` with the matching augmentation
-    (``augment = cfg["prepend_base_action"]`` so joint-trained models
-    don't get an extra augmented dim), loads the state dict (stripping
-    ``_orig_mod.`` from torch-compiled keys), and returns
-    ``(model, koop_cfg_flat)``.
+    Reads ``train_koopman/weights/<experiment_name>/koopman_ckpt.pt``, rebuilds
+    the :class:`TrainKoopmanCfg` from the saved nested dict, builds the model,
+    loads the state dict (stripping ``_orig_mod.`` torch-compile prefix), and
+    returns ``(model, train_cfg, state_dim, action_dim)``.
     """
     ckpt_path = Path("train_koopman") / "weights" / experiment_name / "koopman_ckpt.pt"
     raw = torch.load(ckpt_path, map_location=device)
-    koop_cfg = raw["config"]
-    augment = bool(koop_cfg.get("prepend_base_action", True))
-    model, _ = build_koopman_model(koop_cfg, augment=augment, device=device)
+    if not isinstance(raw.get("config"), dict) or "state_dim" not in raw:
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path} is in the pre-refactor flat-dict format. "
+            "Re-train with the current code to get a nested-config checkpoint."
+        )
+    train_cfg = ConfigManager._build(
+        TrainKoopmanCfg, raw["config"], context="checkpoint.config"
+    )
+    state_dim = int(raw["state_dim"])
+    action_dim = int(raw["action_dim"])
+    model, _ = build_koopman_model(
+        train_cfg, state_dim=state_dim, action_dim=action_dim, device=device
+    )
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw["model"].items()}
     model.load_state_dict(state_dict)
     model.eval()
-    print(f"Loaded Koopman weights from {ckpt_path} (augment={augment})")
-    return model, koop_cfg
+    print(f"Loaded Koopman weights from {ckpt_path}")
+    return model, train_cfg, state_dim, action_dim

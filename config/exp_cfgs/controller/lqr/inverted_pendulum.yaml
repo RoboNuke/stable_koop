@@ -1,0 +1,16 @@
+# LQR controller fit + stability analysis for InvertedPendulum-v4.
+# Lyapunov branch (prepend_state=false) with SDP P-optimization.
+
+lqr_controller_cfg:
+  q_scale: 1.0
+  q_epsilon_scale: 0.0
+  r_scale: 1.0
+  scale_B: false
+
+  stability_analysis:
+    epsilon_x: 0.3
+    eta: 0.1
+    use_optimization: true
+
+  koopman_experiment_name: "inverted_pendulum"
+  output_name: "inverted_pendulum"

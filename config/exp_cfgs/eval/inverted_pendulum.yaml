@@ -1,0 +1,24 @@
+# Evaluation for InvertedPendulum-v4.
+#
+# The pendulum heatmap renderer (eval_koopman_accuracy) is pendulum-specific
+# and won't produce meaningful output for InvertedPendulum — disabled here.
+# Policy rollout uses the success criteria from eval/pendulum_metrics.py,
+# which won't match InvertedPendulum's termination either; treat those
+# numbers as a sanity check, not a real metric.
+
+eval_cfg:
+  num_parallel_evals: 16
+  eval_num_trajectories: 200
+  eval_max_steps: 200
+  eval_seed: 42
+
+  success_angle_deg: 15.0
+  success_max_thdot: 1.0
+  success_hold_steps: 20
+
+  eval_koopman_accuracy: false
+  eval_policy_rollout: false
+
+  koopman_experiment_name: "inverted_pendulum"
+  residual_experiment_name: "inverted_pendulum"
+  results_name: "inverted_pendulum"

@@ -39,8 +39,10 @@ def run(cfg: EvalCfg) -> str:
     out_dir = Path("eval") / "results" / cfg.results_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model, koop_cfg = load_koopman_experiment(cfg.koopman_experiment_name, device)
-    ds = load_dataset(koop_cfg["dataset_name"])
+    model, train_cfg, _state_dim, _action_dim = load_koopman_experiment(
+        cfg.koopman_experiment_name, device
+    )
+    ds = load_dataset(train_cfg.dataset_name)
     gather_snap = yaml.safe_load(ds.config_yaml)["gather_data_cfg"]
     env_name = gather_snap["env_name"]
     env_kwargs = gather_snap.get("env_kwargs", {}) or {}
@@ -48,16 +50,10 @@ def run(cfg: EvalCfg) -> str:
     flat = _flat_eval_cfg(cfg)
 
     if cfg.eval_koopman_accuracy:
-        from config.manager import AugmentationCfg
         from data.augmentation import augment_trajectories, compute_act_scale, compute_obs_scale
         from eval.koopman_accuracy import evaluate_model
 
-        aug_cfg = AugmentationCfg(
-            prepend_base_action=koop_cfg["prepend_base_action"],
-            use_action_delta=koop_cfg["use_action_delta"],
-            obs_scale_source=koop_cfg.get("obs_scale_source", "env"),
-            act_scale_source=koop_cfg.get("act_scale_source", "env"),
-        )
+        aug_cfg = train_cfg.augmentation
         aug_trajectories = augment_trajectories(ds, aug_cfg)
         obs_scale = compute_obs_scale(aug_cfg, ds)
         act_scale = compute_act_scale(aug_cfg, ds)
@@ -69,8 +65,8 @@ def run(cfg: EvalCfg) -> str:
         fig, error_stats, heatmap_data = evaluate_model(
             model,
             aug_trajectories,
-            train_horizon=koop_cfg.get("horizon", 5),
-            eval_horizon=koop_cfg.get("horizon", 5) + 1,
+            train_horizon=train_cfg.horizon,
+            eval_horizon=train_cfg.horizon + 1,
             env_name=env_name,
             obs_scale=koopman_obs_scale.tolist(),
             obs_type=env_kwargs.get("obs_type", "cos_sin"),

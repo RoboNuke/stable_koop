@@ -216,15 +216,56 @@ def gather(cfg: GatherDataCfg) -> Path:
         cfg=cfg,
     )
     print(f"[gather_data] wrote {out}")
+
+    # Report base-policy performance on the freshly written dataset.
+    from data.dataset_stats import evaluate_dataset
+    evaluate_dataset(cfg.dataset_name)
+
     return out
 
 
+def gather_both(cfg: GatherDataCfg) -> tuple[Path, Path]:
+    """Gather two datasets back-to-back: base-only and perturbed.
+
+    Writes ``cfg.dataset_name`` (perturbations off) and ``cfg.dataset_name + '_pert'``
+    (perturbations on), regardless of what the YAML says for ``perturbations.enabled``.
+    Both datasets share the same env / base policy / seed / hyperparameters.
+    """
+    base_cfg = dataclasses.replace(
+        cfg,
+        perturbations=dataclasses.replace(cfg.perturbations, enabled=False),
+    )
+    pert_cfg = dataclasses.replace(
+        cfg,
+        perturbations=dataclasses.replace(cfg.perturbations, enabled=True),
+        dataset_name=f"{cfg.dataset_name}_pert",
+    )
+    print(f"[gather_data] --both: gathering {base_cfg.dataset_name} (perturbations off)")
+    base_path = gather(base_cfg)
+    print(f"[gather_data] --both: gathering {pert_cfg.dataset_name} (perturbations on)")
+    pert_path = gather(pert_cfg)
+    return base_path, pert_path
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Gather one trajectory dataset.")
+    parser = argparse.ArgumentParser(description="Gather one or two trajectory datasets.")
     parser.add_argument("--config", required=True, help="Per-stage gather_data YAML.")
+    parser.add_argument(
+        "--both",
+        action="store_true",
+        help=(
+            "Gather both base-only and perturbed datasets in one call. "
+            "The base dataset is written to <dataset_name> and the perturbed "
+            "dataset to <dataset_name>_pert; the YAML's perturbations.enabled "
+            "is ignored in this mode."
+        ),
+    )
     args = parser.parse_args()
     cfg = ConfigManager.load_stage(args.config, "gather_data_cfg")
-    gather(cfg)
+    if args.both:
+        gather_both(cfg)
+    else:
+        gather(cfg)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+# LQR controller fit + stability analysis for the prior_best experiment.
+# Legacy used the Lyapunov bound (use_lyapunov_bound: true, prepend_state: false)
+# with optimize_lyapunov_P: true → SDP P-optimization on top of the LQR P.
+
+lqr_controller_cfg:
+  q_scale: 1.0
+  q_epsilon_scale: 0.0
+  r_scale: 1.0
+  scale_B: false
+
+  stability_analysis:
+    # epsilon_x: 0.3 in x-space (legacy max_tracking_error_x).
+    epsilon_x: 0.3
+    # eta: 0.57 — legacy max_displacement_x. In legacy this was an x-space
+    # value internally scaled to latent via the encoder Lipschitz m
+    # (eta_latent = m · max_displacement_x). The current schema treats eta
+    # as already-latent, so if your trained encoder has m ≠ 1 you may want
+    # to adjust this value to ``m · 0.57``.
+    eta: 0.57
+    use_optimization: true          # legacy optimize_lyapunov_P: true
+
+  koopman_experiment_name: "prior_best"
+  output_name: "prior_best"

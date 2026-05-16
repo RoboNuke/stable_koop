@@ -2,22 +2,32 @@
 
 from controller.lqr.lqr import LQR
 from controller.lqr.lqr_analysis import (
-    compute_BtPB,
     compute_lyapunov_params,
-    lyapunov_gamma,
     optimize_alpha_P,
     optimize_lyapunov_P,
-    run_sdp_optimization,
     setup_lqr,
+)
+from controller.lqr.lqr_analysisv2 import (
+    action_budget_report,
+    controllability_fit_report,
+    gamma_coverage_report,
+    generate_P_and_bound,
+    lqr_fit_report,
+    one_step_pred_error_report,
+    run_stability_report,
 )
 
 __all__ = [
     "LQR",
-    "compute_BtPB",
+    "action_budget_report",
     "compute_lyapunov_params",
-    "lyapunov_gamma",
+    "controllability_fit_report",
+    "gamma_coverage_report",
+    "generate_P_and_bound",
+    "lqr_fit_report",
+    "one_step_pred_error_report",
     "optimize_alpha_P",
     "optimize_lyapunov_P",
-    "run_sdp_optimization",
+    "run_stability_report",
     "setup_lqr",
 ]

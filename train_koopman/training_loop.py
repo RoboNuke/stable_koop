@@ -1,8 +1,7 @@
 """Core Koopman training loop — paradigm-agnostic optimizer/scheduler driver.
 
-This is the function called by both ``two_phase`` and ``joint`` paradigms. The
-function body mirrors the legacy ``launch/train_pendulum.py::train`` verbatim
-(only imports changed) to preserve bit-equivalent training behavior.
+Called by both ``two_phase`` and ``joint``. Reads its config directly from
+the :class:`config.manager.TrainKoopmanCfg` dataclass; nothing flat-dict.
 """
 
 from __future__ import annotations
@@ -13,25 +12,25 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from config.manager import TrainKoopmanCfg
 from data.dataloader import TrajectoryDataset
 from train_koopman.losses import bi_lipschitz_loss, build_loss_fns, compute_loss
 
 
-def train(model, trajectories, cfg):
+def train(model, trajectories, train_cfg: TrainKoopmanCfg):
     """Train a KoopmanAutoencoder on pre-collected ``trajectories``.
 
-    ``cfg`` is a flat dict (mirroring the legacy pendulum.yaml shape).
     Returns the trained model (mutated in place; best epoch's state_dict reloaded).
     """
     device = next(model.parameters()).device
-    torch.manual_seed(cfg["seed"])
+    torch.manual_seed(train_cfg.seed)
 
-    dataset = TrajectoryDataset(trajectories, cfg["horizon"])
+    dataset = TrajectoryDataset(trajectories, train_cfg.horizon)
     print(f"Dataset size: {len(dataset)} windows")
-    num_workers = cfg.get("num_workers", 0)
+    num_workers = train_cfg.num_workers
     loader = DataLoader(
         dataset,
-        batch_size=cfg["batch_size"],
+        batch_size=train_cfg.batch_size,
         shuffle=True,
         drop_last=True,
         pin_memory=True,
@@ -41,50 +40,50 @@ def train(model, trajectories, cfg):
     if num_workers > 0:
         print(f"DataLoader: {num_workers} workers (persistent)")
 
-    if cfg.get("riemannian_optimizer", False):
+    if train_cfg.riemannian_optimizer:
         import geoopt
 
         optimizer = geoopt.optim.RiemannianAdam(
-            model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
+            model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
         )
         print("Using RiemannianAdam optimizer")
     else:
         optimizer = torch.optim.Adam(
-            model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
+            model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
         )
 
-    if cfg.get("cosine_scheduler", False):
+    if train_cfg.cosine_scheduler:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cfg["cosine_T_max"], eta_min=cfg["cosine_eta_min"]
+            optimizer, T_max=train_cfg.cosine_T_max, eta_min=train_cfg.cosine_eta_min
         )
         print(
             f"Using CosineAnnealingLR scheduler "
-            f"(T_max={cfg['cosine_T_max']}, eta_min={cfg['cosine_eta_min']})"
+            f"(T_max={train_cfg.cosine_T_max}, eta_min={train_cfg.cosine_eta_min})"
         )
     else:
         scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=cfg["scheduler_step"], gamma=cfg["scheduler_gamma"]
+            optimizer, step_size=train_cfg.scheduler_step, gamma=train_cfg.scheduler_gamma
         )
         print(
             f"Using StepLR scheduler "
-            f"(step_size={cfg['scheduler_step']}, gamma={cfg['scheduler_gamma']})"
+            f"(step_size={train_cfg.scheduler_step}, gamma={train_cfg.scheduler_gamma})"
         )
 
-    if cfg.get("torch_compile", False):
+    if train_cfg.torch_compile:
         model = torch.compile(model)
         print("Model compiled with torch.compile")
 
     # Reconstruction pretraining (encoder/decoder only).
-    recon_pretrain_epochs = cfg.get("recon_pretrain_epochs", 0)
+    recon_pretrain_epochs = train_cfg.recon_pretrain_epochs
     has_learned_encoder = hasattr(model, "encoder") and model.encoder is not None
     if recon_pretrain_epochs > 0 and not has_learned_encoder:
         print("Skipping reconstruction pretraining (encoder is fixed, no learnable params)")
         recon_pretrain_epochs = 0
     if recon_pretrain_epochs > 0:
-        pretrain_lr = cfg.get("recon_pretrain_lr", cfg["lr"])
-        pretrain_bilip = cfg.get("recon_pretrain_bilip", False)
-        pretrain_bilip_w = cfg.get("recon_pretrain_bilip_weight", 1.0)
-        pretrain_bilip_m = cfg.get("bilip_m_target", 0.5)
+        pretrain_lr = train_cfg.recon_pretrain_lr
+        pretrain_bilip = train_cfg.recon_pretrain_bilip
+        pretrain_bilip_w = train_cfg.recon_pretrain_bilip_weight
+        pretrain_bilip_m = train_cfg.losses.bilip_m_target
         print(
             f"\n--- Reconstruction Pretraining "
             f"({recon_pretrain_epochs} epochs, lr={pretrain_lr}) ---"
@@ -92,7 +91,7 @@ def train(model, trajectories, cfg):
         if pretrain_bilip:
             print(f"  BiLip loss enabled (weight={pretrain_bilip_w}, m_target={pretrain_bilip_m})")
         pretrain_optimizer = torch.optim.Adam(
-            model.parameters(), lr=pretrain_lr, weight_decay=cfg["weight_decay"]
+            model.parameters(), lr=pretrain_lr, weight_decay=train_cfg.weight_decay
         )
         for epoch in range(1, recon_pretrain_epochs + 1):
             model.train()
@@ -120,7 +119,7 @@ def train(model, trajectories, cfg):
                 pretrain_optimizer.step()
                 n_batches += 1
 
-            if epoch % cfg.get("log_interval", 10) == 0 or epoch == 1:
+            if epoch % train_cfg.log_interval == 0 or epoch == 1:
                 parts = [f"  Pretrain Epoch {epoch:4d} | Recon: {epoch_recon / n_batches:.6f}"]
                 if pretrain_bilip:
                     parts.append(f"BiLip: {epoch_bilip / n_batches:.6f}")
@@ -128,23 +127,24 @@ def train(model, trajectories, cfg):
         del pretrain_optimizer
         print("--- Pretraining complete ---\n")
 
-    loss_fns = build_loss_fns(cfg, model)
+    loss_fns = build_loss_fns(model, train_cfg)
     active_names = list(loss_fns.keys())
     print(
         f"Active losses: "
         f"{', '.join(f'{n} (w={loss_fns[n][1]})' for n in active_names)}"
     )
 
-    grad_clip_enabled = cfg.get("grad_clip", False)
-    grad_clip_type = cfg.get("grad_clip_type", "norm")
-    grad_clip_value = cfg.get("grad_clip_value", 1.0)
+    grad_clip_enabled = train_cfg.grad_clip
+    grad_clip_type = train_cfg.grad_clip_type
+    grad_clip_value = train_cfg.grad_clip_value
     if grad_clip_enabled:
         print(f"Gradient clipping: {grad_clip_type}, max={grad_clip_value}")
 
-    loss_threshold = cfg.get("loss_threshold", 0.001)
+    loss_threshold = train_cfg.loss_threshold
     best_loss = float("inf")
     best_state_dict = copy.deepcopy(model.state_dict())
     best_epoch = 0
+    best_components = {name: float("nan") for name in active_names}
     print("(Press Ctrl+C to end training early and continue pipeline)")
 
     epoch = 0
@@ -152,7 +152,7 @@ def train(model, trajectories, cfg):
     epoch_total = 0.0
     epoch_accum = {name: 0.0 for name in active_names}
     try:
-        for epoch in range(1, cfg["num_epochs"] + 1):
+        for epoch in range(1, train_cfg.num_epochs + 1):
             model.train()
             epoch_accum = {name: 0.0 for name in active_names}
             epoch_total = 0.0
@@ -188,8 +188,11 @@ def train(model, trajectories, cfg):
                 best_loss = avg_total
                 best_state_dict = copy.deepcopy(model.state_dict())
                 best_epoch = epoch
+                best_components = {
+                    name: epoch_accum[name] / n_batches for name in active_names
+                }
 
-            if epoch % cfg["log_interval"] == 0 or epoch == 1:
+            if epoch % train_cfg.log_interval == 0 or epoch == 1:
                 parts = [f"Epoch {epoch:4d} | Total: {avg_total:.6f}"]
                 for name in active_names:
                     parts.append(f"{name}: {epoch_accum[name] / n_batches:.6f}")
@@ -206,10 +209,8 @@ def train(model, trajectories, cfg):
 
     print("\n--- Training Complete ---")
     print(f"  Best total: {best_loss:.6f} (epoch {best_epoch})")
-    if n_batches > 0:
-        print(f"  Final total: {epoch_total / n_batches:.6f}")
-        for name in active_names:
-            print(f"  {name:>6s}: {epoch_accum[name] / n_batches:.6f}")
-    print(f"  Epochs: {epoch}/{cfg['num_epochs']}")
+    for name in active_names:
+        print(f"  {name:>6s}: {best_components[name]:.6f}")
+    print(f"  Epochs: {epoch}/{train_cfg.num_epochs}")
 
     return model

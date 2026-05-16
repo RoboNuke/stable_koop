@@ -57,7 +57,7 @@ def control_analysis(A, B_mat):
         for i, (ev, unstable) in enumerate(zip(eigenvalues, unstable_mask)):
             if unstable:
                 proj = (V[:, i].conj() @ B_mat.to(torch.cfloat)).abs()
-                print(f"      Unstable mode λ={ev.abs():.4f}, B projection={proj.item():.4f}")
+                print(f"      Unstable mode λ={ev.abs():.2f}, B projection={proj.item():.2f}")
     else:
         print("      No unstable modes detected")
     return ctrl_rank
@@ -83,9 +83,9 @@ def compute_encoder_lipschitz(encoder, training_data):
     L = float(sigma_maxs.max().detach())
     print(
         f"  σ_min distribution ({len(sigma_mins)} points): "
-        f"min={sigma_mins.min():.6f}  p1={sigma_mins.quantile(0.01):.6f}  "
-        f"p5={sigma_mins.quantile(0.05):.6f}  median={sigma_mins.median():.6f}  "
-        f"mean={sigma_mins.mean():.6f}"
+        f"min={sigma_mins.min():.2f}  p1={sigma_mins.quantile(0.01):.2f}  "
+        f"p5={sigma_mins.quantile(0.05):.2f}  median={sigma_mins.median():.2f}  "
+        f"mean={sigma_mins.mean():.2f}"
     )
     return m, L
 

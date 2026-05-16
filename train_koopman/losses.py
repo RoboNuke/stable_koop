@@ -7,11 +7,16 @@ own the dispatch and aggregation.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.linalg import solve_discrete_are
 from torch.func import jacrev, vmap
+
+if TYPE_CHECKING:
+    from config.manager import TrainKoopmanCfg
 
 
 # ---------------------------------------------------------------------------
@@ -233,33 +238,26 @@ def latent_consistency_loss(model, states_seq, actions_seq):
 # ---------------------------------------------------------------------------
 # Loss-builder + aggregator.
 #
-# ``build_loss_fns`` reads from a flat ``cfg`` dict (mirroring the legacy
-# config/pendulum.yaml shape). The orchestrator flattens the
-# ``TrainKoopmanCfg`` dataclass into this dict shape before calling — this
-# keeps the bit-exact path through training identical to the legacy code.
+# ``build_loss_fns`` reads from a :class:`TrainKoopmanCfg` dataclass. Per-loss
+# weights / targets / enable flags live on ``train_cfg.losses`` (LossesCfg);
+# the few cross-section reads (``latent_dim``, ``action_dim``, ``horizon``,
+# ``rho``, ``vectorize_rollout``) live at the top level of ``train_cfg``.
 # ---------------------------------------------------------------------------
 
 
-def build_loss_fns(cfg, model):
-    """Return ``{name: (fn, weight)}`` for every active loss given ``cfg``.
-
-    ``cfg`` is a flat dict (legacy pendulum.yaml shape).
-    """
+def build_loss_fns(model, train_cfg: "TrainKoopmanCfg"):
+    """Return ``{name: (fn, weight)}`` for every active loss given ``train_cfg``."""
+    L = train_cfg.losses
     losses = {}
-
-    recon_w = cfg["recon_weight"]
-    pred_w = cfg["pred_weight"]
-    lc_w = cfg.get("latent_consistency_weight", 1.0)
-    vectorize = cfg.get("vectorize_rollout", False)
 
     if model.decoder is not None:
         def _recon(model, states_seq, actions_seq, all_states):
             all_z = model.encode(all_states)
             return F.mse_loss(model.decode(all_z), all_states)
-        losses["Recon"] = (_recon, recon_w)
+        losses["Recon"] = (_recon, L.recon_weight)
 
     if getattr(model, "prepend_state", False):
-        xpred_w = cfg.get("x_pred_weight", 1.0)
+        xpred_w = L.x_pred_weight
         p_dim = model.prepend_dim
 
         def _xpred(model, states_seq, actions_seq, all_states):
@@ -283,128 +281,129 @@ def build_loss_fns(cfg, model):
 
         losses["XPred"] = (_xpred, xpred_w)
 
+    vectorize = train_cfg.vectorize_rollout
+
     def _pred(model, states_seq, actions_seq, all_states):
         if vectorize:
             return _pred_loss_vectorized(model, states_seq, actions_seq)
         return _pred_loss_sequential(model, states_seq, actions_seq)
 
-    losses["Pred"] = (_pred, pred_w)
+    losses["Pred"] = (_pred, L.pred_weight)
 
-    if cfg.get("l_inf_pred_loss", False):
+    if L.l_inf_pred_loss:
         def _linf(model, states_seq, actions_seq, all_states):
             return l_inf_pred_loss(model, states_seq, actions_seq)
-        losses["L_inf"] = (_linf, cfg["l_inf_pred_weight"])
+        losses["L_inf"] = (_linf, L.l_inf_pred_weight)
 
     def _lc(model, states_seq, actions_seq, all_states):
         return latent_consistency_loss(model, states_seq, actions_seq)
 
-    losses["LC"] = (_lc, lc_w)
+    losses["LC"] = (_lc, L.latent_consistency_weight)
 
-    if cfg.get("latent_rollout_loss", False):
-        lrc_w = cfg["latent_rollout_weight"]
-
+    if L.latent_rollout_loss:
         def _lrc(model, states_seq, actions_seq, all_states):
             return latent_rollout_consistency_loss(model, states_seq, actions_seq)
 
-        losses["LRC"] = (_lrc, lrc_w)
+        losses["LRC"] = (_lrc, L.latent_rollout_weight)
 
-    if cfg.get("controllability_loss", False):
-        horizon = cfg["horizon"]
+    if L.controllability_loss:
+        horizon = train_cfg.horizon
 
         def _ctrl(model, states_seq, actions_seq, all_states):
             return controllability_loss(model.A, model.B_matrix, horizon=horizon)
 
-        losses["Ctrl"] = (_ctrl, cfg["ctrl_weight"])
+        losses["Ctrl"] = (_ctrl, L.ctrl_weight)
 
-    if cfg.get("unstable_ctrl_loss", False):
-        uc_threshold = cfg.get("unstable_ctrl_threshold", 1.0)
+    if L.unstable_ctrl_loss:
+        uc_threshold = L.unstable_ctrl_threshold
 
         def _uctrl(model, states_seq, actions_seq, all_states):
             return unstable_controllability_loss(
                 model.A, model.B_matrix, threshold=uc_threshold
             )
 
-        losses["UCtrl"] = (_uctrl, cfg["unstable_ctrl_weight"])
+        losses["UCtrl"] = (_uctrl, L.unstable_ctrl_weight)
 
-    if cfg.get("bi_lipschitz_loss", False):
-        m_target = cfg.get("bilip_m_target", 0.5)
+    if L.bi_lipschitz_loss:
+        m_target = L.bilip_m_target
 
         def _bilip(model, states_seq, actions_seq, all_states):
             return bi_lipschitz_loss(model.encode, all_states.detach(), m_target=m_target)
 
-        losses["BiLip"] = (_bilip, cfg["bilip_weight"])
+        losses["BiLip"] = (_bilip, L.bilip_weight)
 
-    if cfg.get("spectral_loss", False):
+    if L.spectral_loss:
         def _spec(model, states_seq, actions_seq, all_states):
             return spectral_loss(model.A)
 
-        losses["Spec"] = (_spec, cfg["spectral_weight"])
+        losses["Spec"] = (_spec, L.spectral_weight)
 
-    if cfg.get("normality_loss", False):
+    if L.normality_loss:
         def _norm(model, states_seq, actions_seq, all_states):
             return normality_loss(model.A)
 
-        losses["Norm"] = (_norm, cfg["normality_weight"])
+        losses["Norm"] = (_norm, L.normality_weight)
 
-    if cfg.get("cl_normality_loss", False):
-        latent_dim = cfg["latent_dim"]
-        action_dim = cfg["action_dim"]
-        cl_Q = torch.eye(latent_dim) * cfg.get("q_scale", 1.0)
-        cl_R = torch.eye(action_dim) * cfg.get("r_scale", 1.0)
+    if L.cl_normality_loss:
+        # cl_normality_loss reads Q/R from the LQR config, not the training
+        # config. The training pipeline doesn't have access to those; legacy
+        # code defaulted to identity scaling (q_scale=1.0, r_scale=1.0).
+        cl_Q = torch.eye(train_cfg.latent_dim)
+        cl_R = torch.eye(train_cfg.action_dim)
 
         def _cl_norm(model, states_seq, actions_seq, all_states):
             return closed_loop_normality_loss(model.A, model.B_matrix, cl_Q, cl_R)
 
-        losses["CLNorm"] = (_cl_norm, cfg["cl_normality_weight"])
+        losses["CLNorm"] = (_cl_norm, L.cl_normality_weight)
 
-    if cfg.get("b_eigen_loss", False) and hasattr(model.K_module, "b_eigen"):
-        min_scale = cfg.get("b_eigen_min_scale", 0.1)
+    if L.b_eigen_loss and hasattr(model.K_module, "b_eigen"):
+        min_scale = L.b_eigen_min_scale
 
         def _beig(model, states_seq, actions_seq, all_states):
             return b_eigen_loss(model.K_module.b_eigen, min_scale=min_scale)
 
-        losses["BEig"] = (_beig, cfg["b_eigen_weight"])
+        losses["BEig"] = (_beig, L.b_eigen_weight)
 
-    if cfg.get("b_scale_loss", False):
-        target_scale = cfg.get("b_scale_target", 1.0)
+    if L.b_scale_loss:
+        target_scale = L.b_scale_target
 
         def _bscale(model, states_seq, actions_seq, all_states):
             return b_scale_loss(model.B_matrix, target_scale=target_scale)
 
-        losses["BScl"] = (_bscale, cfg["b_scale_weight"])
+        losses["BScl"] = (_bscale, L.b_scale_weight)
 
-    if cfg.get("b_min_sv_loss", False):
-        min_sv = cfg.get("b_min_sv_target", 0.1)
+    if L.b_min_sv_loss:
+        min_sv = L.b_min_sv_target
 
         def _bminsv(model, states_seq, actions_seq, all_states):
             return b_min_sv_loss(model.B_matrix, min_sv=min_sv)
 
-        losses["BMinSV"] = (_bminsv, cfg["b_min_sv_weight"])
+        losses["BMinSV"] = (_bminsv, L.b_min_sv_weight)
 
-    if cfg.get("eig_spread_loss", False) and hasattr(model.K_module, "log_d"):
-        min_gap = cfg.get("eig_spread_min_gap", 0.1)
-        rho = cfg.get("rho", 1.0)
+    if L.eig_spread_loss and hasattr(model.K_module, "log_d"):
+        min_gap = L.eig_spread_min_gap
+        rho = train_cfg.rho
 
         def _espread(model, states_seq, actions_seq, all_states):
             return eigenvalue_spread_loss(model.K_module.log_d, rho, min_gap=min_gap)
 
-        losses["ESprd"] = (_espread, cfg["eig_spread_weight"])
+        losses["ESprd"] = (_espread, L.eig_spread_weight)
 
-    if cfg.get("unit_circle_gap_loss", False):
-        gap = cfg.get("unit_circle_gap", 0.05)
+    if L.unit_circle_gap_loss:
+        gap = L.unit_circle_gap
 
         def _ucgap(model, states_seq, actions_seq, all_states):
             return unit_circle_gap_loss(model.A, gap=gap)
 
-        losses["UCGap"] = (_ucgap, cfg["unit_circle_gap_weight"])
+        losses["UCGap"] = (_ucgap, L.unit_circle_gap_weight)
 
-    if cfg.get("upper_lipschitz_loss", False):
-        m_max = cfg.get("upper_lip_m_max", 1.0)
+    if L.upper_lipschitz_loss:
+        m_max = L.upper_lip_m_max
 
         def _ulip(model, states_seq, actions_seq, all_states):
             return upper_lipschitz_loss(model.encode, all_states.detach(), m_max=m_max)
 
-        losses["ULip"] = (_ulip, cfg["upper_lip_weight"])
+        losses["ULip"] = (_ulip, L.upper_lip_weight)
 
     return losses
 

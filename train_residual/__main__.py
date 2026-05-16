@@ -7,8 +7,6 @@ the dataset metadata snapshot, and runs SAC residual training.
 from __future__ import annotations
 
 import argparse
-import dataclasses
-import os
 from pathlib import Path
 
 import torch
@@ -17,7 +15,6 @@ import yaml
 from config.manager import ConfigManager, TrainResidualCfg
 from data.dataloader import load_dataset
 from data.env_builder import make_eval_env, make_single_env
-from controller.lqr.lqr import LQR
 from policy import make_policy
 from train_koopman.checkpointing import load_koopman_experiment, make_device
 
@@ -44,9 +41,11 @@ def _base_policy_from_dataset(dataset_name: str):
 
 def run(cfg: TrainResidualCfg) -> str:
     device = make_device()
-    model, koop_cfg = load_koopman_experiment(cfg.koopman_experiment_name, device)
+    model, train_cfg, _state_dim, _action_dim = load_koopman_experiment(
+        cfg.koopman_experiment_name, device
+    )
     lqr = _load_lqr(cfg.lqr_name)
-    base_policy, gather_snap = _base_policy_from_dataset(koop_cfg["dataset_name"])
+    base_policy, gather_snap = _base_policy_from_dataset(train_cfg.dataset_name)
 
     env_name = gather_snap["env_name"]
     env_kwargs = gather_snap.get("env_kwargs", {}) or {}
@@ -61,9 +60,11 @@ def run(cfg: TrainResidualCfg) -> str:
             env_kwargs=env_kwargs,
         )
 
-    # Build a flat cfg dict the legacy training code expects.
+    # Flat dict for the SAC training code. Only `latent_dim` flows from the
+    # Koopman side; everything else is residual-cfg fields constructed
+    # explicitly so there's no nested-dataclass flatten/collision risk.
     flat = {
-        **koop_cfg,
+        "latent_dim": train_cfg.latent_dim,
         "residual_z_ref_limit": cfg.z_ref_limit,
         "residual_num_envs": cfg.num_envs,
         "residual_total_timesteps": cfg.total_timesteps,

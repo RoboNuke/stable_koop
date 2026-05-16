@@ -14,7 +14,7 @@ gather_data_cfg:
   max_episode_steps: 50
 
   base_policy:
-    name: "none"                  # "none", "energy", "bang_energy", "pd"
+    name: "bang_energy"                  # "none", "energy", "bang_energy", "pd"
     params:
       kp: 10.0
       kd: 2.0
@@ -23,10 +23,10 @@ gather_data_cfg:
       switch_angle: 40.0
 
   perturbations:
-    enabled: false                 # set false for base-policy-only data
+    enabled: true                 # set false for base-policy-only data
     perturb_scale: 1.0
     fix_perturb_range: false
     hold_steps: 5
 
-  dataset_name: "basic_pendulum"
+  dataset_name: "bang_energy_pendulum_pert"
   seed: 42

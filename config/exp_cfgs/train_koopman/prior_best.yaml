@@ -1,0 +1,130 @@
+# Koopman training for the prior_best experiment.
+# Converted from https://github.com/RoboNuke/stable_koop/blob/main/config/pendulum.yaml
+#
+# Legacy flow was `launch/run_anal_b.py` with `train_for_B: false`:
+#   Phase 1 — train A only with u=0 (base_policy="none" data, action=0).
+#   Phase 2 — analytical B via least-squares + PBH/SVD controllability projection.
+# In the new pipeline that maps to: joint training on the base-only dataset
+# (action delta = 0 → only A learns) + b_fitting with the
+# "least_squares_projected" method using the perturbed dataset.
+#
+# Note: legacy used a single combined config; the gather step is now split
+# into two datasets (see gather_data/prior_best.yaml and prior_best_pert.yaml).
+
+train_koopman_cfg:
+  approach: "joint"
+  k_type: "normalized"            # legacy: normalized
+  encoder_type: "cayley"          # legacy: cayley
+
+  latent_dim: 8
+  rho: 1.2
+  encoder_spec_norm: false
+  encoder_latent: 16
+  init_b_in_a: true               # legacy flag preserved (no-op in joint+analytical B)
+  prepend_state: false            # legacy: false → no-prepend (Lyapunov) branch
+  prepend_control: false
+
+  augmentation:
+    prepend_base_action: false    # matches prepend_state=false
+    use_action_delta: false       # actions=0 for base-only data; raw is fine
+    obs_scale_source: "env"
+    act_scale_source: "env"
+
+  horizon: 5
+  batch_size: 2048
+  num_workers: 4
+  lr: 1.0e-2
+  weight_decay: 1.0e-5
+  num_epochs: 100
+
+  recon_pretrain_epochs: 0
+  recon_pretrain_lr: 1.0e-3
+  recon_pretrain_bilip: false
+  recon_pretrain_bilip_weight: 1.0
+
+  loss_threshold: -10.0           # early-stop effectively disabled
+
+  scheduler_step: 100
+  scheduler_gamma: 0.5
+
+  cosine_scheduler: false
+  cosine_T_max: 200
+  cosine_eta_min: 1.0e-6
+
+  riemannian_optimizer: true      # required by k_type=normalized (orthogonal layers)
+  vectorize_rollout: true
+  torch_compile: false
+
+  grad_clip: false
+  grad_clip_type: "norm"
+  grad_clip_value: 1.0
+
+  losses:
+    recon_weight: 1.0
+    pred_weight: 1.0
+    latent_consistency_weight: 0.5
+
+    latent_rollout_loss: false
+    latent_rollout_weight: 1.0
+    x_pred_weight: 1.0
+
+    l_inf_pred_loss: false
+    l_inf_pred_weight: 1.0
+
+    controllability_loss: false
+    ctrl_weight: 0.1
+
+    bi_lipschitz_loss: true
+    bilip_weight: 2.0
+    bilip_m_target: 1.0
+
+    spectral_loss: false
+    spectral_weight: 0.01
+
+    normality_loss: false
+    normality_weight: 2.0
+
+    cl_normality_loss: false
+    cl_normality_weight: 1.0
+
+    b_eigen_loss: true
+    b_eigen_weight: 1.0
+    b_eigen_min_scale: 0.3
+
+    b_scale_loss: false
+    b_scale_weight: 1.0
+    b_scale_target: 1.0
+
+    b_min_sv_loss: false
+    b_min_sv_weight: 1.0
+    b_min_sv_target: 0.1
+
+    eig_spread_loss: true
+    eig_spread_weight: 1.0
+    eig_spread_min_gap: 0.1
+
+    unstable_ctrl_loss: true
+    unstable_ctrl_weight: 0.05
+    unstable_ctrl_threshold: 1.0
+
+    unit_circle_gap_loss: false
+    unit_circle_gap_weight: 1.0
+    unit_circle_gap: 0.05
+
+    upper_lipschitz_loss: false
+    upper_lip_weight: 1.0
+    upper_lip_m_max: 1.25
+
+  b_fitting:
+    enabled: true
+    perturbed_dataset_name: "prior_best_pert"
+    method: "least_squares_projected"   # legacy train_for_B=false → LS + PBH/SVD projection
+    ctrl_lambda: 0.1                    # unused with this method, kept as legacy default
+    train_steps: 500                    # unused with this method, kept as legacy default
+    lr: 1.0e-3                          # unused with this method, kept as legacy default
+    log_interval: 100
+
+  seed: 42
+  log_interval: 10
+  experiment_name: "prior_best"
+  dataset_name: "prior_best"

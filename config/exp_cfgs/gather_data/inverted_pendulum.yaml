@@ -1,0 +1,28 @@
+# Gather config for InvertedPendulum-v4 (MuJoCo).
+#
+# Used with `bash launch/gather_data.sh ... --both`, which writes:
+#   - inverted_pendulum       (perturbations forced off — for A-only joint training)
+#   - inverted_pendulum_pert  (perturbations forced on  — for the analytical B refit)
+
+gather_data_cfg:
+  env_name: "InvertedPendulum-v4"
+  env_kwargs: {}                        # no custom wrappers needed
+
+  num_trajectories: 2000
+  max_episode_steps: 1000
+
+  base_policy:
+    name: "PD_policy"
+    params:
+      k_theta: 4.0
+      k_theta_dot: 0.5
+      action_clip: 3.0                  # InvertedPendulum-v4 action range is ±3
+
+  perturbations:
+    enabled: false                      # ignored when run with `--both`
+    perturb_scale: 1.0
+    fix_perturb_range: false
+    hold_steps: 5
+
+  dataset_name: "inverted_pendulum"
+  seed: 42

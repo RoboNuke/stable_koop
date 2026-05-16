@@ -20,6 +20,13 @@ import numpy as np
 from config.manager import AugmentationCfg
 
 
+def _fmt_vec(v) -> str:
+    """One-line per-dim formatter for small float vectors."""
+    if v is None:
+        return "n/a"
+    return "[" + ", ".join(f"{x:.3g}" for x in np.asarray(v).ravel()) + "]"
+
+
 def _scale_from(source: str, space_low, space_high, observed_min, observed_max):
     """Return the per-dim scale vector for the requested source."""
     if source == "env":
@@ -77,6 +84,23 @@ def augment_trajectories(ds, cfg: AugmentationCfg) -> list:
     else:
         koop_obs_scale = obs_scale
 
+    # --- pre-augmentation diagnostics ---
+    print("\n=== Augmentation ===")
+    print(f"  prepend_base_action: {cfg.prepend_base_action}")
+    print(f"  use_action_delta:    {cfg.use_action_delta}")
+    print(f"  obs_scale_source:    {cfg.obs_scale_source}")
+    print(f"  act_scale_source:    {cfg.act_scale_source}")
+    print("  --- raw env / observed bounds ---")
+    print(f"  obs env  low / high: {_fmt_vec(ds.obs_space_low)} / {_fmt_vec(ds.obs_space_high)}")
+    print(f"  obs obsv min / max:  {_fmt_vec(ds.obs_min)} / {_fmt_vec(ds.obs_max)}")
+    print(f"  act env  low / high: {_fmt_vec(ds.act_space_low)} / {_fmt_vec(ds.act_space_high)}")
+    print(f"  act obsv min / max:  {_fmt_vec(ds.act_min)} / {_fmt_vec(ds.act_max)}")
+    print("  --- chosen scales ---")
+    print(f"  obs scale (per dim): {_fmt_vec(obs_scale)}")
+    print(f"  act scale (per dim): {_fmt_vec(act_scale)}")
+    if cfg.prepend_base_action:
+        print(f"  koop_state scale ([obs; base_action]): {_fmt_vec(koop_obs_scale)}")
+
     out = []
     for states, actions, base_actions, _rewards in ds.trajectories:
         T = len(actions)
@@ -99,10 +123,22 @@ def augment_trajectories(ds, cfg: AugmentationCfg) -> list:
         if act_scale is not None:
             koopman_actions = koopman_actions / act_scale
 
-        # Two-phase legacy quirk: drop the last realized action to match the
-        # bit-equivalent layout used historically.
-        if cfg.prepend_base_action and cfg.use_action_delta:
+        # When prepending the base action, the augmented state channel only
+        # has T entries (one per available base_action) rather than T+1, so
+        # the matching action channel must drop its last entry to preserve
+        # the TrajectoryDataset invariant ``len(states) == len(actions) + 1``.
+        if cfg.prepend_base_action:
             koopman_actions = koopman_actions[:-1]
 
         out.append((koopman_states.astype(np.float32), koopman_actions.astype(np.float32)))
+
+    # --- post-augmentation diagnostics: per-dim min/max across all output ---
+    all_states = np.concatenate([s for s, _ in out], axis=0)
+    all_actions = np.concatenate([a for _, a in out], axis=0) if any(len(a) for _, a in out) else None
+    print("  --- post-augmentation (normalized) ---")
+    print(f"  koop_state min / max: {_fmt_vec(all_states.min(axis=0))} / {_fmt_vec(all_states.max(axis=0))}")
+    if all_actions is not None and all_actions.size > 0:
+        print(f"  koop_action min / max: {_fmt_vec(all_actions.min(axis=0))} / {_fmt_vec(all_actions.max(axis=0))}")
+    print(f"  trajectories: {len(out)}  transitions: {sum(len(a) for _, a in out)}")
+
     return out

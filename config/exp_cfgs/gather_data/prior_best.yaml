@@ -1,0 +1,38 @@
+# Gather config for the prior_best experiment.
+# Converted from https://github.com/RoboNuke/stable_koop/blob/main/config/pendulum.yaml
+# (legacy A-then-B flow: base_policy="none" + perturbations).
+#
+# Used with `bash launch/gather_data.sh ... --both`, which writes:
+#   - prior_best       (perturbations forced off — for A-only joint training)
+#   - prior_best_pert  (perturbations forced on  — for the analytical B refit)
+# In that mode the `perturbations.enabled` field below is ignored. If you call
+# `gather_data` without --both, the field controls a single-pass gather.
+
+gather_data_cfg:
+  env_name: "Pendulum-v1"
+  env_kwargs:
+    obs_type: "cos_sin"
+    limited_spawn: false
+    spawn_angle_range: 180.0
+    friction_coeff: 0.0
+
+  num_trajectories: 200
+  max_episode_steps: 200
+
+  base_policy:
+    name: "none"
+    params:
+      kp: 10.0
+      kd: 2.0
+      ke: 0.5
+      gamma: 0.9
+      switch_angle: 40.0
+
+  perturbations:
+    enabled: false
+    perturb_scale: 1.0
+    fix_perturb_range: false
+    hold_steps: 5
+
+  dataset_name: "prior_best"
+  seed: 42

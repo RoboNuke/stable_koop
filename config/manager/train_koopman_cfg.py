@@ -4,11 +4,11 @@ Field defaults mirror ``config/pendulum.yaml`` exactly. Enum-like choices
 (``approach``, ``k_type``, ``encoder_type``) are required (no default) so a
 YAML must name them explicitly.
 
-B is learned by the gradient-descent training loop alongside the rest of
-the model — there is no separate B-fitting step in either paradigm. Standalone
-B-fit routines (least-squares pseudoinverse, gradient with controllability
-regularization) live in :mod:`train_koopman.b_fitting` for ad-hoc use against
-a saved Koopman A, but they are not invoked by the training pipeline.
+The ``joint`` paradigm can optionally run an analytical B refit after the
+gradient-descent training: gradient descent on B alone with a controllability
+regularizer, against a separately-gathered perturbed dataset. See
+:class:`BFittingCfg` and :mod:`train_koopman.b_fitting`. The ``two_phase``
+paradigm is unaffected.
 """
 
 from __future__ import annotations
@@ -85,6 +85,36 @@ class LossesCfg:
 
 
 @dataclasses.dataclass(kw_only=True)
+class BFittingCfg:
+    """Optional post-training analytical B refit (joint paradigm only).
+
+    When ``enabled``, after the main training loop completes the perturbed
+    dataset is loaded, encoded with the trained model, and B is re-optimized
+    via gradient descent with a controllability regularizer (see
+    :func:`train_koopman.b_fitting.gradient_b`). The fitted B replaces
+    ``model.B.weight`` before the checkpoint is saved.
+    """
+
+    enabled: bool = False
+    perturbed_dataset_name: str = ""
+    """Dataset to load for the B refit (must contain non-zero perturbations).
+    Required when ``enabled``."""
+    method: str = "gradient"
+    """Fit method: ``gradient`` (Adam with controllability regularizer, initialized
+    from least-squares) or ``least_squares_projected`` (closed-form least-squares
+    followed by PBH+SVD controllability projection)."""
+    ctrl_lambda: float = 0.2
+    """Weight on the controllability regularizer ``−σ_min([B, AB, …, Aⁿ⁻¹B])``
+    (``gradient`` method only)."""
+    train_steps: int = 200
+    """Adam optimization steps over B (``gradient`` method only)."""
+    lr: float = 1.0e-4
+    """Learning rate for the B optimizer (``gradient`` method only)."""
+    log_interval: int = 100
+    """How often to print step diagnostics during ``gradient`` fit (0 disables)."""
+
+
+@dataclasses.dataclass(kw_only=True)
 class TrainKoopmanCfg:
     """Top-level Koopman-training config."""
 
@@ -149,6 +179,9 @@ class TrainKoopmanCfg:
     grad_clip_value: float = 1.0
 
     losses: LossesCfg = dataclasses.field(default_factory=LossesCfg)
+
+    b_fitting: BFittingCfg = dataclasses.field(default_factory=BFittingCfg)
+    """Optional analytical B refit (joint paradigm only)."""
 
     seed: int = 42
     log_interval: int = 10
