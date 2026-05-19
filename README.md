@@ -48,8 +48,11 @@ Run the full pipeline end-to-end for the bundled pendulum experiment:
 bash launch/run_all.sh pendulum
 ```
 
-This runs ``gather_data → train_koopman → fit_controller → train_residual → eval``
-in sequence using ``config/exp_cfgs/<stage>/pendulum.yaml`` for each stage.
+This runs ``gather_data → train_koopman (+ controller fit) → train_residual → eval``
+in sequence. Each stage uses ``config/exp_cfgs/<stage>/pendulum.yaml``,
+except training, which uses the combined
+``config/exp_cfgs/train_koopman/<controller_type>/pendulum.yaml`` file that
+carries both the Koopman training and controller-fit headers.
 
 ## Running individual stages
 
@@ -57,22 +60,32 @@ Each stage is independently runnable against the previous stage's saved
 outputs:
 
 ```
-bash launch/gather_data.sh   config/exp_cfgs/gather_data/pendulum.yaml
-bash launch/train_koopman.sh config/exp_cfgs/train_koopman/pendulum.yaml
-bash launch/fit_controller.sh config/exp_cfgs/controller/lqr/pendulum.yaml
+bash launch/gather_data.sh   config/exp_cfgs/gather_data/pendulum.yaml --both
+bash launch/train_koopman.sh config/exp_cfgs/train_koopman/lqr/pendulum.yaml
 bash launch/train_residual.sh config/exp_cfgs/train_residual/pendulum.yaml
 bash launch/eval.sh          config/exp_cfgs/eval/pendulum.yaml
 ```
 
+``train_koopman`` accepts two extra flags:
+
+* ``--skip_train`` — skip Koopman training and fit only the controller
+  against an already-saved model. The script prompts interactively for a
+  fresh controller experiment name so the new fit lands in a new subdir
+  under ``<koopman_dir>/lqr/``.
+* ``--koopman_path <path>`` — override the model checkpoint location.
+  Accepts a directory (containing ``koopman_ckpt.pt``) or the ``.pt``
+  file directly. When absent, the controller cfg's ``koopman_experiment_name``
+  field is used (``results/<name>/``).
+
 Stage outputs land under (each gitignored):
 
-| Stage           | Output                                          |
-|-----------------|-------------------------------------------------|
-| gather_data     | ``data/datasets/<dataset_name>.npz``            |
-| train_koopman   | ``train_koopman/weights/<experiment_name>/``    |
-| fit_controller  | ``controller/lqr/weights/<output_name>/``       |
-| train_residual  | ``train_residual/weights/<experiment_name>/``   |
-| eval            | ``eval/results/<results_name>/``                |
+| Stage             | Output                                                            |
+|-------------------|-------------------------------------------------------------------|
+| gather_data       | ``data/datasets/<dataset_name>.npz``                              |
+| train_koopman     | ``results/<experiment_name>/`` (ckpt, config.yaml, model_performance.yaml) |
+| (controller fit)  | ``results/<koopman_exp>/lqr/<output_name>/`` (lqr.pt, config.yaml, ctrl_performance.yaml) |
+| train_residual    | ``train_residual/weights/<experiment_name>/``                     |
+| eval              | ``eval/results/<results_name>/``                                  |
 
 ## Adding a new experiment
 

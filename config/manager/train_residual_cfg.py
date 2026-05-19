@@ -32,9 +32,9 @@ class TrainResidualCfg:
     memory_size: int = 100_000
 
     koopman_experiment_name: str = "pendulum_default"
-    """Source Koopman weights subdir under ``train_koopman/weights/``."""
+    """Source Koopman experiment subdir under ``results/``."""
     lqr_name: str = "pendulum_default"
-    """Source LQR weights name."""
+    """LQR fit subdir under ``results/<koopman_experiment_name>/lqr/``."""
     experiment_name: str = "pendulum_default"
     """Output subdir under ``train_residual/weights/``."""
     seed: int = 42

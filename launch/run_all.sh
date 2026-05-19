@@ -22,8 +22,7 @@ done
 echo "[run_all] experiment=$EXP_NAME residual=$RUN_RESIDUAL"
 
 bash launch/gather_data.sh "config/exp_cfgs/gather_data/${EXP_NAME}.yaml" --both
-bash launch/train_koopman.sh "config/exp_cfgs/train_koopman/${EXP_NAME}.yaml"
-bash launch/fit_controller.sh "config/exp_cfgs/controller/lqr/${EXP_NAME}.yaml"
+bash launch/train_koopman.sh "config/exp_cfgs/train_koopman/lqr/${EXP_NAME}.yaml"
 if [[ "$RUN_RESIDUAL" -eq 1 ]]; then
     bash launch/train_residual.sh "config/exp_cfgs/train_residual/${EXP_NAME}.yaml"
 else

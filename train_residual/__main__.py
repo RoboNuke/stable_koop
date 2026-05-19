@@ -19,8 +19,10 @@ from policy import make_policy
 from train_koopman.checkpointing import load_koopman_experiment, make_device
 
 
-def _load_lqr(name: str):
-    lqr_path = Path("controller") / "lqr" / "weights" / name / "lqr.pt"
+def _load_lqr(koopman_experiment_name: str, lqr_name: str):
+    lqr_path = (
+        Path("results") / koopman_experiment_name / "lqr" / lqr_name / "lqr.pt"
+    )
     raw = torch.load(lqr_path, map_location="cpu")
     # Reconstruct minimal LQR-compatible object with the saved F/P.
     class _LoadedLQR:
@@ -44,7 +46,7 @@ def run(cfg: TrainResidualCfg) -> str:
     model, train_cfg, _state_dim, _action_dim = load_koopman_experiment(
         cfg.koopman_experiment_name, device
     )
-    lqr = _load_lqr(cfg.lqr_name)
+    lqr = _load_lqr(cfg.koopman_experiment_name, cfg.lqr_name)
     base_policy, gather_snap = _base_policy_from_dataset(train_cfg.dataset_name)
 
     env_name = gather_snap["env_name"]

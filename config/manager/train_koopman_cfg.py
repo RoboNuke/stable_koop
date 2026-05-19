@@ -115,6 +115,32 @@ class BFittingCfg:
 
 
 @dataclasses.dataclass(kw_only=True)
+class VisualizationCfg:
+    """Optional 3D voxel-binned one-step state-prediction-error visualizer.
+
+    Bins every training transition by the start state's 3D object position
+    (goal-relative when ``goal_obs_indices`` is set), averages the
+    state-space one-step prediction error within each voxel, then writes
+    per-z-slice PNG heatmaps and a GIF sweeping through z.
+    """
+
+    enabled: bool = False
+    object_pos_obs_indices: list[int] = dataclasses.field(
+        default_factory=lambda: [0, 1, 2]
+    )
+    """Indices into the raw obs vector that give the object's (x, y, z) position."""
+    goal_obs_indices: list[int] | None = None
+    """Indices into the raw obs vector that give the goal's (x, y, z) position.
+    Read from the first state of each trajectory and subtracted from the object
+    position so all trajectories are aligned to a common (0, 0, 0). ``None``
+    skips the subtraction."""
+    voxel_size: float = 0.05
+    """Side length of the cubic voxel in workspace units."""
+    gif_seconds: float = 5.0
+    """Total GIF length in seconds; per-frame duration = gif_seconds / num_z_slices."""
+
+
+@dataclasses.dataclass(kw_only=True)
 class TrainKoopmanCfg:
     """Top-level Koopman-training config."""
 
@@ -183,9 +209,14 @@ class TrainKoopmanCfg:
     b_fitting: BFittingCfg = dataclasses.field(default_factory=BFittingCfg)
     """Optional analytical B refit (joint paradigm only)."""
 
+    visualization: VisualizationCfg = dataclasses.field(default_factory=VisualizationCfg)
+    """Optional 3D voxel-binned state-error visualizer (off by default)."""
+
     seed: int = 42
     log_interval: int = 10
     experiment_name: str = "pendulum_default"
-    """Subdirectory under ``train_koopman/weights/``."""
+    """Subdirectory under ``results/`` where the koopman checkpoint,
+    ``model_performance.yaml``, ``config.yaml``, and any controller-fit
+    subdirs are saved."""
     dataset_name: str = "pendulum_default"
     """Dataset to load from ``data/datasets/<dataset_name>.npz``."""

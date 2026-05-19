@@ -108,10 +108,12 @@ class ConfigManager:
 
     @classmethod
     def load_stage(cls, yaml_path: str | Path, header: str):
-        """Load and return a single stage's dataclass instance from a per-stage YAML.
+        """Load a single stage's dataclass instance from a YAML file.
 
-        The YAML must contain exactly one top-level mapping whose key equals
-        ``header``. Strict on field names just like :meth:`load`.
+        The YAML may carry the requested ``header`` either alone or alongside
+        other known headers (the latter is how a combined train_koopman + LQR
+        YAML works). Unknown headers raise. Strict on field names just like
+        :meth:`load`.
         """
         if header not in cls.REGISTRY:
             raise KeyError(
@@ -125,10 +127,15 @@ class ConfigManager:
             raise ValueError(
                 f"Config root in {path} must be a mapping, got {type(raw).__name__}"
             )
-        if set(raw) != {header}:
+        if header not in raw:
             raise KeyError(
-                f"Per-stage YAML {path} must contain exactly the single header "
-                f"{header!r}; got {sorted(raw)}"
+                f"Header {header!r} not found in {path}; got {sorted(raw)}"
+            )
+        unknown = set(raw) - set(cls.REGISTRY)
+        if unknown:
+            raise KeyError(
+                f"Unknown header(s) {sorted(unknown)} in {path}; "
+                f"expected only registered headers {sorted(cls.REGISTRY)}"
             )
         return cls._build(cls.REGISTRY[header], raw[header], context=header)
 

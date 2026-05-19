@@ -72,6 +72,17 @@ register_env_scorer(
     make_koopman_heatmap=make_koopman_angle_heatmap,
 )
 
+from eval.inverted_pendulum_metrics import (  # noqa: E402
+    inverted_pendulum_check_success,
+    inverted_pendulum_compute_metrics,
+)
+
+register_env_scorer(
+    "InvertedPendulum-v4",
+    check_success=inverted_pendulum_check_success,
+    compute_metrics=inverted_pendulum_compute_metrics,
+)
+
 
 from eval.policy_rollout import evaluate, load_eval_stats  # noqa: E402
 from eval.koopman_accuracy import evaluate_model  # noqa: E402

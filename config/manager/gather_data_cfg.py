@@ -60,6 +60,48 @@ class PerturbationCfg:
 
 
 @dataclasses.dataclass(kw_only=True)
+class ForgeDRFreezeCfg:
+    """Collapse FORGE/IsaacLab domain-randomization ranges to fixed values.
+
+    The base policy is typically trained with DR over physics + sensor knobs.
+    For Koopman data collection we want a single deterministic "real-world"
+    instantiation, so each randomized parameter listed here gets its range
+    collapsed to ``(value, value)`` — the manager-side sampler still runs but
+    always returns ``value``. Any field left as ``None`` leaves the
+    corresponding randomization event active (the training DR distribution).
+
+    The mapping from these semantic names to IsaacLab event-cfg paths lives
+    in the FORGE env wrapper builder.
+    """
+
+    # Contact / material (object + fingertip surfaces).
+    static_friction: float | None = None
+    dynamic_friction: float | None = None
+    restitution: float | None = None
+
+    # Object properties.
+    object_mass: float | None = None
+    object_inertia_scale: float | None = None
+    object_com_offset: tuple[float, float, float] | None = None
+
+    # Robot joint dynamics.
+    joint_friction: float | None = None
+    joint_damping: float | None = None
+    joint_stiffness: float | None = None
+    """Impedance Kp."""
+    joint_armature: float | None = None
+    """Reflected motor inertia."""
+    actuator_gain_scaling: float | None = None
+    """Multiplier on commanded torque/force."""
+
+    # Sensor / actuator noise (set to 0.0 to fully disable noise).
+    observation_noise_std: float | None = None
+    ft_sensor_noise_std: float | None = None
+    """F/T sensor noise; called out separately because FORGE leans on it."""
+    action_noise_std: float | None = None
+
+
+@dataclasses.dataclass(kw_only=True)
 class GatherDataCfg:
     """Top-level data-gathering config — one call produces one dataset."""
 
@@ -76,6 +118,17 @@ class GatherDataCfg:
         default_factory=lambda: BasePolicyCfg(name="none")
     )
     perturbations: PerturbationCfg = dataclasses.field(default_factory=PerturbationCfg)
+
+    dr_freeze: ForgeDRFreezeCfg = dataclasses.field(default_factory=ForgeDRFreezeCfg)
+    """FORGE/IsaacLab DR overrides applied when constructing the env. Defaults
+    are all ``None`` (no overrides); pendulum / inverted_pendulum experiments
+    ignore the block entirely."""
+
+    eval_cfg_path: str = ""
+    """Path to the eval YAML used for dataset success thresholds. Required
+    when the env has a registered :class:`eval.EnvScorer` (so the gather-time
+    stats use the same thresholds you'll see in the eval step instead of
+    hardcoded fallbacks)."""
 
     dataset_name: str = "default"
     seed: int = 42

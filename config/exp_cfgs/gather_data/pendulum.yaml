@@ -28,5 +28,7 @@ gather_data_cfg:
     fix_perturb_range: false
     hold_steps: 5
 
+  eval_cfg_path: "config/exp_cfgs/eval/pendulum.yaml"
+
   dataset_name: "basic_pendulum"
   seed: 42

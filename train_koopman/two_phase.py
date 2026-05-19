@@ -20,10 +20,11 @@ from data.augmentation import augment_trajectories
 from data.dataloader import load_dataset
 from train_koopman.checkpointing import (
     build_koopman_model,
+    experiment_dir,
     make_device,
     save_checkpoint,
-    weights_dir,
 )
+from train_koopman.save_performance import save_model_performance
 from train_koopman.training_loop import train
 
 
@@ -53,8 +54,8 @@ def _phase1_cfg(train_cfg: TrainKoopmanCfg) -> TrainKoopmanCfg:
 
 
 def run(train_cfg: TrainKoopmanCfg) -> str:
-    """End-to-end two-phase training; returns the output weights directory."""
-    out_dir = weights_dir(train_cfg.experiment_name)
+    """End-to-end two-phase training; returns the output experiment directory."""
+    out_dir = experiment_dir(train_cfg.experiment_name)
 
     device = make_device()
     ds = load_dataset(train_cfg.dataset_name)
@@ -68,7 +69,7 @@ def run(train_cfg: TrainKoopmanCfg) -> str:
 
     # --- Phase 1: core losses only ---
     print("\n=== Phase 1: Pre-Train Koopman Model (Core Losses Only) ===")
-    model = train(model, aug_trajectories, _phase1_cfg(train_cfg))
+    model, _phase1_stats = train(model, aug_trajectories, _phase1_cfg(train_cfg))
     save_checkpoint(
         model,
         train_cfg,
@@ -86,7 +87,7 @@ def run(train_cfg: TrainKoopmanCfg) -> str:
     else:
         nn.init.kaiming_uniform_(model.B.weight)
         print("Reinitialized B matrix with random weights")
-    model = train(model, aug_trajectories, train_cfg)
+    model, training_stats = train(model, aug_trajectories, train_cfg)
     save_checkpoint(
         model,
         train_cfg,
@@ -96,4 +97,13 @@ def run(train_cfg: TrainKoopmanCfg) -> str:
     )
     print(f"Phase 2 checkpoint saved to {out_dir / 'koopman_ckpt.pt'}")
 
+    save_model_performance(
+        out_dir=out_dir,
+        model=model,
+        train_cfg=train_cfg,
+        aug_trajectories=aug_trajectories,
+        device=device,
+        training_stats=training_stats,
+        ds=ds,
+    )
     return str(out_dir)

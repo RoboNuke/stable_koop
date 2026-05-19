@@ -3,9 +3,8 @@ __pycache__/
 
 # Stage outputs (gitignored — produced by running the pipeline)
 data/datasets/
-train_koopman/weights/
+results/
 train_residual/weights/
-controller/lqr/weights/
 eval/results/
 
 # Legacy artifacts (kept ignored defensively)

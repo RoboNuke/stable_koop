@@ -45,7 +45,14 @@ class LQRControllerCfg:
         default_factory=StabilityAnalysisCfg
     )
 
+    eval_cfg_path: str = ""
+    """Path to the eval YAML used at the end of the controller fit to roll
+    out base policy + (optional) residual policy and record per-step
+    diagnostics (``z_t``, ``z_pred``, ``x_pred``, etc.) to
+    ``eval_traj.npz`` in the controller's output directory. Required when
+    the env has a registered :class:`eval.EnvScorer`."""
+
     koopman_experiment_name: str = "pendulum_default"
-    """Source Koopman weights subdir under ``train_koopman/weights/``."""
+    """Source Koopman experiment subdir under ``results/``."""
     output_name: str = "pendulum_default"
-    """Output subdir under ``controller/lqr/weights/`` (or equivalent)."""
+    """Output subdir under ``results/<koopman_experiment_name>/lqr/``."""

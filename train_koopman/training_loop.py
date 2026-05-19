@@ -213,4 +213,12 @@ def train(model, trajectories, train_cfg: TrainKoopmanCfg):
         print(f"  {name:>6s}: {best_components[name]:.6f}")
     print(f"  Epochs: {epoch}/{train_cfg.num_epochs}")
 
-    return model
+    training_stats = {
+        "best_loss": float(best_loss),
+        "best_epoch": int(best_epoch),
+        "num_epochs_completed": int(epoch),
+        "num_epochs_planned": int(train_cfg.num_epochs),
+        "active_losses": list(active_names),
+        "best_components": {name: float(v) for name, v in best_components.items()},
+    }
+    return model, training_stats

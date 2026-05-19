@@ -1,12 +1,14 @@
-# Koopman training for the pendulum experiment.
-# Mirrors config/pendulum.yaml defaults verbatim.
+# Koopman training + LQR controller fit for the pendulum experiment.
+# Both stages live in one file; `python -m train_koopman --config <this file>`
+# runs training and then the LQR fit. Pass `--skip_train` to fit the
+# controller against an already-saved model.
 
 train_koopman_cfg:
   approach: "joint"           # "two_phase" or "joint"
   k_type: "schur"            # "cayley", "schur", "normalized", "complex_normal", "unbounded"
   encoder_type: "trig"          # "linear" or "trig"
 
-  latent_dim: 2 
+  latent_dim: 2
   rho: 0.95
   encoder_spec_norm: false
   encoder_latent: 16
@@ -117,3 +119,20 @@ train_koopman_cfg:
   log_interval: 10
   experiment_name: "pendulum_baseline"
   dataset_name: "basic_pendulum"
+
+
+lqr_controller_cfg:
+  q_scale: 1000.0
+  q_epsilon_scale: 0.0
+  r_scale: 0.0001
+  scale_B: false
+
+  stability_analysis:
+    epsilon_x: 0.3                # max tracking error in x-space
+    eta: 0.1                      # latent-space displacement bound
+    use_optimization: true        # run SDP (no-prepend) or L-BFGS α (prepend) optimizer
+
+  eval_cfg_path: "config/exp_cfgs/eval/pendulum.yaml"
+
+  koopman_experiment_name: "pendulum_baseline"
+  output_name: "pendulum_baseline"

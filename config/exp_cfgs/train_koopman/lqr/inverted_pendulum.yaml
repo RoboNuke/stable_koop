@@ -1,4 +1,4 @@
-# Koopman training for InvertedPendulum-v4.
+# Koopman training + LQR controller fit for InvertedPendulum-v4.
 # Joint paradigm with analytical B refit on the perturbed dataset (mirrors
 # the legacy A-then-B flow): the base dataset has identical action and
 # base_action, so `use_action_delta: true` produces a zero action channel
@@ -45,7 +45,7 @@ train_koopman_cfg:
   cosine_T_max: 200
   cosine_eta_min: 1.0e-6
 
-  riemannian_optimizer: false            # required by k_type=normalized
+  riemannian_optimizer: false
   vectorize_rollout: true
   torch_compile: true
 
@@ -122,3 +122,20 @@ train_koopman_cfg:
   log_interval: 10
   experiment_name: "inverted_pendulum"
   dataset_name: "inverted_pendulum"
+
+
+lqr_controller_cfg:
+  q_scale: 1.0
+  q_epsilon_scale: 0.0
+  r_scale: 1.0
+  scale_B: false
+
+  stability_analysis:
+    epsilon_x: 0.3
+    eta: 0.1
+    use_optimization: true
+
+  eval_cfg_path: "config/exp_cfgs/eval/inverted_pendulum.yaml"
+
+  koopman_experiment_name: "inverted_pendulum"
+  output_name: "inverted_pendulum"

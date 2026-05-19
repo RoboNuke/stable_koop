@@ -118,24 +118,41 @@ def load_checkpoint(model, path: str | Path, device: torch.device) -> dict:
     return checkpoint
 
 
-def weights_dir(experiment_name: str) -> Path:
-    """Standard output subdir for a Koopman training run."""
-    out = Path("train_koopman") / "weights" / experiment_name
+def experiment_dir(experiment_name: str) -> Path:
+    """Output dir for a Koopman experiment: ``results/<experiment_name>/``.
+
+    Holds the model checkpoint (``koopman_ckpt.pt``), a copy of the input
+    config (``config.yaml``), the training-summary file
+    (``model_performance.yaml``), and any controller-fit subdirs
+    (``<controller_type>/<output_name>/``).
+    """
+    out = Path("results") / experiment_name
     out.mkdir(parents=True, exist_ok=True)
     return out
 
 
 def load_koopman_experiment(
-    experiment_name: str, device: torch.device
+    experiment_name: str,
+    device: torch.device,
+    *,
+    ckpt_path: str | Path | None = None,
 ) -> tuple[KoopmanAutoencoder, TrainKoopmanCfg, int, int]:
     """Canonical loader.
 
-    Reads ``train_koopman/weights/<experiment_name>/koopman_ckpt.pt``, rebuilds
-    the :class:`TrainKoopmanCfg` from the saved nested dict, builds the model,
-    loads the state dict (stripping ``_orig_mod.`` torch-compile prefix), and
-    returns ``(model, train_cfg, state_dim, action_dim)``.
+    By default reads ``results/<experiment_name>/koopman_ckpt.pt``.
+    ``ckpt_path`` overrides the lookup: pass a directory (with
+    ``koopman_ckpt.pt`` inside) or a direct ``.pt`` file path.
+
+    Rebuilds the :class:`TrainKoopmanCfg` from the saved nested dict, builds the
+    model, loads the state dict (stripping the ``_orig_mod.`` torch-compile
+    prefix), and returns ``(model, train_cfg, state_dim, action_dim)``.
     """
-    ckpt_path = Path("train_koopman") / "weights" / experiment_name / "koopman_ckpt.pt"
+    if ckpt_path is None:
+        ckpt_path = Path("results") / experiment_name / "koopman_ckpt.pt"
+    else:
+        ckpt_path = Path(ckpt_path)
+        if ckpt_path.is_dir():
+            ckpt_path = ckpt_path / "koopman_ckpt.pt"
     raw = torch.load(ckpt_path, map_location=device)
     if not isinstance(raw.get("config"), dict) or "state_dim" not in raw:
         raise RuntimeError(

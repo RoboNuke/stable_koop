@@ -21,10 +21,11 @@ from data.dataloader import load_dataset
 from train_koopman.b_fitting import gradient_b, least_squares_projected_b
 from train_koopman.checkpointing import (
     build_koopman_model,
+    experiment_dir,
     make_device,
     save_checkpoint,
-    weights_dir,
 )
+from train_koopman.save_performance import save_model_performance
 from train_koopman.training_loop import train
 
 
@@ -55,8 +56,12 @@ def _encode_transitions(model, aug_trajectories, device):
     return torch.cat(z_t_list, dim=0), torch.cat(z_next_list, dim=0), torch.cat(u_list, dim=0)
 
 
-def _refit_b_analytical(model, train_cfg: TrainKoopmanCfg, device) -> None:
-    """Reinit B, encode perturbed trajectories, fit B with the chosen method."""
+def _refit_b_analytical(model, train_cfg: TrainKoopmanCfg, device) -> dict:
+    """Reinit B, encode perturbed trajectories, fit B with the chosen method.
+
+    Returns a small summary dict describing the refit for inclusion in
+    ``model_performance.yaml``.
+    """
     bcfg = train_cfg.b_fitting
     if not bcfg.perturbed_dataset_name:
         raise ValueError(
@@ -100,14 +105,19 @@ def _refit_b_analytical(model, train_cfg: TrainKoopmanCfg, device) -> None:
 
     with torch.no_grad():
         model.B.weight.copy_(B_new.to(model.B.weight.dtype).to(model.B.weight.device))
-    print(
-        f"  ||B||_2 before refit: {torch.linalg.norm(B_before, ord=2).item():.4e}  "
-        f"after: {torch.linalg.norm(B_new, ord=2).item():.4e}"
-    )
+    b_norm_before = float(torch.linalg.norm(B_before, ord=2).item())
+    b_norm_after = float(torch.linalg.norm(B_new, ord=2).item())
+    print(f"  ||B||_2 before refit: {b_norm_before:.4e}  after: {b_norm_after:.4e}")
+    return {
+        "method": bcfg.method,
+        "perturbed_dataset_name": bcfg.perturbed_dataset_name,
+        "B_norm_before": b_norm_before,
+        "B_norm_after": b_norm_after,
+    }
 
 
 def run(train_cfg: TrainKoopmanCfg) -> str:
-    out_dir = weights_dir(train_cfg.experiment_name)
+    out_dir = experiment_dir(train_cfg.experiment_name)
 
     device = make_device()
     ds = load_dataset(train_cfg.dataset_name)
@@ -120,10 +130,11 @@ def run(train_cfg: TrainKoopmanCfg) -> str:
     aug_trajectories = augment_trajectories(ds, train_cfg.augmentation)
 
     print("\n=== Joint Training: A + B + Encoder Together ===")
-    model = train(model, aug_trajectories, train_cfg)
+    model, training_stats = train(model, aug_trajectories, train_cfg)
 
+    b_summary = None
     if train_cfg.b_fitting.enabled:
-        _refit_b_analytical(model, train_cfg, device)
+        b_summary = _refit_b_analytical(model, train_cfg, device)
 
     save_checkpoint(
         model,
@@ -133,4 +144,15 @@ def run(train_cfg: TrainKoopmanCfg) -> str:
         path=out_dir / "koopman_ckpt.pt",
     )
     print(f"Checkpoint saved to {out_dir / 'koopman_ckpt.pt'}")
+
+    save_model_performance(
+        out_dir=out_dir,
+        model=model,
+        train_cfg=train_cfg,
+        aug_trajectories=aug_trajectories,
+        device=device,
+        training_stats=training_stats,
+        b_fitting_summary=b_summary,
+        ds=ds,
+    )
     return str(out_dir)

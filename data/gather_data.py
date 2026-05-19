@@ -119,6 +119,19 @@ def collect_trajectories(
 # ---------------------------------------------------------------------------
 
 
+def dataset_dir(folder_name: str) -> Path:
+    """Folder holding every artifact for ``folder_name``'s dataset(s).
+
+    With ``--both`` the base and perturbed npz files share this folder. Each
+    npz writes its own ``<dataset_name>_config.yaml`` snapshot next to the
+    data; a shared ``metadata.yaml`` (written by :mod:`data.dataset_stats`)
+    holds the stats for every dataset in the folder.
+    """
+    out = Path("data") / "datasets" / folder_name
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 def save_dataset(
     dataset_name: str,
     trajectories,
@@ -129,11 +142,16 @@ def save_dataset(
     act_space_high: np.ndarray,
     perturbations_enabled: bool,
     cfg: GatherDataCfg,
+    folder_name: str | None = None,
 ) -> Path:
-    """Write the raw dataset .npz; companion to :func:`data.dataloader.load_dataset`."""
-    out_dir = Path("data") / "datasets"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{dataset_name}.npz"
+    """Write the raw dataset .npz + a per-dataset config.yaml into the folder.
+
+    ``folder_name`` defaults to ``dataset_name``. When called from
+    :func:`gather_both`, both the base and the perturbed gather pass the same
+    ``folder_name`` so their npz files share one directory.
+    """
+    folder = dataset_dir(folder_name or dataset_name)
+    out_path = folder / f"{dataset_name}.npz"
 
     # Observed min/max across the actual collected data.
     all_states = np.concatenate([s for s, _, _, _ in trajectories], axis=0)
@@ -143,6 +161,9 @@ def save_dataset(
     act_min = all_actions.min(axis=0).astype(np.float32)
     act_max = all_actions.max(axis=0).astype(np.float32)
 
+    cfg_yaml_str = yaml.safe_dump(
+        {"gather_data_cfg": dataclasses.asdict(cfg)}, sort_keys=False
+    )
     save_dict = {
         "num_trajectories": np.array(len(trajectories)),
         "state_dim": np.array(int(obs_space_low.shape[0])),
@@ -156,11 +177,7 @@ def save_dataset(
         "act_min": act_min,
         "act_max": act_max,
         "perturbations_enabled": np.array(perturbations_enabled),
-        "config_yaml": np.array(
-            yaml.safe_dump(
-                {"gather_data_cfg": dataclasses.asdict(cfg)}, sort_keys=False
-            )
-        ),
+        "config_yaml": np.array(cfg_yaml_str),
     }
     for i, (s, a, ba, r) in enumerate(trajectories):
         save_dict[f"states_{i}"] = s
@@ -168,6 +185,10 @@ def save_dataset(
         save_dict[f"base_actions_{i}"] = ba
         save_dict[f"rewards_{i}"] = r
     np.savez(out_path, **save_dict)
+
+    # Per-dataset gather config copy.
+    cfg_path = folder / f"{dataset_name}_config.yaml"
+    cfg_path.write_text(cfg_yaml_str)
     return out_path
 
 
@@ -176,8 +197,13 @@ def save_dataset(
 # ---------------------------------------------------------------------------
 
 
-def gather(cfg: GatherDataCfg) -> Path:
-    """Run one gather call against ``cfg`` and write a single dataset."""
+def gather(cfg: GatherDataCfg, *, folder_name: str | None = None) -> Path:
+    """Run one gather call against ``cfg`` and write a single dataset.
+
+    ``folder_name`` lets the caller pin the on-disk folder (used by
+    :func:`gather_both` so the base and perturbed npz files end up in the
+    same directory). Defaults to ``cfg.dataset_name``.
+    """
     env = make_single_env(env_name=cfg.env_name, env_kwargs=cfg.env_kwargs)
     base_policy = make_policy(cfg.base_policy.name, **cfg.base_policy.params)
 
@@ -214,12 +240,13 @@ def gather(cfg: GatherDataCfg) -> Path:
         act_space_high=act_space_high,
         perturbations_enabled=cfg.perturbations.enabled,
         cfg=cfg,
+        folder_name=folder_name,
     )
     print(f"[gather_data] wrote {out}")
 
     # Report base-policy performance on the freshly written dataset.
     from data.dataset_stats import evaluate_dataset
-    evaluate_dataset(cfg.dataset_name)
+    evaluate_dataset(cfg.dataset_name, folder_name=folder_name)
 
     return out
 
@@ -229,8 +256,10 @@ def gather_both(cfg: GatherDataCfg) -> tuple[Path, Path]:
 
     Writes ``cfg.dataset_name`` (perturbations off) and ``cfg.dataset_name + '_pert'``
     (perturbations on), regardless of what the YAML says for ``perturbations.enabled``.
-    Both datasets share the same env / base policy / seed / hyperparameters.
+    Both datasets share the same env / base policy / seed / hyperparameters and
+    land in the same folder ``data/datasets/<cfg.dataset_name>/``.
     """
+    folder_name = cfg.dataset_name
     base_cfg = dataclasses.replace(
         cfg,
         perturbations=dataclasses.replace(cfg.perturbations, enabled=False),
@@ -241,9 +270,9 @@ def gather_both(cfg: GatherDataCfg) -> tuple[Path, Path]:
         dataset_name=f"{cfg.dataset_name}_pert",
     )
     print(f"[gather_data] --both: gathering {base_cfg.dataset_name} (perturbations off)")
-    base_path = gather(base_cfg)
+    base_path = gather(base_cfg, folder_name=folder_name)
     print(f"[gather_data] --both: gathering {pert_cfg.dataset_name} (perturbations on)")
-    pert_path = gather(pert_cfg)
+    pert_path = gather(pert_cfg, folder_name=folder_name)
     return base_path, pert_path
 
 

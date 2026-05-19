@@ -22,13 +22,17 @@ import yaml
 from data.dataloader import load_dataset
 
 
-# Hardcoded default thresholds for ``EnvScorer.check_success`` callers that
-# need a cfg blob. Match the legacy ``launch/eval_policy.py`` defaults.
-_DEFAULT_SUCCESS_CFG = {
-    "success_angle_deg": 15.0,
-    "success_max_thdot": 1.0,
-    "success_hold_steps": 20,
-}
+def _success_cfg_from_eval(eval_cfg_path: str) -> dict:
+    """Load an EvalCfg YAML and return the dict the scorer needs."""
+    from config.manager.manager import ConfigManager
+
+    eval_cfg = ConfigManager.load_stage(eval_cfg_path, "eval_cfg")
+    return {
+        "success_angle_deg": eval_cfg.success_angle_deg,
+        "success_max_thdot": eval_cfg.success_max_thdot,
+        "success_max_cart_vel": eval_cfg.success_max_cart_vel,
+        "success_hold_steps": eval_cfg.success_hold_steps,
+    }
 
 
 def _mean_std(values) -> tuple[float, float]:
@@ -70,16 +74,33 @@ def _print_table(per_traj: list[dict], success_mask: np.ndarray, metric_keys: li
         )
 
 
-def evaluate_dataset(dataset_name: str) -> dict:
+def evaluate_dataset(
+    dataset_name: str,
+    *,
+    folder_name: str | None = None,
+    eval_cfg_path: str | None = None,
+) -> dict:
     """Compute + print summary stats for a saved dataset.
 
-    Returns a dict of the computed stats (suitable for YAML serialization).
+    Success thresholds come from the eval YAML at ``eval_cfg_path`` when
+    provided. If not provided, the path stored in the dataset's saved
+    ``gather_data_cfg.eval_cfg_path`` is used. If the env has a registered
+    scorer and no eval cfg is resolvable, this raises — the gather pipeline
+    is expected to point at an eval config so the gather-time stats use
+    the same thresholds the eval step will use.
+
+    Writes/updates ``data/datasets/<folder_name>/metadata.yaml`` keyed by
+    ``dataset_name`` so ``--both`` runs produce base and ``_pert`` entries
+    in the same file.
     """
     ds = load_dataset(dataset_name)
     snap = yaml.safe_load(ds.config_yaml).get("gather_data_cfg", {})
     env_name = snap.get("env_name", "<unknown>")
     max_episode_steps = snap.get("max_episode_steps", None)
     base_policy = snap.get("base_policy", {}).get("name", "<unknown>")
+    dr_freeze = snap.get("dr_freeze", {})
+    if eval_cfg_path is None:
+        eval_cfg_path = snap.get("eval_cfg_path", "") or ""
     n = len(ds.trajectories)
 
     print("\n" + "=" * 86)
@@ -116,6 +137,14 @@ def evaluate_dataset(dataset_name: str) -> dict:
     success_mask: np.ndarray
     success_source: str
     if scorer is not None:
+        if not eval_cfg_path:
+            raise ValueError(
+                f"evaluate_dataset({dataset_name!r}): env {env_name!r} has a "
+                "registered scorer but no eval_cfg_path was provided. Set "
+                "`eval_cfg_path` in the gather YAML to point at the matching "
+                "eval config so dataset-time success thresholds match eval-time."
+            )
+        success_cfg = _success_cfg_from_eval(eval_cfg_path)
         # Extend per-traj dicts with scorer metrics + compute scorer-defined success.
         for i, (states, actions, _bases, _rewards) in enumerate(ds.trajectories):
             extra = scorer.compute_metrics(states, actions)
@@ -123,14 +152,12 @@ def evaluate_dataset(dataset_name: str) -> dict:
             extra.pop("reward", None)
             per_traj[i].update(extra)
         success_mask = np.array(
-            [scorer.check_success(s, _DEFAULT_SUCCESS_CFG) for s, *_ in ds.trajectories]
+            [scorer.check_success(s, success_cfg) for s, *_ in ds.trajectories]
         )
-        success_source = (
-            f"{env_name} scorer "
-            f"(angle≤{_DEFAULT_SUCCESS_CFG['success_angle_deg']}°, "
-            f"|θ̇|≤{_DEFAULT_SUCCESS_CFG['success_max_thdot']}, "
-            f"hold={_DEFAULT_SUCCESS_CFG['success_hold_steps']})"
+        thresholds = ", ".join(
+            f"{k.removeprefix('success_')}={v}" for k, v in success_cfg.items()
         )
+        success_source = f"{env_name} scorer ({thresholds}) [from {eval_cfg_path}]"
     elif max_episode_steps is not None:
         success_mask = np.array([m["length"] == max_episode_steps for m in per_traj])
         success_source = f"reached max_episode_steps ({max_episode_steps})"
@@ -160,6 +187,7 @@ def evaluate_dataset(dataset_name: str) -> dict:
         "perturbations_enabled": bool(ds.perturbations_enabled),
         "trajectories": n,
         "max_episode_steps": max_episode_steps,
+        "dr_freeze": dr_freeze,
         "success_count": n_success,
         "failure_count": n_failure,
         "success_rate": rate,
@@ -180,4 +208,28 @@ def evaluate_dataset(dataset_name: str) -> dict:
             mean, std = _mean_std(vals)
             group_stats[key] = {"mean": mean, "std": std}
         out[group] = group_stats
+
+    # Persist into the dataset folder's shared metadata.yaml (keyed by dataset_name
+    # so a --both gather ends up with both base and pert entries).
+    _write_metadata(folder_name or dataset_name, dataset_name, out)
     return out
+
+
+def _write_metadata(folder_name: str, dataset_name: str, stats: dict) -> None:
+    """Merge ``stats`` into ``data/datasets/<folder_name>/metadata.yaml``."""
+    from pathlib import Path
+
+    meta_path = Path("data") / "datasets" / folder_name / "metadata.yaml"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict = {}
+    if meta_path.is_file():
+        try:
+            loaded = yaml.safe_load(meta_path.read_text()) or {}
+            if isinstance(loaded, dict):
+                existing = loaded
+        except yaml.YAMLError:
+            existing = {}
+    existing[dataset_name] = stats
+    meta_path.write_text(yaml.safe_dump(existing, sort_keys=False, default_flow_style=False))
+    print(f"  metadata saved to {meta_path}")

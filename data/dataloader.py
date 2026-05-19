@@ -47,10 +47,25 @@ class LoadedDataset:
 
 
 def load_dataset(dataset_name: str, datasets_dir: str | Path = "data/datasets") -> LoadedDataset:
-    """Load a dataset written by :func:`data.gather_data.save_dataset`."""
-    path = Path(datasets_dir) / f"{dataset_name}.npz"
-    if not path.is_file():
-        raise FileNotFoundError(f"Dataset not found: {path}")
+    """Load a dataset written by :func:`data.gather_data.save_dataset`.
+
+    Looks for ``<datasets_dir>/<dataset_name>/<dataset_name>.npz`` first
+    (the standalone-gather layout). If ``dataset_name`` ends in ``_pert``,
+    also checks the shared ``--both`` folder
+    ``<datasets_dir>/<base>/<dataset_name>.npz`` where ``base`` is the
+    name with the ``_pert`` suffix stripped.
+    """
+    root = Path(datasets_dir)
+    candidates = [root / dataset_name / f"{dataset_name}.npz"]
+    if dataset_name.endswith("_pert"):
+        base = dataset_name[: -len("_pert")]
+        candidates.append(root / base / f"{dataset_name}.npz")
+    path = next((p for p in candidates if p.is_file()), None)
+    if path is None:
+        raise FileNotFoundError(
+            f"Dataset {dataset_name!r} not found; tried: "
+            + ", ".join(str(p) for p in candidates)
+        )
     arr = np.load(path, allow_pickle=False)
 
     num = int(arr["num_trajectories"])

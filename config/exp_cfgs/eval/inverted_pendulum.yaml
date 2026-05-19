@@ -1,10 +1,10 @@
 # Evaluation for InvertedPendulum-v4.
+# Success criterion: pole within `success_angle_deg`, |pole_theta_dot| below
+# `success_max_thdot`, AND |cart_xdot| below `success_max_cart_vel`, all held
+# for `success_hold_steps` consecutive final steps.
 #
-# The pendulum heatmap renderer (eval_koopman_accuracy) is pendulum-specific
-# and won't produce meaningful output for InvertedPendulum — disabled here.
-# Policy rollout uses the success criteria from eval/pendulum_metrics.py,
-# which won't match InvertedPendulum's termination either; treat those
-# numbers as a sanity check, not a real metric.
+# The env terminates when |pole_theta| > ~12°, so success thresholds well
+# inside that.
 
 eval_cfg:
   num_parallel_evals: 16
@@ -12,12 +12,15 @@ eval_cfg:
   eval_max_steps: 200
   eval_seed: 42
 
-  success_angle_deg: 15.0
-  success_max_thdot: 1.0
-  success_hold_steps: 20
+  success_angle_deg: 5.0      # pole within 5° of upright
+  success_max_thdot: 0.5      # pole angular velocity ≤ 0.5 rad/s
+  success_max_cart_vel: 0.5   # cart linear velocity ≤ 0.5 m/s
+  success_hold_steps: 10      # 10 consecutive in-spec final steps
 
+  # Koopman accuracy heatmap is pendulum-angle specific (uses obs_to_angle);
+  # leave off for InvertedPendulum until a cartpole-specific heatmap exists.
   eval_koopman_accuracy: false
-  eval_policy_rollout: false
+  eval_policy_rollout: true
 
   koopman_experiment_name: "inverted_pendulum"
   residual_experiment_name: "inverted_pendulum"
