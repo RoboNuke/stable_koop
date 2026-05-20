@@ -1,7 +1,13 @@
 # Residual policy (SAC) training for the pendulum experiment.
 
 train_residual_cfg:
-  z_ref_limit: 1.0
+  gamma_worst_case: 0.1
+  reward_weight: 1.0
+  pred_error_space: "latent"
+  z_ref_max_mode: "action_bound"
+  obs_augmentation: "both"
+  disable_action_augmentation: false
+
   num_envs: 8
   total_timesteps: 100000
   eval_interval: 5000
@@ -18,7 +24,7 @@ train_residual_cfg:
   learning_starts: 1000
   memory_size: 100000
 
-  koopman_experiment_name: "pendulum_default"
-  lqr_name: "pendulum_default"
+  koopman_path: "results/pendulum_default"
+  controller_path: "results/pendulum_default/lqr/pendulum_default"
   experiment_name: "pendulum_default"
   seed: 42

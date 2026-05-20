@@ -1,7 +1,7 @@
 """CLI: ``python -m train_residual --config <yaml>``.
 
-Loads the referenced Koopman model + LQR, reconstructs the base policy from
-the dataset metadata snapshot, and runs SAC residual training.
+Loads the Koopman model + LQR from filesystem paths in the cfg and runs
+SAC residual training against a stability-aware env wrapper.
 """
 
 from __future__ import annotations
@@ -15,42 +15,68 @@ import yaml
 from config.manager import ConfigManager, TrainResidualCfg
 from data.dataloader import load_dataset
 from data.env_builder import make_eval_env, make_single_env
-from policy import make_policy
 from train_koopman.checkpointing import load_koopman_experiment, make_device
 
 
-def _load_lqr(koopman_experiment_name: str, lqr_name: str):
-    lqr_path = (
-        Path("results") / koopman_experiment_name / "lqr" / lqr_name / "lqr.pt"
-    )
-    raw = torch.load(lqr_path, map_location="cpu")
-    # Reconstruct minimal LQR-compatible object with the saved F/P.
+def _resolve_koopman_dir(koopman_path: str) -> Path:
+    p = Path(koopman_path)
+    if p.is_file():
+        return p.parent
+    return p
+
+
+def _load_lqr(controller_path: str):
+    """Load the LQR ``F`` and the stability bound ``gamma_max``.
+
+    Returns a lightweight object with ``.F`` (torch tensor) and
+    ``.gain_norm`` (torch scalar), plus the loaded ``gamma_max`` float.
+    """
+    ctrl_dir = Path(controller_path)
+    lqr_pt = ctrl_dir / "lqr.pt"
+    perf_yaml = ctrl_dir / "ctrl_performance.yaml"
+    if not lqr_pt.is_file():
+        raise FileNotFoundError(f"Expected LQR weights at {lqr_pt}")
+    if not perf_yaml.is_file():
+        raise FileNotFoundError(
+            f"Expected ctrl_performance.yaml at {perf_yaml} (needed for gamma_max)"
+        )
+
+    raw = torch.load(lqr_pt, map_location="cpu")
+    F = raw["F"]
+
     class _LoadedLQR:
         def __init__(self, F):
             self.F = F
-            self.gain_norm = torch.linalg.norm(F, ord=2)
-    return _LoadedLQR(raw["F"])
+            self.gain_norm = torch.linalg.matrix_norm(F, ord=2)
+
+    perf = yaml.safe_load(perf_yaml.read_text())
+    bound = perf.get("bound") or {}
+    if "gamma_max" not in bound:
+        raise KeyError(
+            f"'bound.gamma_max' not found in {perf_yaml}; was stability "
+            "analysis run for this controller?"
+        )
+    gamma_max = float(bound["gamma_max"])
+    return _LoadedLQR(F), gamma_max
 
 
-def _base_policy_from_dataset(dataset_name: str):
-    """Reconstruct the base policy from the dataset's saved GatherDataCfg snapshot."""
+def _env_info_from_dataset(dataset_name: str):
+    """Pull ``(env_name, env_kwargs)`` from the dataset's saved gather snapshot."""
     ds = load_dataset(dataset_name)
     snap = yaml.safe_load(ds.config_yaml)["gather_data_cfg"]
-    bp = snap["base_policy"]
-    name = bp.pop("name")
-    return make_policy(name, **bp), snap
+    env_name = snap["env_name"]
+    env_kwargs = snap.get("env_kwargs", {}) or {}
+    return env_name, env_kwargs
 
 
 def run(cfg: TrainResidualCfg) -> str:
     device = make_device()
+    koopman_dir = _resolve_koopman_dir(cfg.koopman_path)
     model, train_cfg, _state_dim, _action_dim = load_koopman_experiment(
-        cfg.koopman_experiment_name, device
+        experiment_name=koopman_dir.name, device=device, ckpt_path=koopman_dir,
     )
-    lqr = _load_lqr(cfg.koopman_experiment_name, cfg.lqr_name)
-    base_policy, gather_snap = _base_policy_from_dataset(train_cfg.dataset_name)
-
-    env_name = gather_snap["env_name"]
-    env_kwargs = gather_snap.get("env_kwargs", {}) or {}
+    lqr, gamma_max = _load_lqr(cfg.controller_path)
+    env_name, env_kwargs = _env_info_from_dataset(train_cfg.dataset_name)
 
     def make_env_fn():
         return make_single_env(env_name=env_name, env_kwargs=env_kwargs)
@@ -62,27 +88,22 @@ def run(cfg: TrainResidualCfg) -> str:
             env_kwargs=env_kwargs,
         )
 
-    # Flat dict for the SAC training code. Only `latent_dim` flows from the
-    # Koopman side; everything else is residual-cfg fields constructed
-    # explicitly so there's no nested-dataclass flatten/collision risk.
     flat = {
-        "latent_dim": train_cfg.latent_dim,
-        "residual_z_ref_limit": cfg.z_ref_limit,
-        "residual_num_envs": cfg.num_envs,
-        "residual_total_timesteps": cfg.total_timesteps,
-        "residual_eval_interval": cfg.eval_interval,
-        "residual_batch_size": cfg.batch_size,
-        "residual_lr": cfg.lr,
-        "residual_actor_hidden_size": cfg.actor_hidden_size,
-        "residual_actor_hidden_layers": cfg.actor_hidden_layers,
-        "residual_critic_hidden_size": cfg.critic_hidden_size,
-        "residual_critic_hidden_layers": cfg.critic_hidden_layers,
-        "residual_gamma": cfg.gamma,
-        "residual_tau": cfg.tau,
-        "residual_initial_entropy_value": cfg.initial_entropy_value,
-        "residual_random_timesteps": cfg.random_timesteps,
-        "residual_learning_starts": cfg.learning_starts,
-        "residual_memory_size": cfg.memory_size,
+        "num_envs": cfg.num_envs,
+        "total_timesteps": cfg.total_timesteps,
+        "eval_interval": cfg.eval_interval,
+        "batch_size": cfg.batch_size,
+        "lr": cfg.lr,
+        "actor_hidden_size": cfg.actor_hidden_size,
+        "actor_hidden_layers": cfg.actor_hidden_layers,
+        "critic_hidden_size": cfg.critic_hidden_size,
+        "critic_hidden_layers": cfg.critic_hidden_layers,
+        "gamma": cfg.gamma,
+        "tau": cfg.tau,
+        "initial_entropy_value": cfg.initial_entropy_value,
+        "random_timesteps": cfg.random_timesteps,
+        "learning_starts": cfg.learning_starts,
+        "memory_size": cfg.memory_size,
         "experiment_name": cfg.experiment_name,
         # Eval-related fields used by the evaluate callback.
         "num_parallel_evals": cfg.num_envs,
@@ -105,14 +126,21 @@ def run(cfg: TrainResidualCfg) -> str:
     from train_residual.sac import train_residual as _train
 
     _train(
-        base_policy=base_policy,
+        koopman_model=model,
         lqr=lqr,
+        gamma_max=gamma_max,
+        gamma_worst_case=cfg.gamma_worst_case,
+        reward_weight=cfg.reward_weight,
+        pred_error_space=cfg.pred_error_space,
+        z_ref_max_mode=cfg.z_ref_max_mode,
+        obs_augmentation=cfg.obs_augmentation,
+        disable_action_augmentation=cfg.disable_action_augmentation,
         cfg=flat,
         run_dir=str(out_dir),
         make_env_fn=make_env_fn,
         make_eval_env_fn=make_eval_env_fn,
         evaluate_fn=evaluate_for_env,
-        z_ref_limit=cfg.z_ref_limit,
+        device=device,
     )
     return str(out_dir)
 

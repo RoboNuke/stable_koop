@@ -1,8 +1,14 @@
-"""Residual-policy SAC training core (env-loop and composite policy builder).
+"""Residual-policy SAC training loop.
 
-Ported from ``launch/train_residual.py``. Only changes: imports re-pointed
-at the refactored modules, and the SAC loop now takes a pre-built ``cfg``
-dict (legacy flat shape) so the training loop stays bit-equivalent.
+The base controller (LQR in the Koopman latent space) is baked into the
+:class:`ResidualPolicyEnv` wrapper, so the SAC actor produces ``z_ref``
+directly and no composite policy is needed at training or eval time.
+
+Env stack (gymnasium):
+    raw gym env x N -> SyncVectorEnv -> GymVectorAdapter -> ResidualPolicyEnv
+The result is a batched-tensor env (IsaacLab-shaped). For Isaac Lab
+training, omit the gymnasium stack and pass the Lab env directly to
+:class:`ResidualPolicyEnv`.
 """
 
 from __future__ import annotations
@@ -13,94 +19,104 @@ from typing import Callable
 import gymnasium as gym
 import numpy as np
 import torch
-import yaml
 
 from skrl.agents.torch.sac import SAC, SAC_DEFAULT_CONFIG
-from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
 
 from models.residual_policy import Critic, StochasticActor
+from wrappers.gym_vec_adapter import GymVectorAdapter, TensorToGymAdapter
 from wrappers.residual import ResidualPolicyEnv
 
 
-def make_composite_policy(base_policy, residual_model, lqr_F_np, z_ref_limit, device, action_bounds):
-    """Build a callable that combines a base policy with an LQR residual derived from z_ref.
-
-    Exposes both single-obs and batched call paths (``policy(obs)`` and
-    ``policy.batch(obs_batch)``).
-    """
-    act_low, act_high = action_bounds
-
-    def policy(obs):
-        base_action = base_policy(obs)
-        obs_aug = np.concatenate([obs, base_action]).astype(np.float32)
-        with torch.no_grad():
-            obs_t = torch.FloatTensor(obs_aug).unsqueeze(0).to(device)
-            raw_action = residual_model.act({"states": obs_t})[0]
-            raw_action_np = raw_action.cpu().numpy().flatten()
-        z_ref = z_ref_limit * raw_action_np
-        u_res = lqr_F_np @ z_ref
-        return np.clip(base_action + u_res, act_low, act_high)
-
-    def batch_policy(obs_batch):
-        N = len(obs_batch)
-        base_actions = np.array([base_policy(obs_batch[i]) for i in range(N)])
-        obs_aug = np.concatenate([obs_batch, base_actions], axis=-1).astype(np.float32)
-        with torch.no_grad():
-            obs_t = torch.FloatTensor(obs_aug).to(device)
-            raw_actions = residual_model.act({"states": obs_t})[0]
-            raw_actions_np = raw_actions.cpu().numpy()
-        z_refs = z_ref_limit * raw_actions_np
-        u_res = z_refs @ lqr_F_np.T
-        total = base_actions + u_res
-        return np.clip(total, act_low, act_high)
-
-    policy.batch = batch_policy
-    return policy
+def _make_residual_env(
+    *,
+    n_envs: int,
+    make_raw_env_fn: Callable,
+    koopman_model,
+    lqr,
+    gamma_max: float,
+    gamma_worst_case: float,
+    reward_weight: float,
+    pred_error_space: str,
+    z_ref_max_mode: str,
+    obs_augmentation: str,
+    disable_action_augmentation: bool,
+    device: torch.device,
+) -> ResidualPolicyEnv:
+    """Build the standard gymnasium -> batched-tensor stack."""
+    vec_env = gym.vector.SyncVectorEnv([make_raw_env_fn for _ in range(n_envs)])
+    adapter = GymVectorAdapter(vec_env, device=device)
+    return ResidualPolicyEnv(
+        adapter,
+        koopman_model=koopman_model,
+        lqr=lqr,
+        gamma_max=gamma_max,
+        gamma_worst_case=gamma_worst_case,
+        reward_weight=reward_weight,
+        pred_error_space=pred_error_space,
+        z_ref_max_mode=z_ref_max_mode,
+        obs_augmentation=obs_augmentation,
+        disable_action_augmentation=disable_action_augmentation,
+        device=device,
+    )
 
 
 def train_residual(
-    base_policy: Callable,
+    *,
+    koopman_model,
     lqr,
+    gamma_max: float,
+    gamma_worst_case: float,
+    reward_weight: float,
+    pred_error_space: str,
+    z_ref_max_mode: str,
+    obs_augmentation: str,
+    disable_action_augmentation: bool,
     cfg: dict,
     run_dir: str,
-    *,
     make_env_fn: Callable,
-    make_eval_env_fn: Callable,
+    make_eval_env_fn: Callable,  # kept for signature compatibility; unused
     evaluate_fn: Callable,
-    z_ref_limit: float = 1.0,
+    device: torch.device,
     keep_all_ckpts: bool = False,
 ):
-    """SAC training loop. Returns the trained actor model.
-
-    Caller injects env builders and the evaluation callback to keep this
-    module independent of ``eval/``.
-    """
+    """SAC training loop. Returns the trained actor model."""
     phase_dir = os.path.join(run_dir, "residual_train")
     os.makedirs(phase_dir, exist_ok=True)
     ckpt_dir = os.path.join(phase_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    num_envs = cfg["num_envs"]
+    total_timesteps = cfg["total_timesteps"]
+    eval_interval = cfg["eval_interval"]
+    actor_hidden_size = cfg["actor_hidden_size"]
+    actor_hidden_layers = cfg["actor_hidden_layers"]
+    critic_hidden_size = cfg["critic_hidden_size"]
+    critic_hidden_layers = cfg["critic_hidden_layers"]
 
-    latent_dim = cfg["latent_dim"]
-    num_envs = cfg.get("residual_num_envs", 8)
-    total_timesteps = cfg.get("residual_total_timesteps", 100000)
-    eval_interval = cfg.get("residual_eval_interval", 5000)
-    actor_hidden_size = cfg.get("residual_actor_hidden_size", 64)
-    actor_hidden_layers = cfg.get("residual_actor_hidden_layers", 2)
-    critic_hidden_size = cfg.get("residual_critic_hidden_size", 64)
-    critic_hidden_layers = cfg.get("residual_critic_hidden_layers", 2)
-    lqr_F_np = lqr.F.numpy().astype(np.float32)
+    common_kwargs = dict(
+        koopman_model=koopman_model,
+        lqr=lqr,
+        gamma_max=gamma_max,
+        gamma_worst_case=gamma_worst_case,
+        reward_weight=reward_weight,
+        pred_error_space=pred_error_space,
+        z_ref_max_mode=z_ref_max_mode,
+        obs_augmentation=obs_augmentation,
+        disable_action_augmentation=disable_action_augmentation,
+        device=device,
+    )
 
-    def make_env():
-        env = make_env_fn()
-        return ResidualPolicyEnv(env, base_policy, lqr, latent_dim, z_ref_limit)
-
-    vec_env = gym.vector.SyncVectorEnv([make_env for _ in range(num_envs)])
-    wrapped_env = wrap_env(vec_env)
-    eval_env = make_eval_env_fn()
+    wrapped_env = _make_residual_env(
+        n_envs=num_envs, make_raw_env_fn=make_env_fn, **common_kwargs
+    )
+    # Eval env: same residual stack, separate instance so eval doesn't
+    # disturb training state. Wrap in TensorToGymAdapter so the existing
+    # numpy-based evaluator can drive it.
+    eval_tensor_env = _make_residual_env(
+        n_envs=num_envs, make_raw_env_fn=make_env_fn, **common_kwargs
+    )
+    eval_env = TensorToGymAdapter(eval_tensor_env)
 
     obs_space = wrapped_env.observation_space
     act_space = wrapped_env.action_space
@@ -114,24 +130,24 @@ def train_residual(
     }
 
     memory = RandomMemory(
-        memory_size=cfg.get("residual_memory_size", 100000), num_envs=num_envs, device=device
+        memory_size=cfg["memory_size"], num_envs=num_envs, device=device
     )
 
     sac_cfg = SAC_DEFAULT_CONFIG.copy()
     sac_cfg["gradient_steps"] = 1
-    sac_cfg["batch_size"] = cfg.get("residual_batch_size", 256)
-    sac_cfg["discount_factor"] = cfg.get("residual_gamma", 0.99)
-    sac_cfg["polyak"] = 1.0 - cfg.get("residual_tau", 0.005)
-    sac_cfg["actor_learning_rate"] = cfg.get("residual_lr", 3e-4)
-    sac_cfg["critic_learning_rate"] = cfg.get("residual_lr", 3e-4)
+    sac_cfg["batch_size"] = cfg["batch_size"]
+    sac_cfg["discount_factor"] = cfg["gamma"]
+    sac_cfg["polyak"] = 1.0 - cfg["tau"]
+    sac_cfg["actor_learning_rate"] = cfg["lr"]
+    sac_cfg["critic_learning_rate"] = cfg["lr"]
     sac_cfg["learn_entropy"] = True
-    sac_cfg["initial_entropy_value"] = cfg.get("residual_initial_entropy_value", 1.0)
-    sac_cfg["random_timesteps"] = cfg.get("residual_random_timesteps", 1000)
-    sac_cfg["learning_starts"] = cfg.get("residual_learning_starts", 1000)
+    sac_cfg["initial_entropy_value"] = cfg["initial_entropy_value"]
+    sac_cfg["random_timesteps"] = cfg["random_timesteps"]
+    sac_cfg["learning_starts"] = cfg["learning_starts"]
     sac_cfg["experiment"]["write_interval"] = num_envs * 10
     sac_cfg["experiment"]["checkpoint_interval"] = 0
     sac_cfg["experiment"]["directory"] = phase_dir
-    sac_cfg["experiment"]["experiment_name"] = cfg.get("experiment_name", "residual")
+    sac_cfg["experiment"]["experiment_name"] = cfg["experiment_name"]
     sac_cfg["experiment"]["store_separately"] = False
 
     agent = SAC(
@@ -147,9 +163,13 @@ def train_residual(
     print(f"  Total timesteps: {total_timesteps}")
     print(f"  Num envs: {num_envs}")
     print(f"  Eval interval: {eval_interval}")
-    print(f"  Latent dim (z_ref size): {latent_dim}")
-    print(f"  z_ref limit: {z_ref_limit}")
-    print(f"  LQR F shape: {lqr_F_np.shape}")
+    print(f"  Action dim: {act_space.shape[0]}")
+    print(f"  gamma_max: {gamma_max:.4e}, gamma_worst_case: {gamma_worst_case:.4e}")
+    print(f"  reward_weight: {reward_weight}")
+    print(f"  pred_error_space: {pred_error_space}")
+    print(f"  z_ref_max_mode: {z_ref_max_mode}")
+    print(f"  obs_augmentation: {obs_augmentation}")
+    print(f"  disable_action_augmentation: {disable_action_augmentation}")
 
     agent.init()
     writer = agent.writer
@@ -164,13 +184,20 @@ def train_residual(
     def _run_eval(step):
         residual_model = models["policy"]
         residual_model.eval()
-        act_space_local = (
-            eval_env.single_action_space if hasattr(eval_env, "num_envs") else eval_env.action_space
-        )
-        action_bounds = (act_space_local.low, act_space_local.high)
-        policy = make_composite_policy(
-            base_policy, residual_model, lqr_F_np, z_ref_limit, device, action_bounds
-        )
+
+        def policy(obs):
+            with torch.no_grad():
+                obs_t = torch.as_tensor(obs, device=device, dtype=torch.float32).unsqueeze(0)
+                z_ref = residual_model.act({"states": obs_t})[0]
+            return z_ref.cpu().numpy().flatten()
+
+        def batch_policy(obs_batch):
+            with torch.no_grad():
+                obs_t = torch.as_tensor(obs_batch, device=device, dtype=torch.float32)
+                z_refs = residual_model.act({"states": obs_t})[0]
+            return z_refs.cpu().numpy()
+
+        policy.batch = batch_policy
         results, _, _ = evaluate_fn(eval_env, policy, cfg)
         writer.add_scalar("eval_total_metric/success_rate", results["success_rate"], step)
         residual_model.train()
@@ -218,7 +245,7 @@ def train_residual(
 
     writer.close()
     eval_env.close()
-    vec_env.close()
+    wrapped_env.close()
 
     print(f"\nResidual training complete. Results in {phase_dir}")
     return models["policy"]
