@@ -1,8 +1,9 @@
 """Evaluation entry points + per-env scorer registry.
 
-The framework (``eval/policy_rollout.py``, ``eval/koopman_accuracy.py``) is
-environment-agnostic. Per-env scoring lives in dedicated modules
-(e.g. :mod:`eval.pendulum_metrics`) and registers itself here.
+The framework (``eval/rollout.py``, ``eval/multi_mode.py``,
+``eval/koopman_accuracy.py``) is environment-agnostic. Per-env scoring
+lives in dedicated modules (e.g. :mod:`eval.pendulum_metrics`) and
+registers itself here.
 
 To add an environment: write a module exposing ``check_success(states, cfg) -> bool``
 and ``compute_metrics(states, actions) -> dict``, then call
@@ -40,7 +41,7 @@ def register_env_scorer(
     compute_metrics: Callable,
     make_koopman_heatmap: Optional[Callable] = None,
 ) -> None:
-    """Register the per-env scorer used by :func:`eval.policy_rollout.evaluate`."""
+    """Register the per-env scorer used by :func:`eval.rollout.do_rollout`."""
     ENV_SCORERS[env_name] = EnvScorer(
         check_success=check_success,
         compute_metrics=compute_metrics,
@@ -77,20 +78,25 @@ from eval.inverted_pendulum_metrics import (  # noqa: E402
     inverted_pendulum_compute_metrics,
 )
 
-register_env_scorer(
-    "InvertedPendulum-v4",
-    check_success=inverted_pendulum_check_success,
-    compute_metrics=inverted_pendulum_compute_metrics,
-)
+# v4 and v5 are functionally identical for InvertedPendulum (same obs layout,
+# termination at |theta|>0.2, max_episode_steps=1000) — only gymnasium's
+# internal MuJoCo bindings differ. Register the scorer under both names so
+# whichever the gather YAML picks works out of the box.
+for _ip_name in ("InvertedPendulum-v4", "InvertedPendulum-v5"):
+    register_env_scorer(
+        _ip_name,
+        check_success=inverted_pendulum_check_success,
+        compute_metrics=inverted_pendulum_compute_metrics,
+    )
 
 
-from eval.policy_rollout import evaluate, load_eval_stats  # noqa: E402
+from eval.rollout import do_rollout, load_eval_stats  # noqa: E402
 from eval.koopman_accuracy import evaluate_model  # noqa: E402
 
 __all__ = [
     "ENV_SCORERS",
     "EnvScorer",
-    "evaluate",
+    "do_rollout",
     "evaluate_model",
     "get_env_scorer",
     "load_eval_stats",

@@ -1,6 +1,12 @@
-"""Evaluation config: rollout counts, success criteria, output paths.
+"""Evaluation config: rollout counts, success criteria, mode triggers, output paths.
 
-Field defaults mirror ``config/pendulum.yaml`` exactly.
+``EvalCfg`` drives ``python -m eval --config ...`` and the auto-eval calls
+issued at the end of ``controller.lqr`` and ``train_residual``. The set of
+modes that run is implied by which artifact fields are populated:
+
+* ``lqr_output_name`` empty                          → base policy only
+* ``lqr_output_name`` set                            → base + LQR
+* ``lqr_output_name`` + ``residual_experiment_name`` → base + LQR + residual
 """
 
 from __future__ import annotations
@@ -66,6 +72,14 @@ class EvalCfg:
     """Run multi-step Koopman model accuracy eval."""
     eval_policy_rollout: bool = True
     """Run base / combined policy success-rate rollout."""
+    capture_per_step: bool = True
+    """Capture every per-env, per-step value the residual wrapper writes to
+    ``info`` (``gamma_t``, ``eta_t``, ``stability_term``, ``env_reward``,
+    ``z_t``, ``z_next``, ``z_pred``, ``z_ref_t``, ``x_pred``, …) into the
+    per-mode ``_eval_traj.npz`` under the wrapper's own key names.
+    ``states``, ``applied_action``, total ``reward`` and ``success`` are
+    captured regardless. Set False to skip the heavier latent / prediction
+    arrays."""
 
     koopman_experiment_name: str = "pendulum_default"
     """Source Koopman experiment subdir under ``results/``."""

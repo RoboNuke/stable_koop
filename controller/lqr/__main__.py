@@ -48,12 +48,124 @@ def _resolve_koopman_dir(cfg: LQRControllerCfg, koopman_path: str | None) -> Pat
     return Path("results") / cfg.koopman_experiment_name
 
 
+def _normalize_eigvals(evs: list) -> tuple[list, bool]:
+    """Convert any Python ``complex`` values in ``evs`` to ``[real, imag]`` pairs.
+
+    Older training runs wrote ``open_loop_eigvals`` as a YAML sequence of
+    ``!!python/complex`` scalars, which can't be reloaded with
+    ``yaml.safe_load``. Returns ``(normalized_list, was_changed)`` so the
+    caller can decide whether to rewrite the file.
+    """
+    out = []
+    changed = False
+    for z in evs:
+        if isinstance(z, complex):
+            out.append([float(z.real), float(z.imag)])
+            changed = True
+        else:
+            out.append(z)
+    return out, changed
+
+
+def _read_perf_yaml(perf_path: Path) -> tuple[dict, bool]:
+    """Load a model_performance.yaml, normalizing any ``!!python/complex`` eigvals.
+
+    Uses ``yaml.full_load`` so files written by older training runs (which
+    embedded Python complex numbers) parse cleanly. Returns
+    ``(perf_dict, needs_rewrite)`` where ``needs_rewrite`` is True iff any
+    eigvals were normalized — the caller should overwrite the file to
+    purge the bad tags.
+    """
+    perf = yaml.full_load(perf_path.read_text()) or {}
+    ctrl = perf.get("controllability_fit")
+    needs_rewrite = False
+    if isinstance(ctrl, dict):
+        evs = ctrl.get("open_loop_eigvals")
+        if isinstance(evs, list):
+            ctrl["open_loop_eigvals"], needs_rewrite = _normalize_eigvals(evs)
+    return perf, needs_rewrite
+
+
+def _load_cached_model_performance(
+    koopman_dir: Path,
+) -> tuple[dict | None, dict | None]:
+    """Pull ``one_step_pred_error`` + ``controllability_fit`` from training YAML.
+
+    Returns ``(pred_stats, ctrl_stats)`` so ``run_stability_report`` can skip
+    the underlying recompute. Either entry is ``None`` if the YAML is
+    missing or doesn't carry that section, in which case the caller falls
+    back to recomputing.
+    """
+    perf_path = koopman_dir / "model_performance.yaml"
+    if not perf_path.is_file():
+        return None, None
+    perf, _ = _read_perf_yaml(perf_path)
+    pred = perf.get("one_step_pred_error")
+    ctrl = perf.get("controllability_fit")
+    return pred, ctrl
+
+
+def _backfill_model_performance(
+    koopman_dir: Path,
+    *,
+    pred_stats: dict,
+    ctrl_stats: dict,
+) -> None:
+    """Backfill missing ``one_step_pred_error`` / ``controllability_fit``.
+
+    Writes to the koopman-level ``model_performance.yaml`` so future
+    controller fits can reuse them without recomputing. If the file
+    doesn't exist (e.g. older checkpoint, or training crashed before
+    writing it), creates it with just the two cached sections. The
+    training step (:func:`train_koopman.save_performance.save_model_performance`)
+    is still the source of truth for the full set of sections
+    (including ``training_summary``).
+
+    Also purges any ``!!python/complex`` eigvals from an existing
+    ``controllability_fit`` section so the file can be read back by
+    ``yaml.safe_load``.
+    """
+    perf_path = koopman_dir / "model_performance.yaml"
+    if perf_path.is_file():
+        perf, needs_rewrite_for_complex = _read_perf_yaml(perf_path)
+    else:
+        perf, needs_rewrite_for_complex = {}, False
+    changed = needs_rewrite_for_complex
+    if "one_step_pred_error" not in perf:
+        perf["one_step_pred_error"] = pred_stats
+        changed = True
+    if "controllability_fit" not in perf:
+        perf["controllability_fit"] = ctrl_stats
+        changed = True
+    if not changed:
+        return
+    with perf_path.open("w") as f:
+        yaml.dump(perf, f, default_flow_style=False, sort_keys=False)
+    print(f"[lqr] backfilled model_performance.yaml at {perf_path}")
+
+
+def _backfill_train_config(koopman_dir: Path, train_cfg) -> None:
+    """Write ``config.yaml`` next to the koopman checkpoint if it's missing."""
+    config_path = koopman_dir / "config.yaml"
+    if config_path.is_file():
+        return
+    with config_path.open("w") as f:
+        yaml.dump(
+            {"train_koopman_cfg": dataclasses.asdict(train_cfg)},
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+        )
+    print(f"[lqr] backfilled training config.yaml at {config_path}")
+
+
 def run(
     cfg: LQRControllerCfg,
     *,
     koopman_path: str | None = None,
     output_name_override: str | None = None,
     run_traj_eval: bool = True,
+    quiet_diagnostics: bool = False,
 ) -> str:
     device = make_device()
 
@@ -76,7 +188,9 @@ def run(
         cfg.koopman_experiment_name, device, ckpt_path=ckpt_path,
     )
     ds = load_dataset(train_cfg.dataset_name)
-    aug_trajectories = augment_trajectories(ds, train_cfg.augmentation)
+    aug_trajectories = augment_trajectories(
+        ds, train_cfg.augmentation, verbose=not quiet_diagnostics
+    )
 
     A = model.A.detach().cpu()
     B_mat = model.B_matrix.detach().cpu()
@@ -89,6 +203,9 @@ def run(
     lqr, Q, R_cost, B_scale = setup_lqr(
         A, B_mat, cfg, state_dim=state_dim, action_dim=action_dim
     )
+
+    # --- Load cached stats from the koopman training run, if available ---
+    cached_pred, cached_ctrl = _load_cached_model_performance(koopman_dir)
 
     # --- Unified stability analysis ---
     sa = cfg.stability_analysis
@@ -104,27 +221,64 @@ def run(
         aug_trajectories=aug_trajectories,
         device=device,
         epsilon_x=sa.epsilon_x,
-        eta=sa.eta,
+        ctrl_percentages=list(sa.ctrl_percentages),
         q_scale=cfg.q_scale,
         r_scale=cfg.r_scale,
         use_optimization=sa.use_optimization,
+        quiet_diagnostics=quiet_diagnostics,
+        encoder_lipschitz_batch_size=train_cfg.encoder_lipschitz_batch_size,
+        cached_pred_stats=cached_pred,
+        cached_ctrl_stats=cached_ctrl,
     )
     variables["B_scale"] = float(B_scale)
 
-    # --- Voxel γ-compliance visualization (uses the Koopman's viz cfg) ---
+    # Backfill the koopman-level YAMLs if they were missing or incomplete,
+    # so future controller fits can reuse the cached stats instead of
+    # recomputing them. config.yaml is written from the loaded train_cfg;
+    # model_performance.yaml gets any sections that weren't present (and
+    # has any legacy ``!!python/complex`` eigvals purged on rewrite).
+    _backfill_train_config(koopman_dir, train_cfg)
+    _backfill_model_performance(
+        koopman_dir,
+        pred_stats=variables["pred_error_stats"],
+        ctrl_stats=variables["controllability_fit"],
+    )
+
+    # --- Control-budget summary plot (always; doesn't need voxel viz cfg) ---
+    from controller.lqr.visualize import save_ctrl_sweep_plot
+    viz_summaries: dict = {
+        "ctrl_sweep_plot": save_ctrl_sweep_plot(
+            out_dir=out_dir,
+            sweep=variables["ctrl_pct_sweep"],
+            highlight_points=variables["ctrl_pct_results"],
+        )
+    }
+
+    # --- Voxel γ-compliance heatmaps (only when voxel viz is enabled) ---
+    # One compliance heatmap per ctrl_percentage in the config list (each
+    # uses η = pct · ||B||·u_max).
     if train_cfg.visualization.enabled:
         from controller.lqr.visualize import save_compliance_visualization
-        viz_summary = save_compliance_visualization(
-            out_dir=out_dir,
-            model=model,
-            ds=ds,
-            aug_trajectories=aug_trajectories,
-            viz_cfg=train_cfg.visualization,
-            device=device,
-            gamma_max=float(variables["bound"]["gamma_max"]),
-        )
-        if viz_summary is not None:
-            variables["visualization"] = viz_summary
+        for entry in variables["ctrl_pct_results"]:
+            pct = float(entry["ctrl_percentage"])
+            eta_at = float(entry["eta"])
+            gamma_at = float(entry["gamma_max"])
+            label = f"ctrl_pct_{int(round(pct * 100)):03d}"
+            summary = save_compliance_visualization(
+                out_dir=out_dir,
+                model=model,
+                ds=ds,
+                aug_trajectories=aug_trajectories,
+                viz_cfg=train_cfg.visualization,
+                device=device,
+                gamma_max=gamma_at,
+                label=label,
+                title_suffix=f"ctrl_pct={pct:.2f},  η={eta_at:.2e}",
+            )
+            if summary is not None:
+                viz_summaries[label] = summary
+
+    variables["visualization"] = viz_summaries
 
     # --- Persist results ---
     perf_path = out_dir / "ctrl_performance.yaml"
@@ -150,18 +304,19 @@ def run(
     )
     print(f"LQR weights saved to {lqr_path}")
 
-    # --- Trajectory-level eval (base policy + per-step diagnostics) ---
+    # --- Post-fit eval (base + LQR via eval.multi_mode) ---
     if run_traj_eval:
         if not cfg.eval_cfg_path:
             raise ValueError(
                 "lqr_controller_cfg.eval_cfg_path is empty; set it in the YAML "
-                "or pass --no_traj_eval to skip trajectory evaluation."
+                "or pass --no_eval to skip post-fit evaluation."
             )
-        _run_trajectory_eval(
+        _run_post_fit_eval(
             cfg=cfg,
-            out_dir=out_dir,
+            controller_dir=out_dir,
             model=model,
-            train_cfg=train_cfg,
+            lqr=lqr,
+            gamma_max=float(variables["bound"]["gamma_max"]),
             ds=ds,
             device=device,
             ctrl_variables=variables,
@@ -171,31 +326,27 @@ def run(
     return str(out_dir)
 
 
-def _run_trajectory_eval(
+def _run_post_fit_eval(
     *,
     cfg: LQRControllerCfg,
-    out_dir: Path,
+    controller_dir: Path,
     model,
-    train_cfg,
+    lqr,
+    gamma_max: float,
     ds,
     device,
     ctrl_variables: dict,
     ctrl_perf_path: Path,
 ) -> None:
-    """Roll out the base policy on the env, record per-step Koopman + policy data."""
-    from data.env_builder import make_single_env
-    from data.dataset_stats import _success_cfg_from_eval
-    from eval.trajectory_eval import evaluate_with_trajectories, save_trajectory_npz
+    """Hand off to ``eval.multi_mode.run_multi_mode`` for base + LQR rollouts."""
+    from eval.multi_mode import run_multi_mode
     from policy import make_policy
 
     print("\n" + "=" * 50)
-    print("  Trajectory Evaluation (base policy + per-step diagnostics)")
+    print("  Post-fit Eval (base + LQR via eval.multi_mode)")
     print("=" * 50)
 
     eval_cfg = ConfigManager.load_stage(cfg.eval_cfg_path, "eval_cfg")
-    success_cfg = _success_cfg_from_eval(cfg.eval_cfg_path)
-
-    # Env + base policy come from the gather snapshot embedded in the dataset.
     gather_snap = yaml.safe_load(ds.config_yaml)["gather_data_cfg"]
     env_name = gather_snap["env_name"]
     env_kwargs = gather_snap.get("env_kwargs", {}) or {}
@@ -203,36 +354,31 @@ def _run_trajectory_eval(
     base_policy = make_policy(
         base_policy_snap["name"], **(base_policy_snap.get("params", {}) or {})
     )
-    env = make_single_env(env_name=env_name, env_kwargs=env_kwargs)
 
-    try:
-        metrics, per_trajectory = evaluate_with_trajectories(
-            env,
-            base_policy,
-            model=model,
-            device=device,
-            env_name=env_name,
-            eval_cfg=eval_cfg,
-            success_cfg=success_cfg,
-            residual_policy=None,  # wired in for later; no residual yet
-        )
-    finally:
-        env.close()
+    eval_out_dir = Path("eval") / "results" / eval_cfg.results_name
+    eval_out_dir.mkdir(parents=True, exist_ok=True)
 
-    traj_path = out_dir / "eval_traj.npz"
-    save_trajectory_npz(traj_path, per_trajectory)
-    print(f"Per-step eval trajectories saved to {traj_path}")
+    run_multi_mode(
+        out_dir=eval_out_dir,
+        eval_cfg=eval_cfg,
+        env_name=env_name,
+        env_kwargs=env_kwargs,
+        base_policy=base_policy,
+        koopman_model=model,
+        device=device,
+        lqr=lqr,
+        gamma_max=gamma_max,
+        residual_actor=None,  # no residual yet at this stage
+    )
 
-    # Merge eval task metrics into ctrl_performance.yaml.
     ctrl_variables["eval"] = {
         "eval_cfg_path": cfg.eval_cfg_path,
-        "success_cfg": success_cfg,
-        "metrics": metrics,
-        "trajectory_npz": str(traj_path),
+        "results_dir": str(eval_out_dir),
+        "gamma_max": float(gamma_max),
     }
     with ctrl_perf_path.open("w") as f:
         yaml.dump(ctrl_variables, f, default_flow_style=False, sort_keys=False)
-    print(f"ctrl_performance.yaml updated with eval metrics: {ctrl_perf_path}")
+    print(f"ctrl_performance.yaml updated with eval results dir: {ctrl_perf_path}")
 
 
 def main() -> None:
@@ -245,8 +391,8 @@ def main() -> None:
              "under <koopman_dir>/lqr/).",
     )
     parser.add_argument(
-        "--no_traj_eval", action="store_true",
-        help="Skip the post-fit trajectory eval (env rollouts + eval_traj.npz).",
+        "--no_eval", action="store_true",
+        help="Skip the post-fit eval (base + LQR rollouts via eval.multi_mode).",
     )
     args = parser.parse_args()
     cfg = ConfigManager.load_stage(args.config, "lqr_controller_cfg")
@@ -254,7 +400,7 @@ def main() -> None:
         cfg,
         koopman_path=args.koopman_path,
         output_name_override=args.controller_output_name,
-        run_traj_eval=not args.no_traj_eval,
+        run_traj_eval=not args.no_eval,
     )
 
 

@@ -173,6 +173,14 @@ class ResidualPolicyEnv:
         z_t = self._z_prev  # (N, L)
 
         if self.disable_action_augmentation:
+            # Passthrough mode: no latent-reference. z_ref is conceptually
+            # zero for downstream diagnostics (kept on info for shape
+            # consistency across modes).
+            z_ref = torch.zeros(
+                (self.num_envs, self.latent_dim),
+                device=self.device,
+                dtype=raw_action.dtype,
+            )
             delta = None
             u = torch.clamp(raw_action, self._env_act_low, self._env_act_high)
         else:
@@ -189,12 +197,16 @@ class ResidualPolicyEnv:
 
         z_next = self.koopman.encode(obs_next)
 
+        # Always-on diagnostics (exposed via info for downstream eval). z_pred
+        # / x_pred are also reused for the gamma_t computation below depending
+        # on pred_error_space, so this is at most one extra decode per step
+        # compared to the minimal path.
+        z_pred = self.koopman.predict(z_t, u)
+        x_pred = self.koopman.decode(z_pred)
+
         if self.pred_error_space == "latent":
-            z_pred = self.koopman.predict(z_t, u)
             gamma_t = torch.linalg.vector_norm(z_next - z_pred, dim=-1)
         elif self.pred_error_space == "state_decoded":
-            z_pred = self.koopman.predict(z_t, u)
-            x_pred = self.koopman.decode(z_pred)
             gamma_t = torch.linalg.vector_norm(obs_next - x_pred, dim=-1)
         else:  # state_reconstruction
             x_recon = self.koopman.decode(z_next)
@@ -225,7 +237,12 @@ class ResidualPolicyEnv:
         info["gamma_t"] = gamma_t
         info["eta_t"] = eta_t
         info["stability_term"] = stability_term
-        info["applied_action"] = u
+        info["applied_action"] = u       # env-native action sent downstream
+        info["z_ref_t"] = z_ref          # scaled latent reference (zero in passthrough)
+        info["z_t"] = z_t
+        info["z_next"] = z_next
+        info["z_pred"] = z_pred
+        info["x_pred"] = x_pred
 
         return self._augment_obs(obs_next), aug_reward, terminated, truncated, info
 
