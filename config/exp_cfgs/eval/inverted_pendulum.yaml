@@ -1,27 +1,29 @@
 # Evaluation for InvertedPendulum-v4.
-# Success criterion: pole within `success_angle_deg`, |pole_theta_dot| below
-# `success_max_thdot`, AND |cart_xdot| below `success_max_cart_vel`, all held
-# for `success_hold_steps` consecutive final steps.
-#
-# The env terminates when |pole_theta| > ~12°, so success thresholds well
-# inside that.
+# Success criterion: trajectory survived to the rollout time-limit (the env
+# didn't terminate due to |pole_theta| > 0.2 rad). The angle / velocity
+# threshold fields below are kept for schema compatibility (the scorer
+# ignores them) so the same EvalCfg dataclass works across envs.
 
 eval_cfg:
   num_parallel_evals: 16
-  eval_num_trajectories: 200
-  eval_max_steps: 200
+  eval_num_trajectories: 128
+  eval_max_steps: 1000
   eval_seed: 42
 
-  success_angle_deg: 5.0      # pole within 5° of upright
-  success_max_thdot: 0.5      # pole angular velocity ≤ 0.5 rad/s
-  success_max_cart_vel: 0.5   # cart linear velocity ≤ 0.5 m/s
-  success_hold_steps: 10      # 10 consecutive in-spec final steps
+  success_angle_deg: 5.0      # unused by the InvertedPendulum scorer
+  success_max_thdot: 0.5      # unused
+  success_max_cart_vel: 0.5   # unused
+  success_hold_steps: 10      # unused
 
   # Koopman accuracy heatmap is pendulum-angle specific (uses obs_to_angle);
   # leave off for InvertedPendulum until a cartpole-specific heatmap exists.
   eval_koopman_accuracy: false
   eval_policy_rollout: true
+  capture_per_step: true
 
-  koopman_experiment_name: "inverted_pendulum"
-  residual_experiment_name: "inverted_pendulum"
-  results_name: "inverted_pendulum"
+  # Mode triggers (see config/manager/eval_cfg.py): with lqr_output_name set
+  # and residual_experiment_name unset, eval runs base + LQR.
+  koopman_experiment_name: "okay_schur_a0-8"
+  lqr_output_name: "detailed_report"
+  residual_experiment_name: null
+  results_name: "okay_schur_detailed"

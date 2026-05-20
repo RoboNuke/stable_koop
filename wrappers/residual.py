@@ -161,9 +161,9 @@ class ResidualPolicyEnv:
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        obs = obs.to(self.device).float()
+        obs = obs.to(self.device)  # preserve env-native dtype (e.g. float64)
         with torch.no_grad():
-            self._z_prev = self.koopman.encode(obs)
+            self._z_prev = self.koopman.encode(obs.float())
         self._gamma_prev = torch.zeros(self.num_envs, device=self.device)
         return self._augment_obs(obs), info
 
@@ -190,12 +190,15 @@ class ResidualPolicyEnv:
             u = torch.clamp(u, self._env_act_low, self._env_act_high)
 
         obs_next, env_reward, terminated, truncated, info = self.env.step(u)
-        obs_next = obs_next.to(self.device).float()
+        obs_next = obs_next.to(self.device)  # keep env-native dtype
         env_reward = env_reward.to(self.device).float()
         terminated = terminated.to(self.device)
         truncated = truncated.to(self.device)
 
-        z_next = self.koopman.encode(obs_next)
+        # Float32 view used only for the koopman model; obs_next itself is
+        # passed through to the policy in its native dtype below.
+        obs_next_f32 = obs_next.float()
+        z_next = self.koopman.encode(obs_next_f32)
 
         # Always-on diagnostics (exposed via info for downstream eval). z_pred
         # / x_pred are also reused for the gamma_t computation below depending
@@ -207,10 +210,10 @@ class ResidualPolicyEnv:
         if self.pred_error_space == "latent":
             gamma_t = torch.linalg.vector_norm(z_next - z_pred, dim=-1)
         elif self.pred_error_space == "state_decoded":
-            gamma_t = torch.linalg.vector_norm(obs_next - x_pred, dim=-1)
+            gamma_t = torch.linalg.vector_norm(obs_next_f32 - x_pred, dim=-1)
         else:  # state_reconstruction
             x_recon = self.koopman.decode(z_next)
-            gamma_t = torch.linalg.vector_norm(obs_next - x_recon, dim=-1)
+            gamma_t = torch.linalg.vector_norm(obs_next_f32 - x_recon, dim=-1)
 
         if delta is None:
             eta_t = torch.zeros_like(gamma_t)
@@ -251,10 +254,11 @@ class ResidualPolicyEnv:
     def _augment_obs(self, obs: torch.Tensor) -> torch.Tensor:
         if self.obs_augmentation == "none":
             return obs
-        gamma_col = self._gamma_prev.unsqueeze(-1)  # (N, 1)
+        # Match the obs dtype so cat doesn't silently upcast / mix precisions.
+        gamma_col = self._gamma_prev.to(obs.dtype).unsqueeze(-1)
         if self.obs_augmentation == "raw":
             return torch.cat([obs, gamma_col], dim=-1)
-        normalized = (self._gamma_prev - self.gamma_worst_case) * self._inv_BF_norm
+        normalized = ((self._gamma_prev - self.gamma_worst_case) * self._inv_BF_norm).to(obs.dtype)
         return torch.cat([obs, gamma_col, normalized.unsqueeze(-1)], dim=-1)
 
     def close(self):

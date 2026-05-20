@@ -128,9 +128,9 @@ lqr_controller_cfg:
   scale_B: false
 
   stability_analysis:
-    epsilon_x: 0.3                # max tracking error in x-space
-    eta: 0.1                      # latent-space displacement bound
-    use_optimization: true        # run SDP (no-prepend) or L-BFGS α (prepend) optimizer
+    epsilon_x: 0.3                            # max tracking error in x-space (normalized)
+    ctrl_percentages: [0.0, 0.25, 0.5, 0.75, 1.0]  # heatmap + printout at each fraction of u_max/||F||
+    use_optimization: true                    # run SDP (no-prepend) or L-BFGS α (prepend) optimizer
 
   eval_cfg_path: "config/exp_cfgs/eval/pendulum.yaml"
 

@@ -214,6 +214,12 @@ class TrainKoopmanCfg:
 
     seed: int = 42
     log_interval: int = 10
+    encoder_lipschitz_batch_size: int = 4096
+    """Chunk size for the per-point encoder-Jacobian computation in
+    :func:`controller.controller_analysis.compute_encoder_lipschitz`. Larger
+    values are faster but allocate more memory for the vmap+jacrev batch;
+    1.7M training points × output_dim × hidden_dim floats can OOM at the
+    naïve all-at-once batch size. The default chunks into 4096 points."""
     experiment_name: str = "pendulum_default"
     """Subdirectory under ``results/`` where the koopman checkpoint,
     ``model_performance.yaml``, ``config.yaml``, and any controller-fit

@@ -48,7 +48,7 @@ def compute_act_scale(cfg: AugmentationCfg, ds) -> np.ndarray | None:
     return _scale_from(cfg.act_scale_source, ds.act_space_low, ds.act_space_high, ds.act_min, ds.act_max)
 
 
-def augment_trajectories(ds, cfg: AugmentationCfg) -> list:
+def augment_trajectories(ds, cfg: AugmentationCfg, *, verbose: bool = True) -> list:
     """Project ``ds.trajectories`` into ``(koopman_state, koopman_action)`` pairs.
 
     ``ds`` is a :class:`data.dataloader.LoadedDataset`. The output is the
@@ -85,21 +85,22 @@ def augment_trajectories(ds, cfg: AugmentationCfg) -> list:
         koop_obs_scale = obs_scale
 
     # --- pre-augmentation diagnostics ---
-    print("\n=== Augmentation ===")
-    print(f"  prepend_base_action: {cfg.prepend_base_action}")
-    print(f"  use_action_delta:    {cfg.use_action_delta}")
-    print(f"  obs_scale_source:    {cfg.obs_scale_source}")
-    print(f"  act_scale_source:    {cfg.act_scale_source}")
-    print("  --- raw env / observed bounds ---")
-    print(f"  obs env  low / high: {_fmt_vec(ds.obs_space_low)} / {_fmt_vec(ds.obs_space_high)}")
-    print(f"  obs obsv min / max:  {_fmt_vec(ds.obs_min)} / {_fmt_vec(ds.obs_max)}")
-    print(f"  act env  low / high: {_fmt_vec(ds.act_space_low)} / {_fmt_vec(ds.act_space_high)}")
-    print(f"  act obsv min / max:  {_fmt_vec(ds.act_min)} / {_fmt_vec(ds.act_max)}")
-    print("  --- chosen scales ---")
-    print(f"  obs scale (per dim): {_fmt_vec(obs_scale)}")
-    print(f"  act scale (per dim): {_fmt_vec(act_scale)}")
-    if cfg.prepend_base_action:
-        print(f"  koop_state scale ([obs; base_action]): {_fmt_vec(koop_obs_scale)}")
+    if verbose:
+        print("\n=== Augmentation ===")
+        print(f"  prepend_base_action: {cfg.prepend_base_action}")
+        print(f"  use_action_delta:    {cfg.use_action_delta}")
+        print(f"  obs_scale_source:    {cfg.obs_scale_source}")
+        print(f"  act_scale_source:    {cfg.act_scale_source}")
+        print("  --- raw env / observed bounds ---")
+        print(f"  obs env  low / high: {_fmt_vec(ds.obs_space_low)} / {_fmt_vec(ds.obs_space_high)}")
+        print(f"  obs obsv min / max:  {_fmt_vec(ds.obs_min)} / {_fmt_vec(ds.obs_max)}")
+        print(f"  act env  low / high: {_fmt_vec(ds.act_space_low)} / {_fmt_vec(ds.act_space_high)}")
+        print(f"  act obsv min / max:  {_fmt_vec(ds.act_min)} / {_fmt_vec(ds.act_max)}")
+        print("  --- chosen scales ---")
+        print(f"  obs scale (per dim): {_fmt_vec(obs_scale)}")
+        print(f"  act scale (per dim): {_fmt_vec(act_scale)}")
+        if cfg.prepend_base_action:
+            print(f"  koop_state scale ([obs; base_action]): {_fmt_vec(koop_obs_scale)}")
 
     out = []
     for states, actions, base_actions, _rewards in ds.trajectories:
@@ -133,12 +134,13 @@ def augment_trajectories(ds, cfg: AugmentationCfg) -> list:
         out.append((koopman_states.astype(np.float32), koopman_actions.astype(np.float32)))
 
     # --- post-augmentation diagnostics: per-dim min/max across all output ---
-    all_states = np.concatenate([s for s, _ in out], axis=0)
-    all_actions = np.concatenate([a for _, a in out], axis=0) if any(len(a) for _, a in out) else None
-    print("  --- post-augmentation (normalized) ---")
-    print(f"  koop_state min / max: {_fmt_vec(all_states.min(axis=0))} / {_fmt_vec(all_states.max(axis=0))}")
-    if all_actions is not None and all_actions.size > 0:
-        print(f"  koop_action min / max: {_fmt_vec(all_actions.min(axis=0))} / {_fmt_vec(all_actions.max(axis=0))}")
-    print(f"  trajectories: {len(out)}  transitions: {sum(len(a) for _, a in out)}")
+    if verbose:
+        all_states = np.concatenate([s for s, _ in out], axis=0)
+        all_actions = np.concatenate([a for _, a in out], axis=0) if any(len(a) for _, a in out) else None
+        print("  --- post-augmentation (normalized) ---")
+        print(f"  koop_state min / max: {_fmt_vec(all_states.min(axis=0))} / {_fmt_vec(all_states.max(axis=0))}")
+        if all_actions is not None and all_actions.size > 0:
+            print(f"  koop_action min / max: {_fmt_vec(all_actions.min(axis=0))} / {_fmt_vec(all_actions.max(axis=0))}")
+        print(f"  trajectories: {len(out)}  transitions: {sum(len(a) for _, a in out)}")
 
     return out

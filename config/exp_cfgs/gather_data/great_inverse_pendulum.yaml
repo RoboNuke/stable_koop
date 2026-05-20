@@ -1,0 +1,28 @@
+# Gather config for InvertedPendulum-v5 with the "great" LQR_policy:
+# Q=[10000, 100, 10000, 100], R=0.1 — measured ~98% success rate on the
+# survive-to-timeout criterion (mean episode length ~997).
+
+gather_data_cfg:
+  env_name: "InvertedPendulum-v5"
+  env_kwargs: {}
+
+  num_trajectories: 2000
+  max_episode_steps: 1000
+
+  base_policy:
+    name: "LQR_policy"
+    params:
+      Q: [10000.0, 100.0, 10000.0, 100.0]  # diag(cart_x, cart_xdot, theta, theta_dot)
+      R: 0.1
+      action_clip: 3.0
+
+  perturbations:
+    enabled: false
+    perturb_scale: 1.0
+    fix_perturb_range: false
+    hold_steps: 5
+
+  eval_cfg_path: "config/exp_cfgs/eval/inverted_pendulum.yaml"
+
+  dataset_name: "great_inverse_pendulum"
+  seed: 42

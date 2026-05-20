@@ -74,7 +74,53 @@ def _print_stats_block(title: str, stats: dict) -> None:
     print(f"  pct <= R:         {100.0 * stats['pct_under_R']:.2f}%")
 
 
-def one_step_pred_error_report(model, aug_trajectories, device) -> dict:
+def _render_pred_error_report(pred_stats: dict) -> None:
+    """Print the same body that :func:`one_step_pred_error_report` would, from a stats dict."""
+    _print_stats_block("One-step latent prediction error (training data)", pred_stats["latent"])
+    _print_stats_block("One-step state reconstruction error (training data)", pred_stats["state"])
+
+
+def _render_controllability_fit_report(ctrl_stats: dict) -> None:
+    """Print the same body that :func:`controllability_fit_report` would, from a stats dict."""
+    print("--- Koopman controllability fit ---")
+    m = ctrl_stats.get("m")
+    if m is None:
+        print("  m (encoder lower Lipschitz): n/a (fixed encoder)")
+    else:
+        print(f"  m (encoder lower Lipschitz):           {float(m):.2e}")
+    latent_dim = ctrl_stats.get("latent_dim")
+    ctrl_rank = ctrl_stats.get("ctrl_rank")
+    if latent_dim is not None and ctrl_rank is not None:
+        print(f"  Controllability rank:                  {int(ctrl_rank)} / {int(latent_dim)}")
+    mode_info = ctrl_stats.get("mode_controllability")
+    if mode_info:
+        print("  --- All eigenvalues of A (PBH controllability) ---")
+        for i, mi in enumerate(mode_info):
+            re, im = mi["eigenvalue"]
+            mag = mi["magnitude"]
+            proj = mi["pbh_projection"]
+            tag = "controllable" if mi["controllable"] else "UNCONTROLLABLE"
+            print(
+                f"    λ_{i:02d} = {float(re):+.4f}{float(im):+.4f}j  "
+                f"|λ|={float(mag):.4f}  |wᵀB|={float(proj):.2e}  [{tag}]"
+            )
+    else:
+        # Legacy YAML without PBH info — fall back to the |λ| extrema.
+        evs = ctrl_stats.get("open_loop_eigvals") or []
+        mags = [math.hypot(float(z[0]), float(z[1])) for z in evs if isinstance(z, (list, tuple))]
+        if mags:
+            print(f"  open-loop |λ| max:                     {max(mags):.2f}")
+            print(f"  open-loop |λ| min:                     {min(mags):.2f}")
+    svals = ctrl_stats.get("B_singular_values")
+    if svals:
+        print("  --- Singular values of B ---")
+        for i, s in enumerate(svals):
+            print(f"    σ_{i}(B) = {float(s):.4e}")
+    print(f"  ||A||_2 (spectral norm):               {float(ctrl_stats['A_spec_norm']):.2e}")
+    print(f"  ||B||_2 (spectral norm):               {float(ctrl_stats['B_spec_norm']):.2e}")
+
+
+def one_step_pred_error_report(model, aug_trajectories, device, *, verbose: bool = True) -> dict:
     """One-step prediction error stats over training transitions.
 
     Computes per-transition errors in *both* spaces:
@@ -103,8 +149,9 @@ def one_step_pred_error_report(model, aug_trajectories, device) -> dict:
     latent_stats = _stats_dict(torch.cat(latent_errs))
     state_stats = _stats_dict(torch.cat(state_errs))
 
-    _print_stats_block("One-step latent prediction error (training data)", latent_stats)
-    _print_stats_block("One-step state reconstruction error (training data)", state_stats)
+    if verbose:
+        _print_stats_block("One-step latent prediction error (training data)", latent_stats)
+        _print_stats_block("One-step state reconstruction error (training data)", state_stats)
 
     return {
         "latent": latent_stats,
@@ -114,7 +161,10 @@ def one_step_pred_error_report(model, aug_trajectories, device) -> dict:
     }
 
 
-def controllability_fit_report(model, A, B_mat, aug_trajectories, device) -> dict:
+def controllability_fit_report(
+    model, A, B_mat, aug_trajectories, device,
+    *, verbose: bool = True, encoder_lipschitz_batch_size: int = 4096,
+) -> dict:
     """Koopman controllability-fit diagnostics.
 
     Computes:
@@ -127,34 +177,38 @@ def controllability_fit_report(model, A, B_mat, aug_trajectories, device) -> dic
 
     Prints a formatted block and returns a dict.
     """
-    print("--- Koopman controllability fit ---")
+    if verbose:
+        print("--- Koopman controllability fit ---")
 
     m_gx, _L_gx, m_full, _L_full = compute_encoder_lipschitz_bounds(
-        model, aug_trajectories, device
+        model, aug_trajectories, device,
+        verbose=verbose, batch_size=encoder_lipschitz_batch_size,
     )
     m = m_full if m_full is not None else m_gx
-    if m is None:
-        print("  m (encoder lower Lipschitz): n/a (fixed encoder)")
-    else:
-        print(f"  m (encoder lower Lipschitz):           {m:.2e}")
+    if verbose:
+        if m is None:
+            print("  m (encoder lower Lipschitz): n/a (fixed encoder)")
+        else:
+            print(f"  m (encoder lower Lipschitz):           {m:.2e}")
 
-    ctrl_rank = control_analysis(A, B_mat)
+    ctrl_rank, mode_info, B_singular_values = control_analysis(
+        A, B_mat, verbose=verbose
+    )
 
-    eigvals = torch.linalg.eigvals(A)
-    eig_abs = eigvals.abs()
     A_norm = torch.linalg.norm(A, ord=2).item()
     B_norm = torch.linalg.norm(B_mat, ord=2).item()
 
-    print(f"  open-loop |λ| max:                     {eig_abs.max().item():.2f}")
-    print(f"  open-loop |λ| min:                     {eig_abs.min().item():.2f}")
-    print(f"  ||A||_2 (spectral norm):               {A_norm:.2e}")
-    print(f"  ||B||_2 (spectral norm):               {B_norm:.2e}")
+    if verbose:
+        print(f"  ||A||_2 (spectral norm):               {A_norm:.2e}")
+        print(f"  ||B||_2 (spectral norm):               {B_norm:.2e}")
 
     return {
         "m": None if m is None else float(m),
         "ctrl_rank": int(ctrl_rank),
         "latent_dim": int(A.shape[0]),
-        "open_loop_eigvals": np.asarray(eigvals.detach().cpu().numpy()).tolist(),
+        "open_loop_eigvals": [m["eigenvalue"] for m in mode_info],
+        "mode_controllability": mode_info,
+        "B_singular_values": B_singular_values,
         "A_spec_norm": float(A_norm),
         "B_spec_norm": float(B_norm),
     }
@@ -278,41 +332,45 @@ def gamma_coverage_report(
     }
 
 
-def action_budget_report(*, F, u_max: float, A) -> dict:
+def action_budget_report(*, F, B_mat, u_max: float) -> dict:
     """Action-budget diagnostics for the closed-loop latent dynamics.
 
     Computes:
       * ``||F||_2`` (LQR gain spectral norm).
+      * ``||B||_2`` (input matrix spectral norm).
+      * ``||B||·||F||`` (the closed-loop input-feedback product).
       * ``u_max`` — actuator limit from the task.
-      * ``z_ref_limit = u_max / ||F||`` — largest latent reference the
+      * ``z_ref_max = u_max / ||F||`` — largest latent reference the
         controller can chase without saturating.
-      * ``eta_max = z_ref_limit * ||I + A||`` — maximum possible single-step
-        latent displacement induced by tracking a reference at the limit.
+      * ``eta_max = ||B|| · u_max`` — the per-step latent displacement
+        induced by a saturated control. This is the η used by the bound
+        computations downstream (replaces the legacy config-η).
 
     Prints a formatted block and returns a dict.
     """
     F_t = torch.as_tensor(F, dtype=torch.float64)
-    A_t = torch.as_tensor(A, dtype=torch.float64)
+    B_t = torch.as_tensor(B_mat, dtype=torch.float64)
 
     F_norm = torch.linalg.norm(F_t, ord=2).item()
-    z_ref_limit = (u_max / F_norm) if F_norm > 0 else float("inf")
-    I_plus_A_norm = torch.linalg.norm(
-        torch.eye(A_t.shape[0], dtype=A_t.dtype) + A_t, ord=2
-    ).item()
-    eta_max = z_ref_limit * I_plus_A_norm
+    B_norm = torch.linalg.norm(B_t, ord=2).item()
+    BF_product = B_norm * F_norm
+    z_ref_max = (u_max / F_norm) if F_norm > 0 else float("inf")
+    eta_max = B_norm * float(u_max)
 
     print("--- Action budget ---")
+    print(f"  ||B||_2:                               {B_norm:.2e}")
     print(f"  ||F||_2:                               {F_norm:.2e}")
+    print(f"  ||B|| · ||F||:                         {BF_product:.2e}")
     print(f"  u_max:                                 {float(u_max):.2e}")
-    print(f"  z_ref_limit = u_max / ||F||:           {z_ref_limit:.2e}")
-    print(f"  ||I + A||_2:                           {I_plus_A_norm:.2e}")
-    print(f"  eta_max = z_ref_limit * ||I + A||:     {eta_max:.2e}")
+    print(f"  z_ref_max = u_max / ||F||:             {z_ref_max:.2e}")
+    print(f"  eta_max = ||B|| · u_max:               {eta_max:.2e}")
 
     return {
+        "B_norm": float(B_norm),
         "F_norm": float(F_norm),
+        "BF_product": float(BF_product),
         "u_max": float(u_max),
-        "z_ref_limit": float(z_ref_limit),
-        "I_plus_A_norm": float(I_plus_A_norm),
+        "z_ref_max": float(z_ref_max),
         "eta_max": float(eta_max),
     }
 
@@ -478,27 +536,75 @@ def run_stability_report(
     aug_trajectories,
     device,
     epsilon_x: float,
-    eta: float,
+    ctrl_percentages: list[float],
     q_scale: float,
     r_scale: float,
     use_optimization: bool,
+    quiet_diagnostics: bool = False,
+    encoder_lipschitz_batch_size: int = 4096,
+    cached_pred_stats: dict | None = None,
+    cached_ctrl_stats: dict | None = None,
+    n_dense_sweep_points: int = 100,
 ) -> dict:
     """Full LQR stability + bound report.
 
     Drives the small helpers in order and returns a consolidated dict
     suitable for YAML persistence.
-    """
-    print("\n" + "=" * 50)
-    print("  One-step prediction error")
-    print("=" * 50)
-    pred_stats = one_step_pred_error_report(model, aug_trajectories, device)
 
-    print("\n" + "=" * 50)
-    print("  Controllability fit")
-    print("=" * 50)
-    ctrl_stats = controllability_fit_report(model, A, B_mat, aug_trajectories, device)
+    * ``quiet_diagnostics=True`` runs the one-step and controllability
+      helpers silently (still computes their values).
+    * ``cached_pred_stats`` / ``cached_ctrl_stats``: when provided, skip
+      the corresponding (re)computation and use the cached values
+      directly. Used by the controller-fit step to reuse the dicts
+      already saved into ``model_performance.yaml`` during training.
+    """
+    if cached_pred_stats is not None:
+        if not quiet_diagnostics:
+            print("\n" + "=" * 50)
+            print("  One-step prediction error (loaded from model_performance.yaml)")
+            print("=" * 50)
+            _render_pred_error_report(cached_pred_stats)
+        pred_stats = cached_pred_stats
+    else:
+        if not quiet_diagnostics:
+            print("\n" + "=" * 50)
+            print("  One-step prediction error")
+            print("=" * 50)
+        pred_stats = one_step_pred_error_report(
+            model, aug_trajectories, device, verbose=not quiet_diagnostics
+        )
+
+    if cached_ctrl_stats is not None:
+        if not quiet_diagnostics:
+            print("\n" + "=" * 50)
+            print("  Controllability fit (loaded from model_performance.yaml)")
+            print("=" * 50)
+            _render_controllability_fit_report(cached_ctrl_stats)
+        ctrl_stats = cached_ctrl_stats
+    else:
+        if not quiet_diagnostics:
+            print("\n" + "=" * 50)
+            print("  Controllability fit")
+            print("=" * 50)
+        ctrl_stats = controllability_fit_report(
+            model, A, B_mat, aug_trajectories, device,
+            verbose=not quiet_diagnostics,
+            encoder_lipschitz_batch_size=encoder_lipschitz_batch_size,
+        )
     m = ctrl_stats["m"] if ctrl_stats["m"] is not None else 1.0
 
+    # Action budget runs first so its derived quantities (z_ref_max, eta_max)
+    # are available for the γ_max bound below.
+    print("\n" + "=" * 50)
+    print("  Action budget")
+    print("=" * 50)
+    action_stats = action_budget_report(F=lqr.F, B_mat=B_mat, u_max=u_max)
+    eta_max = action_stats["eta_max"]  # ||B|| · u_max
+
+    # γ_max is parameterized by ``η = ctrl_pct · ||B|| · u_max``. We pass
+    # η = 0 to the optimizer (its objective subtracts η as a constant, so
+    # the optimal P doesn't depend on η) — the per-percentage γ is then
+    # just ``gamma_no_eta − η``.
     print("\n" + "=" * 50)
     print("  P and γ_max bound")
     print("=" * 50)
@@ -509,7 +615,7 @@ def run_stability_report(
         R_cost=R_cost,
         real_state_dim=real_state_dim,
         epsilon_x=epsilon_x,
-        eta=eta,
+        eta=0.0,
         m=m,
         use_optimization=use_optimization,
     )
@@ -536,72 +642,94 @@ def run_stability_report(
             alpha=bound["optimized"].get("alpha"),
         )
 
-    print()
-    action_stats = action_budget_report(F=lqr.F, u_max=u_max, A=A)
-
-    # γ values: control-free (η=0) and config-η. For the prepend branch, the
-    # bound is naturally a state-space ε_x quantity, so coverage is computed
-    # against the state-space one-step error (legacy ``alpha_r_space="state"``);
-    # we also print the latent-space coverage for visibility. The no-prepend
-    # branch is naturally latent, so we report latent there.
-    gamma_max = bound["gamma_max"]
+    # Coverage. The bound is naturally state-space in the prepend branch
+    # (ε_x is x-space) and latent-space otherwise. Per request, the
+    # latent-space cross-reference printouts are disabled (commented below);
+    # natural-space coverage remains.
     gamma_max_no_eta = bound["gamma_max_no_eta"]
     prepend = bound["prepend_state"]
     coverage_space = "state" if prepend else "latent"
-    other_space = "latent" if prepend else "state"
+    # other_space = "latent" if prepend else "state"  # cross-reference disabled
 
-    print()
-    print(f"=== γ control-free (η=0) coverage ===  γ = {gamma_max_no_eta:.2e}")
-    coverage_no_eta = _coverage_or_infeasible(
-        "γ_no_eta",
-        model,
-        aug_trajectories,
-        device,
-        gamma=gamma_max_no_eta,
-        pred_error_stats=pred_stats,
-        space=coverage_space,
+    # Precompute per-transition errors in the natural coverage space so the
+    # dense ctrl_percentage sweep doesn't re-iterate the dataset 100 times.
+    errors = _precompute_one_step_errors(
+        model, aug_trajectories, device, space=coverage_space
     )
-    # Also show the other space for cross-reference (informational).
-    _coverage_or_infeasible(
-        "γ_no_eta",
-        model,
-        aug_trajectories,
-        device,
-        gamma=gamma_max_no_eta,
-        pred_error_stats=pred_stats,
-        space=other_space,
-    )
+    nat_stats = pred_stats[coverage_space]
+    R_nat = float(nat_stats["R"])
+    max_nat = float(nat_stats["max"])
 
-    print()
-    print(f"=== γ_max (config η) coverage ===  γ = {gamma_max:.2e}")
-    coverage = _coverage_or_infeasible(
-        "γ_max",
-        model,
-        aug_trajectories,
-        device,
-        gamma=gamma_max,
-        pred_error_stats=pred_stats,
-        space=coverage_space,
-    )
-    _coverage_or_infeasible(
-        "γ_max",
-        model,
-        aug_trajectories,
-        device,
-        gamma=gamma_max,
-        pred_error_stats=pred_stats,
-        space=other_space,
-    )
+    # Per-percentage coverage (the user's selected list).
+    ctrl_pct_results: list[dict] = []
+    for pct in ctrl_percentages:
+        eta_at = float(pct) * float(eta_max)
+        gamma_at = float(gamma_max_no_eta) - eta_at
+        print()
+        print(
+            f"=== ctrl_pct = {float(pct):.2f}  →  "
+            f"η = pct · ||B||·u_max = {eta_at:.2e}  ===  γ = {gamma_at:.2e}"
+        )
+        cov = _coverage_from_errors(
+            f"γ_ctrl_pct={float(pct):.2f}",
+            errors,
+            gamma=gamma_at,
+            R=R_nat,
+            max_err=max_nat,
+            space=coverage_space,
+        )
+        # _coverage_from_errors(  # latent cross-reference (disabled per user request)
+        #     f"γ_ctrl_pct={float(pct):.2f}",
+        #     _precompute_one_step_errors(model, aug_trajectories, device, space=other_space),
+        #     gamma=gamma_at, R=float(pred_stats[other_space]["R"]),
+        #     max_err=float(pred_stats[other_space]["max"]), space=other_space,
+        # )
+        ctrl_pct_results.append({
+            "ctrl_percentage": float(pct),
+            "eta": eta_at,
+            "gamma_max": gamma_at,
+            "coverage": cov,
+        })
+
+    # Dense sweep for the summary plot — 100 points across the full
+    # control-budget range. Uses precomputed errors (no extra iteration).
+    sweep_pcts = np.linspace(0.0, 1.0, n_dense_sweep_points)
+    sweep_etas: list[float] = []
+    sweep_gammas: list[float] = []
+    sweep_fracs: list[float] = []
+    sweep_ratios: list[float] = []
+    total_n = int(errors.numel())
+    for pct in sweep_pcts:
+        eta_at = float(pct) * float(eta_max)
+        gamma_at = float(gamma_max_no_eta) - eta_at
+        count_under = int((errors < gamma_at).sum().item()) if gamma_at > 0 else 0
+        frac = count_under / total_n if total_n > 0 else 0.0
+        ratio = gamma_at / R_nat if R_nat > 0 else float("inf")
+        sweep_etas.append(eta_at)
+        sweep_gammas.append(gamma_at)
+        sweep_fracs.append(frac)
+        sweep_ratios.append(ratio)
+    sweep = {
+        "ctrl_percentages": [float(p) for p in sweep_pcts],
+        "etas": sweep_etas,
+        "gamma_max_values": sweep_gammas,
+        "frac_transitions_covered": sweep_fracs,
+        "gamma_over_R": sweep_ratios,
+        "R": R_nat,
+        "max_error": max_nat,
+        "u_max": float(u_max),
+        "eta_max": float(eta_max),
+        "space": coverage_space,
+    }
 
     return {
         "pred_error_stats": pred_stats,
         "controllability_fit": ctrl_stats,
         "bound": bound,
         "action_budget": action_stats,
-        "gamma_coverage": coverage,
-        "gamma_coverage_no_eta": coverage_no_eta,
+        "ctrl_pct_results": ctrl_pct_results,
+        "ctrl_pct_sweep": sweep,
         "epsilon_x": float(epsilon_x),
-        "eta": float(eta),
         "m": float(m),
         "use_optimization": bool(use_optimization),
         "prepend_state": bound["prepend_state"],
@@ -629,4 +757,86 @@ def _coverage_or_infeasible(
         "R": float(pred_error_stats[space]["R"]),
         "max_error": float(pred_error_stats[space]["max"]),
         "infeasible": True,
+    }
+
+
+def _precompute_one_step_errors(model, aug_trajectories, device, *, space):
+    """Return a 1-D tensor of per-transition errors in the given space.
+
+    Used to avoid re-iterating the dataset for every γ check when we sweep
+    ``ctrl_percentage`` over many values.
+    """
+    if space not in ("latent", "state"):
+        raise ValueError(f"space must be 'latent' or 'state'; got {space!r}")
+    model.to(device)
+    model.eval()
+    all_errs: list = []
+    with torch.no_grad():
+        for states, actions in aug_trajectories:
+            states_t = torch.tensor(states, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
+            T_act = len(actions)
+            z_all = model.encode(states_t[:T_act])
+            z_pred = model.predict(z_all, actions_t[:T_act])
+            if space == "latent":
+                z_next = model.encode(states_t[1 : T_act + 1])
+                errs = torch.linalg.norm(z_next - z_pred, dim=-1)
+            else:
+                x_pred = model.decode(z_pred)
+                x_next = states_t[1 : T_act + 1]
+                errs = torch.linalg.norm(x_next - x_pred, dim=-1)
+            all_errs.append(errs.cpu())
+    return torch.cat(all_errs)
+
+
+def _coverage_from_errors(
+    label: str,
+    errors,
+    *,
+    gamma: float,
+    R: float,
+    max_err: float,
+    space: str,
+    verbose: bool = True,
+) -> dict:
+    """Same shape as :func:`gamma_coverage_report` but on precomputed errors."""
+    total = int(errors.numel())
+    if gamma > 0:
+        count_under = int((errors < gamma).sum().item())
+    else:
+        count_under = 0
+    frac_under = count_under / total if total > 0 else 0.0
+    ratio_R = gamma / R if R > 0 else float("inf")
+    ratio_max = gamma / max_err if max_err > 0 else float("inf")
+
+    if verbose:
+        if gamma > 0:
+            c_ratio = _color_ratio(ratio_R)
+            c_pct = _color_pct(frac_under)
+            print(f"--- γ coverage ({label}, {space} space) ---")
+            print(f"  γ:                                     {gamma:.2e}")
+            print(f"  R (mean + 2σ):                         {R:.2e}")
+            print(f"  max {space} error:                       {max_err:.2e}")
+            print(f"{c_ratio}  γ / R:                                 {ratio_R:.2f}{_RESET}")
+            print(
+                f"{c_pct}  transitions ≤ γ:                       "
+                f"{count_under}/{total} ({100.0 * frac_under:.2f}%){_RESET}"
+            )
+            print(f"  γ / max {space} error:                  {ratio_max:.2f}")
+        else:
+            print(f"--- γ coverage ({label}, {space} space) ---")
+            print(f"{_RED}  γ = {gamma:.2e} ≤ 0 — bound is infeasible.{_RESET}")
+
+    return {
+        "label": label,
+        "space": space,
+        "gamma": float(gamma),
+        "R": float(R),
+        "max_error": float(max_err),
+        "ratio_to_R": float(ratio_R),
+        "ratio_to_max": float(ratio_max),
+        "frac_transitions_under_gamma": float(frac_under),
+        "count_under": int(count_under),
+        "total": int(total),
+        "infeasible": bool(gamma <= 0),
     }

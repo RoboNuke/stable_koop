@@ -5,7 +5,7 @@
 #   - inverted_pendulum_pert  (perturbations forced on  — for the analytical B refit)
 
 gather_data_cfg:
-  env_name: "InvertedPendulum-v4"
+  env_name: "InvertedPendulum-v5"
   env_kwargs: {}                        # no custom wrappers needed
 
   num_trajectories: 2000

@@ -36,13 +36,16 @@ class GymVectorAdapter:
 
     def reset(self, **kwargs):
         obs, info = self.vec_env.reset(**kwargs)
-        return torch.as_tensor(obs, device=self.device, dtype=torch.float32), info
+        # Preserve env-native obs dtype (gym InvertedPendulum returns float64,
+        # for instance). Downcasting to float32 here loses precision on the
+        # policy input — the koopman model handles its own float32 conversion.
+        return torch.as_tensor(obs, device=self.device), info
 
     def step(self, action: torch.Tensor):
         a = action.detach().cpu().numpy()
         obs, reward, terminated, truncated, info = self.vec_env.step(a)
         return (
-            torch.as_tensor(obs, device=self.device, dtype=torch.float32),
+            torch.as_tensor(obs, device=self.device),
             torch.as_tensor(reward, device=self.device, dtype=torch.float32).reshape(self.num_envs, 1),
             torch.as_tensor(terminated, device=self.device, dtype=torch.bool).reshape(self.num_envs, 1),
             torch.as_tensor(truncated, device=self.device, dtype=torch.bool).reshape(self.num_envs, 1),

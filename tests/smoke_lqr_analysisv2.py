@@ -124,7 +124,7 @@ def _run_branch(*, prepend_state: bool) -> None:
         aug_trajectories=aug_trajectories,
         device=device,
         epsilon_x=5.0,   # generous so γ_max comes out positive for the toy
-        eta=0.01,
+        ctrl_percentages=[0.0, 0.5, 1.0],
         q_scale=1.0,
         r_scale=0.1,
         use_optimization=False,

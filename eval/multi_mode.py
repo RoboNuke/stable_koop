@@ -144,11 +144,25 @@ def _run_mode(
             sort_keys=False,
         )
     save_trajectories_npz(out_dir / f"{mode}_eval_traj.npz", per_trajectory)
+    _print_gamma_summary(mode, gamma_summary)
     print(f"  {mode} stats saved to {stats_path}")
     # Fold wrapper_state + applied_action into the gamma summary so the
     # top-level summary collates everything per mode.
     return {**gamma_summary, "applied_action": applied_action_summary,
             "wrapper_state": wrapper_state}
+
+
+def _print_gamma_summary(mode: str, g: dict) -> None:
+    print(
+        f"  [gamma] mode={mode}  "
+        f"violation_rate={g['violation_rate']:.3f}  "
+        f"mean_normalized_gamma={g['mean_normalized_gamma']:.4f}  "
+        f"mean_gamma_reward={g['mean_gamma_reward']:.4f}  "
+        f"max_gamma={g['max_gamma']:.4f}  "
+        f"p95_gamma={g['p95_gamma']:.4f}  "
+        f"mean_eta={g['mean_eta']:.4f}  "
+        f"(gamma_max={g['gamma_max']:.4f}, valid_steps={g['num_valid_steps']})"
+    )
 
 
 def _wrapper_state_snapshot(env, *, mode: str) -> dict:
@@ -229,6 +243,18 @@ def run_multi_mode(
 
     def make_single():
         return make_single_env(env_name=env_name, env_kwargs=env_kwargs)
+
+    base_policy_name = getattr(base_policy, "__class__", type(base_policy)).__name__
+    print(
+        "\n[multi_mode] env={env}  base_policy={pol}  "
+        "gamma_max={gm}  residual={res}  out_dir={out}".format(
+            env=env_name,
+            pol=base_policy_name,
+            gm=("none" if gamma_max is None else f"{gamma_max:.6g}"),
+            res=("loaded" if residual_actor is not None else "none"),
+            out=str(out_dir),
+        )
+    )
 
     per_mode_gamma: dict[str, dict] = {}
 

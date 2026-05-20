@@ -7,11 +7,11 @@
 
 train_koopman_cfg:
   approach: "joint"
-  k_type: "unbounded"
+  k_type: "schur"
   encoder_type: "linear"                # learned encoder (no env-specific trig lift)
 
   latent_dim: 4
-  rho: 1.2
+  rho: 0.05
   encoder_spec_norm: false
   encoder_latent: 80
   init_b_in_a: true
@@ -20,9 +20,16 @@ train_koopman_cfg:
 
   augmentation:
     prepend_base_action: false
-    use_action_delta: true              # action=0 for base-only data → only A learns
+    use_action_delta: false              # action=0 for base-only data → only A learns
     obs_scale_source: "observed"
     act_scale_source: "env"
+
+  visualization:
+    enabled: true
+    object_pos_obs_indices: [0, 1]   # cart_x, theta
+    goal_obs_indices: null
+    voxel_size: 0.05
+    gif_seconds: 5.0
 
   horizon: 5
   batch_size: 2048
@@ -31,7 +38,7 @@ train_koopman_cfg:
   weight_decay: 1.0e-5
   num_epochs: 1000
 
-  recon_pretrain_epochs: 20
+  recon_pretrain_epochs: 5
   recon_pretrain_lr: 1.0e-3
   recon_pretrain_bilip: false
   recon_pretrain_bilip_weight: 1.0
@@ -62,13 +69,13 @@ train_koopman_cfg:
     latent_rollout_weight: 1.0
     x_pred_weight: 1.0
 
-    l_inf_pred_loss: false
-    l_inf_pred_weight: 1.0
+    l_inf_pred_loss: true
+    l_inf_pred_weight: 1.0e-8
 
     controllability_loss: false
     ctrl_weight: 0.1
 
-    bi_lipschitz_loss: true
+    bi_lipschitz_loss: false
     bilip_weight: 2.0
     bilip_m_target: 1.2
 
@@ -110,7 +117,7 @@ train_koopman_cfg:
     upper_lip_m_max: 1.25
 
   b_fitting:
-    enabled: true
+    enabled: false
     perturbed_dataset_name: "inverted_pendulum_pert"
     method: "least_squares_projected"
     ctrl_lambda: 0.1
@@ -119,23 +126,23 @@ train_koopman_cfg:
     log_interval: 100
 
   seed: 42
-  log_interval: 10
-  experiment_name: "inverted_pendulum"
-  dataset_name: "inverted_pendulum"
+  log_interval: 1
+  experiment_name: "okay_schur_a0-8"
+  dataset_name: "okay_inverse_pendulumv2"
 
 
 lqr_controller_cfg:
-  q_scale: 1.0
-  q_epsilon_scale: 0.0
-  r_scale: 1.0
+  q_scale: 100.0
+  q_epsilon_scale: 100.0
+  r_scale: 0.001
   scale_B: false
 
   stability_analysis:
-    epsilon_x: 0.3
-    eta: 0.1
+    epsilon_x: 0.346  # <5deg <11.5deg/sec (.2 rad/sec) <1 cm/s < 1cm
+    ctrl_percentages: [0.0, 0.05, 0.1, 0.25, 1.0]
     use_optimization: true
 
   eval_cfg_path: "config/exp_cfgs/eval/inverted_pendulum.yaml"
 
-  koopman_experiment_name: "inverted_pendulum"
-  output_name: "inverted_pendulum"
+  koopman_experiment_name: "okay_schur_a0-8"
+  output_name: "okay_schur_a0-8"

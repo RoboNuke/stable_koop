@@ -32,6 +32,9 @@ def _success_cfg_from_eval(eval_cfg_path: str) -> dict:
         "success_max_thdot": eval_cfg.success_max_thdot,
         "success_max_cart_vel": eval_cfg.success_max_cart_vel,
         "success_hold_steps": eval_cfg.success_hold_steps,
+        # Default horizon for "survived the rollout" checks; callers
+        # (e.g. evaluate_dataset) may override with their own horizon.
+        "max_steps": eval_cfg.eval_max_steps,
     }
 
 
@@ -145,6 +148,11 @@ def evaluate_dataset(
                 "eval config so dataset-time success thresholds match eval-time."
             )
         success_cfg = _success_cfg_from_eval(eval_cfg_path)
+        # The "survived the rollout" success check needs to know the
+        # expected trajectory horizon — for gather-time datasets that's
+        # the env's max_episode_steps.
+        if max_episode_steps is not None:
+            success_cfg["max_steps"] = max_episode_steps
         # Extend per-traj dicts with scorer metrics + compute scorer-defined success.
         for i, (states, actions, _bases, _rewards) in enumerate(ds.trajectories):
             extra = scorer.compute_metrics(states, actions)

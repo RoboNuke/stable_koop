@@ -41,26 +41,77 @@ def transient_constant(M):
     return cond
 
 
-def control_analysis(A, B_mat):
-    """Print controllability rank + project unstable modes onto B. Returns rank."""
-    A_np = A.numpy()
-    B_np = B_mat.numpy()
+def control_analysis(A, B_mat, *, verbose: bool = True):
+    """Controllability diagnostics for ``(A, B)``.
+
+    Returns ``(ctrl_rank, mode_info, B_singular_values)``:
+
+    * ``ctrl_rank`` — rank of the Kalman controllability matrix.
+    * ``mode_info`` — list of dicts (one per A eigenvalue, ordered as
+      returned by ``scipy.linalg.eig``) with::
+
+          {
+              "eigenvalue":      [real, imag],
+              "magnitude":       |λ|,
+              "pbh_projection":  ||wᵀ B||  (PBH controllability test),
+              "controllable":    bool (pbh_projection > tol · ||w||),
+          }
+
+      Per the PBH test, mode ``i`` is uncontrollable iff its left eigenvector
+      ``w_i`` (satisfying ``w_iᵀ A = λ_i w_iᵀ``) annihilates ``B``.
+    * ``B_singular_values`` — full SVD of B (the input-coupling "modes";
+      B is rectangular so it doesn't have eigenvalues directly).
+
+    When ``verbose``, prints rank, every eigenvalue with its controllability
+    flag, and the B singular values.
+    """
+    from scipy.linalg import eig as scipy_eig
+
+    A_np = np.asarray(A.detach().cpu().numpy() if hasattr(A, "detach") else A)
+    B_np = np.asarray(B_mat.detach().cpu().numpy() if hasattr(B_mat, "detach") else B_mat)
+
+    # Kalman controllability matrix [B, AB, A²B, ...]
     C_mat = np.hstack(
         [np.linalg.matrix_power(A_np, i) @ B_np for i in range(A_np.shape[0])]
     )
-    ctrl_rank = np.linalg.matrix_rank(C_mat)
-    print(f"  Controllability rank:                  {ctrl_rank} / {A_np.shape[0]}")
+    ctrl_rank = int(np.linalg.matrix_rank(C_mat))
 
-    eigenvalues, V = torch.linalg.eig(A)
-    unstable_mask = eigenvalues.abs() > 1.0
-    if unstable_mask.any():
-        for i, (ev, unstable) in enumerate(zip(eigenvalues, unstable_mask)):
-            if unstable:
-                proj = (V[:, i].conj() @ B_mat.to(torch.cfloat)).abs()
-                print(f"      Unstable mode λ={ev.abs():.2f}, B projection={proj.item():.2f}")
-    else:
-        print("      No unstable modes detected")
-    return ctrl_rank
+    # PBH test per eigenvalue
+    eigvals, V_left, _V_right = scipy_eig(A_np, left=True, right=True)
+    mode_info = []
+    for i, lam in enumerate(eigvals):
+        w = V_left[:, i].conj()                       # left eigenvector (row)
+        w_norm = float(np.linalg.norm(w))
+        proj_norm = float(np.linalg.norm(w @ B_np))
+        # Relative threshold guards against scale of w (eigenvectors aren't
+        # unique up to scale, but scipy normalizes; 1e-8 · ||w|| is generous).
+        controllable = proj_norm > 1e-8 * max(w_norm, 1.0)
+        mode_info.append({
+            "eigenvalue": [float(lam.real), float(lam.imag)],
+            "magnitude": float(abs(lam)),
+            "pbh_projection": proj_norm,
+            "controllable": bool(controllable),
+        })
+
+    B_singular_values = [float(s) for s in np.linalg.svd(B_np, compute_uv=False)]
+
+    if verbose:
+        print(f"  Controllability rank:                  {ctrl_rank} / {A_np.shape[0]}")
+        print("  --- All eigenvalues of A (PBH controllability) ---")
+        for i, m in enumerate(mode_info):
+            re, im = m["eigenvalue"]
+            mag = m["magnitude"]
+            proj = m["pbh_projection"]
+            tag = "controllable" if m["controllable"] else "UNCONTROLLABLE"
+            print(
+                f"    λ_{i:02d} = {re:+.4f}{im:+.4f}j  "
+                f"|λ|={mag:.4f}  |wᵀB|={proj:.2e}  [{tag}]"
+            )
+        print("  --- Singular values of B ---")
+        for i, s in enumerate(B_singular_values):
+            print(f"    σ_{i}(B) = {s:.4e}")
+
+    return ctrl_rank, mode_info, B_singular_values
 
 
 # ---------------------------------------------------------------------------
@@ -68,25 +119,48 @@ def control_analysis(A, B_mat):
 # ---------------------------------------------------------------------------
 
 
-def compute_encoder_lipschitz(encoder, training_data):
-    """Lower / upper Lipschitz constants of ``encoder`` over ``training_data``."""
+def compute_encoder_lipschitz(
+    encoder,
+    training_data,
+    *,
+    verbose: bool = True,
+    batch_size: int = 4096,
+):
+    """Lower / upper Lipschitz constants of ``encoder`` over ``training_data``.
+
+    Computes per-point Jacobians with ``vmap(jacrev(...))`` and keeps the min
+    and max singular values across all points. The Jacobian batch is sized
+    naïvely ``len(training_data) × output_dim × hidden_dim`` floats, which can
+    easily exceed RAM for large training sets — so we chunk the inputs into
+    ``batch_size`` slices and accumulate the per-point singular values.
+    """
     X = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in training_data])
 
     def encode_single(x):
         return encoder(x.unsqueeze(0)).squeeze(0)
 
-    J_batch = vmap(jacrev(encode_single))(X)
-    svdvals = torch.linalg.svdvals(J_batch)
-    sigma_mins = svdvals[:, -1]
-    sigma_maxs = svdvals[:, 0]
-    m = float(sigma_mins.min().detach())
-    L = float(sigma_maxs.max().detach())
-    print(
-        f"  σ_min distribution ({len(sigma_mins)} points): "
-        f"min={sigma_mins.min():.2f}  p1={sigma_mins.quantile(0.01):.2f}  "
-        f"p5={sigma_mins.quantile(0.05):.2f}  median={sigma_mins.median():.2f}  "
-        f"mean={sigma_mins.mean():.2f}"
-    )
+    jac_fn = vmap(jacrev(encode_single))
+
+    sigma_min_chunks: list[torch.Tensor] = []
+    sigma_max_chunks: list[torch.Tensor] = []
+    for start in range(0, len(X), batch_size):
+        chunk = X[start : start + batch_size]
+        J = jac_fn(chunk)                              # (b, out, in)
+        svd = torch.linalg.svdvals(J)                  # (b, min(out, in))
+        sigma_min_chunks.append(svd[:, -1].detach())
+        sigma_max_chunks.append(svd[:, 0].detach())
+    sigma_mins = torch.cat(sigma_min_chunks)
+    sigma_maxs = torch.cat(sigma_max_chunks)
+
+    m = float(sigma_mins.min())
+    L = float(sigma_maxs.max())
+    if verbose:
+        print(
+            f"  σ_min distribution ({len(sigma_mins)} points): "
+            f"min={sigma_mins.min():.2f}  p1={sigma_mins.quantile(0.01):.2f}  "
+            f"p5={sigma_mins.quantile(0.05):.2f}  median={sigma_mins.median():.2f}  "
+            f"mean={sigma_mins.mean():.2f}"
+        )
     return m, L
 
 
@@ -102,10 +176,13 @@ def compute_lower_lipschitz(encoder, training_data):
     return float(sigma_mins.min().detach())
 
 
-def compute_encoder_lipschitz_bounds(model, aug_trajectories, device):
+def compute_encoder_lipschitz_bounds(
+    model, aug_trajectories, device, *, verbose: bool = True, batch_size: int = 4096
+):
     """Compute Lipschitz bounds for both ``g(x)`` and the full ``encode`` map."""
     if getattr(model, "_trig_encoder", False) or model.encoder is None:
-        print("  Lipschitz bounds: skipped (fixed encoder)")
+        if verbose:
+            print("  Lipschitz bounds: skipped (fixed encoder)")
         return None, None, None, None
 
     model_cpu = model.cpu()
@@ -115,12 +192,20 @@ def compute_encoder_lipschitz_bounds(model, aug_trajectories, device):
             training_states.append(s)
 
     if model_cpu.prepend_state:
-        print("  --- g(x) encoder only ---")
-        m_gx, L_gx = compute_encoder_lipschitz(model_cpu.encoder, training_states)
-        print("  --- full encode [x; g(x)] ---")
-        m_full, L_full = compute_encoder_lipschitz(model_cpu.encode, training_states)
+        if verbose:
+            print("  --- g(x) encoder only ---")
+        m_gx, L_gx = compute_encoder_lipschitz(
+            model_cpu.encoder, training_states, verbose=verbose, batch_size=batch_size
+        )
+        if verbose:
+            print("  --- full encode [x; g(x)] ---")
+        m_full, L_full = compute_encoder_lipschitz(
+            model_cpu.encode, training_states, verbose=verbose, batch_size=batch_size
+        )
     else:
-        m_gx, L_gx = compute_encoder_lipschitz(model_cpu.encode, training_states)
+        m_gx, L_gx = compute_encoder_lipschitz(
+            model_cpu.encode, training_states, verbose=verbose, batch_size=batch_size
+        )
         m_full, L_full = m_gx, L_gx
 
     model.to(device)

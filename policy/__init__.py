@@ -16,6 +16,7 @@ from typing import Callable, Protocol
 import numpy as np
 
 # Lazy imports of per-env policies so unused imports never run.
+from policy.inverted_pendulum.lqr import LQRPolicy as InvertedPendulumLQRPolicy
 from policy.inverted_pendulum.pd import PDPolicy as InvertedPendulumPDPolicy
 from policy.pendulum.energy_based import (
     BangEnergyShapingPolicy,
@@ -38,6 +39,7 @@ _REGISTRY: dict[str, Callable[..., BasePolicy]] = {
     "energy": EnergyShapingPolicy,
     "bang_energy": BangEnergyShapingPolicy,
     "PD_policy": InvertedPendulumPDPolicy,
+    "LQR_policy": InvertedPendulumLQRPolicy,
 }
 
 

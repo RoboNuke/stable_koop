@@ -56,7 +56,10 @@ def save_model_performance(
     print("=" * 50)
     pred_stats = one_step_pred_error_report(model, aug_trajectories, device)
     print()
-    ctrl_stats = controllability_fit_report(model, A, B_mat, aug_trajectories, device)
+    ctrl_stats = controllability_fit_report(
+        model, A, B_mat, aug_trajectories, device,
+        encoder_lipschitz_batch_size=train_cfg.encoder_lipschitz_batch_size,
+    )
 
     performance: dict = {
         "training_summary": training_stats,

@@ -139,12 +139,6 @@ lqr_controller_cfg:
   stability_analysis:
     # epsilon_x: 0.3 in x-space (legacy max_tracking_error_x).
     epsilon_x: 0.3
-    # eta: 0.57 — legacy max_displacement_x. In legacy this was an x-space
-    # value internally scaled to latent via the encoder Lipschitz m
-    # (eta_latent = m · max_displacement_x). The current schema treats eta
-    # as already-latent, so if your trained encoder has m ≠ 1 you may want
-    # to adjust this value to ``m · 0.57``.
-    eta: 0.57
     use_optimization: true          # legacy optimize_lyapunov_P: true
 
   eval_cfg_path: "config/exp_cfgs/eval/prior_best.yaml"

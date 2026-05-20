@@ -56,10 +56,16 @@ def _run_controller(
     koopman_path: str | None,
     output_name: str | None,
     run_traj_eval: bool,
+    quiet_diagnostics: bool,
 ) -> str:
     """Fit the controller named by whichever ``*_controller_cfg`` header
     appears in the combined YAML. Currently only ``lqr_controller_cfg`` is
-    supported."""
+    supported.
+
+    ``quiet_diagnostics`` suppresses the augmentation block + the one-step
+    prediction error / controllability fit prints from the controller-fit
+    step, since those are already printed by the training step.
+    """
     from controller.lqr.__main__ import run as run_lqr
 
     cfg = ConfigManager.load_stage(config_path, "lqr_controller_cfg")
@@ -69,6 +75,7 @@ def _run_controller(
         koopman_path=koopman_path,
         output_name_override=output_name,
         run_traj_eval=run_traj_eval,
+        quiet_diagnostics=quiet_diagnostics,
     )
 
 
@@ -116,6 +123,10 @@ def main() -> None:
         args.koopman_path,
         output_name_override,
         run_traj_eval=not args.no_traj_eval,
+        # Skip the augmentation + diagnostics block in the controller fit
+        # when training just ran (already printed). When --skip_train, the
+        # training prints didn't happen, so re-print.
+        quiet_diagnostics=not args.skip_train,
     )
 
 
