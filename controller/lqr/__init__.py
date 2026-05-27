@@ -10,6 +10,7 @@ from controller.lqr.lqr_analysis import (
 from controller.lqr.lqr_analysisv2 import (
     action_budget_report,
     controllability_fit_report,
+    dataset_identifiability_report,
     gamma_coverage_report,
     generate_P_and_bound,
     lqr_fit_report,
@@ -22,6 +23,7 @@ __all__ = [
     "action_budget_report",
     "compute_lyapunov_params",
     "controllability_fit_report",
+    "dataset_identifiability_report",
     "gamma_coverage_report",
     "generate_P_and_bound",
     "lqr_fit_report",

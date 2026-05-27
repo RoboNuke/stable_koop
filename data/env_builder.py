@@ -11,13 +11,25 @@ that env's own module).
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import gymnasium as gym
+import numpy as np
+import torch
 
 # Map env_name -> wrapper-builder. The builder takes the raw env plus
 # arbitrary kwargs from the YAML and returns the wrapped env.
 ENV_WRAPPERS: dict[str, Callable[..., gym.Env]] = {}
+
+# Map env_name -> base-goal getter. The getter takes the wrapped (single)
+# env and returns the per-env base goal ``x_base`` in raw observation space.
+# Shape ``(x_dim,)`` is broadcast to the batch; ``(num_envs, x_dim)`` is
+# used row-wise. Consumed by ``wrappers.residual.ResidualPolicyEnv`` to form
+# the latent reference ``z_ref_t_base = koopman.encode(x_base / obs_scale)``
+# so the LQR drives the system toward a known target rather than the
+# latent origin.
+BaseGoalFn = Callable[[gym.Env], Union[np.ndarray, torch.Tensor]]
+ENV_BASE_GOALS: dict[str, BaseGoalFn] = {}
 
 
 def register_env_wrappers(env_name: str, builder: Callable[..., gym.Env]) -> None:
@@ -28,11 +40,35 @@ def register_env_wrappers(env_name: str, builder: Callable[..., gym.Env]) -> Non
     ENV_WRAPPERS[env_name] = builder
 
 
-# Self-register the pendulum wrapper builder. New envs add their own
-# `register_env_wrappers(...)` call at import time from their own module.
-from wrappers.pendulum import apply_pendulum_wrappers  # noqa: E402
+def register_env_base_goal(env_name: str, fn: BaseGoalFn) -> None:
+    """Register ``fn`` as the base-goal getter for ``env_name``."""
+    ENV_BASE_GOALS[env_name] = fn
+
+
+def get_base_goal_fn(env_name: str) -> BaseGoalFn:
+    """Return the registered base-goal getter, or raise ``KeyError``."""
+    if env_name not in ENV_BASE_GOALS:
+        raise KeyError(
+            f"No base-goal getter registered for {env_name!r}. Register one "
+            f"via register_env_base_goal(); see data/README.md for the "
+            f"per-env extension contract."
+        )
+    return ENV_BASE_GOALS[env_name]
+
+
+# Self-register the pendulum wrapper builder + base goal. New envs add their
+# own `register_env_wrappers(...)` / `register_env_base_goal(...)` calls at
+# import time from their own module.
+from wrappers.pendulum import apply_pendulum_wrappers, pendulum_base_goal  # noqa: E402
 
 register_env_wrappers("Pendulum-v1", apply_pendulum_wrappers)
+register_env_base_goal("Pendulum-v1", pendulum_base_goal)
+
+# InvertedPendulum-v4/-v5 have no custom wrapper builder but need a base goal.
+from wrappers.inverted_pendulum import inverted_pendulum_base_goal  # noqa: E402
+
+register_env_base_goal("InvertedPendulum-v4", inverted_pendulum_base_goal)
+register_env_base_goal("InvertedPendulum-v5", inverted_pendulum_base_goal)
 
 
 def make_single_env(

@@ -26,6 +26,23 @@ class VideoCfg:
     """
 
     enabled: bool = False
+    mode: str = "lqr"
+    """Which controller drives the rollout. One of ``"base_only"``,
+    ``"lqr"``, or ``"residual"``.
+
+    * ``"base_only"`` — gather-data base policy from the dataset's
+      ``gather_data_cfg`` snapshot (e.g. ``PD_policy`` / ``LQR_policy``).
+    * ``"lqr"`` — Koopman LQR (wrapper applies ``u = -F·(z - z_ref_base)``
+      with the env's registered ``base_goal_fn``).
+    * ``"residual"`` — SAC actor outputs the latent residual on top of the
+      LQR; requires ``residual_experiment_name`` + ``residual_train_cfg_path``.
+
+    All three modes write to side-by-side subdirs under the LQR control
+    folder, since γmax (the overlay's reference) comes from this LQR fit
+    regardless of which controller drives the rollout::
+
+        results/<koopman_experiment_name>/lqr/<lqr_output_name>/videos_<mode>/
+    """
     formats: list[str] = dataclasses.field(default_factory=lambda: ["gif"])
     fps: int = 30
     num_videos: int = 1
@@ -41,11 +58,6 @@ class VideoCfg:
     bar_pct_cap: float = 1.5
     """Bar visually saturates at this ratio of ``gamma_t / gamma_max`` so values
     above ``gamma_max`` overflow visibly without growing without bound."""
-    use_gather_base_policy: bool = False
-    """If True (and no residual is set), drive the rollout with the gather-data
-    base policy from the dataset's ``gather_data_cfg`` snapshot instead of the
-    Koopman LQR. Useful for long, stable demo rollouts on envs whose
-    Koopman LQR doesn't hold upright."""
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -75,7 +87,8 @@ class EvalCfg:
     capture_per_step: bool = True
     """Capture every per-env, per-step value the residual wrapper writes to
     ``info`` (``gamma_t``, ``eta_t``, ``stability_term``, ``env_reward``,
-    ``z_t``, ``z_next``, ``z_pred``, ``z_ref_t``, ``x_pred``, …) into the
+    ``z_t``, ``z_next``, ``z_pred``, ``z_ref_t_base``, ``z_ref_t_res``,
+    ``x_pred``, …) into the
     per-mode ``_eval_traj.npz`` under the wrapper's own key names.
     ``states``, ``applied_action``, total ``reward`` and ``success`` are
     captured regardless. Set False to skip the heavier latent / prediction
@@ -94,7 +107,5 @@ class EvalCfg:
     ``eval/gym_rollout_video.py`` reads it to mirror the wrapper kwargs the
     actor was trained against. Required when ``residual_experiment_name`` is
     set and ``video.enabled`` is True."""
-    results_name: str = "pendulum_default"
-    """Output subdir under ``eval/results/``."""
 
     video: VideoCfg = dataclasses.field(default_factory=VideoCfg)

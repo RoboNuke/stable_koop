@@ -28,7 +28,7 @@ import torch
 import yaml
 
 from config.manager import ConfigManager, LQRControllerCfg
-from controller.lqr.lqr_analysis import setup_lqr
+from controller.lqr.lqr_analysis import build_C, setup_lqr
 from controller.lqr.lqr_analysisv2 import run_stability_report
 from data.augmentation import augment_trajectories
 from data.dataloader import load_dataset
@@ -88,21 +88,22 @@ def _read_perf_yaml(perf_path: Path) -> tuple[dict, bool]:
 
 def _load_cached_model_performance(
     koopman_dir: Path,
-) -> tuple[dict | None, dict | None]:
-    """Pull ``one_step_pred_error`` + ``controllability_fit`` from training YAML.
+) -> tuple[dict | None, dict | None, dict | None]:
+    """Pull cached dataset/diagnostic sections from training YAML.
 
-    Returns ``(pred_stats, ctrl_stats)`` so ``run_stability_report`` can skip
-    the underlying recompute. Either entry is ``None`` if the YAML is
-    missing or doesn't carry that section, in which case the caller falls
-    back to recomputing.
+    Returns ``(pred_stats, ctrl_stats, identifiability_stats)`` so
+    ``run_stability_report`` can skip the underlying recompute. Any entry
+    is ``None`` if the YAML is missing or doesn't carry that section, in
+    which case the caller falls back to recomputing.
     """
     perf_path = koopman_dir / "model_performance.yaml"
     if not perf_path.is_file():
-        return None, None
+        return None, None, None
     perf, _ = _read_perf_yaml(perf_path)
     pred = perf.get("one_step_pred_error")
     ctrl = perf.get("controllability_fit")
-    return pred, ctrl
+    ident = perf.get("dataset_identifiability")
+    return pred, ctrl, ident
 
 
 def _backfill_model_performance(
@@ -110,6 +111,7 @@ def _backfill_model_performance(
     *,
     pred_stats: dict,
     ctrl_stats: dict,
+    identifiability_stats: dict | None = None,
 ) -> None:
     """Backfill missing ``one_step_pred_error`` / ``controllability_fit``.
 
@@ -136,6 +138,9 @@ def _backfill_model_performance(
         changed = True
     if "controllability_fit" not in perf:
         perf["controllability_fit"] = ctrl_stats
+        changed = True
+    if identifiability_stats is not None and "dataset_identifiability" not in perf:
+        perf["dataset_identifiability"] = identifiability_stats
         changed = True
     if not changed:
         return
@@ -201,11 +206,12 @@ def run(
     print("  LQR Fit")
     print("=" * 50)
     lqr, Q, R_cost, B_scale = setup_lqr(
-        A, B_mat, cfg, state_dim=state_dim, action_dim=action_dim
+        A, B_mat, cfg, action_dim=action_dim
     )
+    C_np = build_C(cfg.C_mask, latent_dim=A.shape[0])
 
     # --- Load cached stats from the koopman training run, if available ---
-    cached_pred, cached_ctrl = _load_cached_model_performance(koopman_dir)
+    cached_pred, cached_ctrl, cached_ident = _load_cached_model_performance(koopman_dir)
 
     # --- Unified stability analysis ---
     sa = cfg.stability_analysis
@@ -216,19 +222,20 @@ def run(
         B_mat=B_mat,
         Q=Q,
         R_cost=R_cost,
-        real_state_dim=state_dim,
+        C=C_np,
         u_max=u_max,
         aug_trajectories=aug_trajectories,
         device=device,
         epsilon_x=sa.epsilon_x,
         ctrl_percentages=list(sa.ctrl_percentages),
-        q_scale=cfg.q_scale,
-        r_scale=cfg.r_scale,
-        use_optimization=sa.use_optimization,
+        optimizer=sa.optimizer,
+        beta_rho_target=sa.beta_rho_target,
+        mode_projection_groups=sa.mode_projection_groups,
         quiet_diagnostics=quiet_diagnostics,
         encoder_lipschitz_batch_size=train_cfg.encoder_lipschitz_batch_size,
         cached_pred_stats=cached_pred,
         cached_ctrl_stats=cached_ctrl,
+        cached_identifiability=cached_ident,
     )
     variables["B_scale"] = float(B_scale)
 
@@ -242,6 +249,7 @@ def run(
         koopman_dir,
         pred_stats=variables["pred_error_stats"],
         ctrl_stats=variables["controllability_fit"],
+        identifiability_stats=variables.get("dataset_identifiability"),
     )
 
     # --- Control-budget summary plot (always; doesn't need voxel viz cfg) ---
@@ -318,6 +326,7 @@ def run(
             lqr=lqr,
             gamma_max=float(variables["bound"]["gamma_max"]),
             ds=ds,
+            train_cfg=train_cfg,
             device=device,
             ctrl_variables=variables,
             ctrl_perf_path=perf_path,
@@ -334,11 +343,13 @@ def _run_post_fit_eval(
     lqr,
     gamma_max: float,
     ds,
+    train_cfg,
     device,
     ctrl_variables: dict,
     ctrl_perf_path: Path,
 ) -> None:
     """Hand off to ``eval.multi_mode.run_multi_mode`` for base + LQR rollouts."""
+    from data.augmentation import compute_act_scale, compute_obs_scale
     from eval.multi_mode import run_multi_mode
     from policy import make_policy
 
@@ -355,11 +366,19 @@ def _run_post_fit_eval(
         base_policy_snap["name"], **(base_policy_snap.get("params", {}) or {})
     )
 
-    eval_out_dir = Path("eval") / "results" / eval_cfg.results_name
-    eval_out_dir.mkdir(parents=True, exist_ok=True)
+    # Match the koopman's training-time normalization so the wrapper's
+    # gamma_t lands in the same space as the LQR analysis above.
+    aug_cfg = train_cfg.augmentation
+    obs_scale = compute_obs_scale(aug_cfg, ds)
+    act_scale = compute_act_scale(aug_cfg, ds)
+
+    # Base results land in the koopman dir; LQR results live next to the
+    # controller artifact.
+    koopman_dir = controller_dir.parent.parent  # results/<koopman>/lqr/<out> -> results/<koopman>
 
     run_multi_mode(
-        out_dir=eval_out_dir,
+        koopman_dir=koopman_dir,
+        lqr_dir=controller_dir,
         eval_cfg=eval_cfg,
         env_name=env_name,
         env_kwargs=env_kwargs,
@@ -369,11 +388,15 @@ def _run_post_fit_eval(
         lqr=lqr,
         gamma_max=gamma_max,
         residual_actor=None,  # no residual yet at this stage
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
     )
 
     ctrl_variables["eval"] = {
         "eval_cfg_path": cfg.eval_cfg_path,
-        "results_dir": str(eval_out_dir),
+        "koopman_dir": str(koopman_dir),
+        "lqr_dir": str(controller_dir),
         "gamma_max": float(gamma_max),
     }
     with ctrl_perf_path.open("w") as f:

@@ -23,7 +23,6 @@ eval_cfg:
 
   # Mode triggers (see config/manager/eval_cfg.py): with lqr_output_name set
   # and residual_experiment_name unset, eval runs base + LQR.
-  koopman_experiment_name: "okay_schur_a0-8"
-  lqr_output_name: "detailed_report"
+  koopman_experiment_name: "okay_schur"
+  lqr_output_name: "okay_schur"
   residual_experiment_name: null
-  results_name: "okay_schur_detailed"

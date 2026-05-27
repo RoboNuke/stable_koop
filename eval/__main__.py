@@ -120,6 +120,9 @@ def _peek_residual_obs_act_space(
     gamma_worst_case: float,
     obs_augmentation: str,
     device: torch.device,
+    obs_scale=None,
+    act_scale=None,
+    aug_cfg=None,
 ):
     """Build a 1-env residual wrapper just to read its (obs, action) spaces.
 
@@ -136,10 +139,14 @@ def _peek_residual_obs_act_space(
         lqr=lqr,
         gamma_max=gamma_max,
         device=device,
+        env_name=env_name,
         pred_error_space=pred_error_space,
         z_ref_max_mode=z_ref_max_mode,
         gamma_worst_case=gamma_worst_case,
         obs_augmentation_override=obs_augmentation,
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
     )
     try:
         return one_env.single_observation_space, one_env.single_action_space
@@ -154,8 +161,13 @@ def _make_single_env(env_name, env_kwargs):
 
 def run(cfg: EvalCfg) -> str:
     device = make_device()
-    out_dir = Path("eval") / "results" / cfg.results_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # All controller-dependent eval results land under the LQR controller dir
+    # (one folder per mode). The koopman dir is only used as the fallback
+    # output for the pre-LQR (gather/koopman-only) context and as the home of
+    # the koopman-accuracy heatmap.
+    koopman_dir = Path("results") / cfg.koopman_experiment_name
+    koopman_dir.mkdir(parents=True, exist_ok=True)
 
     model, train_cfg, _state_dim, _action_dim = load_koopman_experiment(
         cfg.koopman_experiment_name, device
@@ -173,7 +185,7 @@ def run(cfg: EvalCfg) -> str:
     # ---- Koopman accuracy (independent of LQR / residual) ----
     if cfg.eval_koopman_accuracy:
         _run_koopman_accuracy(
-            out_dir=out_dir,
+            out_dir=koopman_dir,
             model=model,
             ds=ds,
             train_cfg=train_cfg,
@@ -182,17 +194,28 @@ def run(cfg: EvalCfg) -> str:
         )
 
     if not cfg.eval_policy_rollout:
-        return str(out_dir)
+        return str(koopman_dir)
 
     # ---- Multi-mode policy rollout ----
+    # Compute the same obs / action scales the koopman model was trained with
+    # so the wrapper feeds the encoder + predict step normalized inputs
+    # (matching controller.controller_analysis.count_steps_under_threshold).
+    from data.augmentation import compute_act_scale, compute_obs_scale
+
+    aug_cfg = train_cfg.augmentation
+    obs_scale = compute_obs_scale(aug_cfg, ds)
+    act_scale = compute_act_scale(aug_cfg, ds)
+
     controller_dir = _resolve_controller_dir(cfg)
     lqr_obj = None
     gamma_max: float | None = None
+    lqr_dir: Path | None = None
     residual_actor = None
     residual_kwargs: dict = {}
 
     if controller_dir is not None and controller_dir.is_dir():
         lqr_obj, gamma_max = _load_lqr(controller_dir)
+        lqr_dir = controller_dir
 
     if lqr_obj is not None and cfg.residual_experiment_name:
         # Need to peek the wrapper-augmented obs/act space for the actor.
@@ -222,6 +245,9 @@ def run(cfg: EvalCfg) -> str:
             gamma_worst_case=residual_kwargs["gamma_worst_case"],
             obs_augmentation=residual_kwargs["obs_augmentation"],
             device=device,
+            obs_scale=obs_scale,
+            act_scale=act_scale,
+            aug_cfg=aug_cfg,
         )
         residual_actor, _ = _load_residual_actor(
             cfg, obs_space=obs_space, act_space=act_space, device=device
@@ -230,7 +256,8 @@ def run(cfg: EvalCfg) -> str:
     from eval.multi_mode import run_multi_mode
 
     run_multi_mode(
-        out_dir=out_dir,
+        koopman_dir=koopman_dir,
+        lqr_dir=lqr_dir,
         eval_cfg=cfg,
         env_name=env_name,
         env_kwargs=env_kwargs,
@@ -244,8 +271,11 @@ def run(cfg: EvalCfg) -> str:
         residual_pred_error_space=residual_kwargs.get("pred_error_space", "latent"),
         residual_z_ref_max_mode=residual_kwargs.get("z_ref_max_mode", "action_bound"),
         residual_gamma_worst_case=residual_kwargs.get("gamma_worst_case", 0.0),
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
     )
-    return str(out_dir)
+    return str(koopman_dir)
 
 
 def _run_koopman_accuracy(

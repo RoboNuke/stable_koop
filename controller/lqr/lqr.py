@@ -31,16 +31,19 @@ class LQR:
             self._solve_full(q_scale)
 
     def _solve_full(self, q_scale):
-        """Standard full-dimensional DARE solve."""
+        """Standard full-dimensional DARE solve.
+
+        Caller (``setup_lqr``) is responsible for handing in float64 A, B,
+        Q, R; we keep everything at scipy's solver precision throughout.
+        """
         P = solve_discrete_are(
             self.A.numpy(), self.B.numpy(),
             self.Q.numpy(), self.R.numpy()
         )
-        P = torch.from_numpy(P).to(self.A.dtype)
-        self.P = P
+        self.P = torch.from_numpy(P)
         self.F = torch.linalg.solve(
             self.R + self.B.T @ self.P @ self.B,
-            self.B.T @ self.P @ self.A
+            self.B.T @ self.P @ self.A,
         )
         self.gain_norm = torch.linalg.norm(self.F, ord=2)
         self.ctrl_dim = self.A.shape[0]

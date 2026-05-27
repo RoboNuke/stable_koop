@@ -42,6 +42,10 @@ def _make_residual_env(
     obs_augmentation: str,
     disable_action_augmentation: bool,
     device: torch.device,
+    base_goal_fn: Callable,
+    obs_scale=None,
+    act_scale=None,
+    aug_cfg=None,
 ) -> ResidualPolicyEnv:
     """Build the standard gymnasium -> batched-tensor stack."""
     vec_env = gym.vector.SyncVectorEnv([make_raw_env_fn for _ in range(n_envs)])
@@ -58,6 +62,10 @@ def _make_residual_env(
         obs_augmentation=obs_augmentation,
         disable_action_augmentation=disable_action_augmentation,
         device=device,
+        base_goal_fn=base_goal_fn,
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
     )
 
 
@@ -78,7 +86,11 @@ def train_residual(
     make_eval_env_fn: Callable,  # kept for signature compatibility; unused
     evaluate_fn: Callable,
     device: torch.device,
+    base_goal_fn: Callable,
     keep_all_ckpts: bool = False,
+    obs_scale=None,
+    act_scale=None,
+    aug_cfg=None,
 ):
     """SAC training loop. Returns the trained actor model."""
     phase_dir = os.path.join(run_dir, "residual_train")
@@ -105,6 +117,10 @@ def train_residual(
         obs_augmentation=obs_augmentation,
         disable_action_augmentation=disable_action_augmentation,
         device=device,
+        base_goal_fn=base_goal_fn,
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
     )
 
     wrapped_env = _make_residual_env(

@@ -15,4 +15,3 @@ eval_cfg:
 
   koopman_experiment_name: "prior_best"
   residual_experiment_name: "prior_best"
-  results_name: "prior_best"

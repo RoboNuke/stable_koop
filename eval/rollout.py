@@ -10,7 +10,8 @@ Three pieces live here:
   ``capture_per_step=True`` it additionally collects every batched value
   the wrapper writes to ``info`` (``gamma_t``, ``eta_t``,
   ``stability_term``, ``env_reward``, ``z_t``, ``z_next``, ``z_pred``,
-  ``z_ref_t``, ``x_pred``, …), under the wrapper's own names. No env
+  ``z_ref_t_base``, ``z_ref_t_res``, ``x_pred``, …), under the wrapper's
+  own names. No env
   knowledge, no key renaming.
 * :func:`group_stats`, :func:`print_stats_table`, :func:`load_eval_stats`,
   :func:`save_trajectories_npz` — small helpers used by the orchestrator.
@@ -55,7 +56,7 @@ def print_stats_table(results, metric_keys):
         f"Failure: {results['num_failure']}  |  "
         f"Rate: {results['success_rate']:.1%}\n"
     )
-    header = f"{'Metric':<20} {'Combined':>20} {'Success':>20} {'Failure':>20}"
+    header = f"{'Metric':<20} {'Combined':>24} {'Success':>24} {'Failure':>24}"
     print(header)
     print("-" * len(header))
     for key in metric_keys:
@@ -63,8 +64,8 @@ def print_stats_table(results, metric_keys):
         for group in ["combined", "success", "failure"]:
             m = results[group].get(key, {}).get("mean", 0.0)
             s = results[group].get(key, {}).get("std", 0.0)
-            parts.append(f"{m:8.3f} +/- {s:6.3f}")
-        print(f"{key:<20} {parts[0]:>20} {parts[1]:>20} {parts[2]:>20}")
+            parts.append(f"{m:10.4f} +/- {s:8.4g}")
+        print(f"{key:<20} {parts[0]:>24} {parts[1]:>24} {parts[2]:>24}")
     print()
 
 
@@ -107,18 +108,30 @@ def build_residual_eval_env(
     lqr,
     gamma_max: float,
     device: torch.device,
+    env_name: str,
     pred_error_space: str = "latent",
     z_ref_max_mode: str = "action_bound",
     gamma_worst_case: float = 0.0,
     obs_augmentation_override: Optional[str] = None,
+    obs_scale=None,
+    act_scale=None,
+    aug_cfg=None,
 ):
     """Build the batched eval env for one mode.
 
     Returns a ``TensorToGymAdapter``-wrapped env that exposes the same numpy
     ``VectorEnv``-shaped interface that :func:`do_rollout` expects.
+
+    ``obs_scale`` / ``act_scale`` / ``aug_cfg`` must reflect the koopman
+    model's training-time augmentation so the wrapper feeds the encoder and
+    predict step the same normalized inputs they were trained on (matching
+    the LQR analysis's coverage computation).
     """
+    from data.env_builder import get_base_goal_fn
     from wrappers.gym_vec_adapter import GymVectorAdapter, TensorToGymAdapter
     from wrappers.residual import ResidualPolicyEnv
+
+    base_goal_fn = get_base_goal_fn(env_name)
 
     if mode not in _MODE_KWARGS:
         raise ValueError(f"unknown mode {mode!r}; expected one of {sorted(_MODE_KWARGS)}")
@@ -148,6 +161,10 @@ def build_residual_eval_env(
         obs_augmentation=mode_kwargs["obs_augmentation"],
         disable_action_augmentation=mode_kwargs["disable_action_augmentation"],
         device=device,
+        base_goal_fn=base_goal_fn,
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
     )
     return TensorToGymAdapter(wrapped)
 
@@ -256,22 +273,26 @@ def do_rollout(
                     applied_actions[i].append(action_batch[i].copy())
                 rewards[i] += float(rew_batch[i])
 
-                # Skip per-step capture for the transition that caused done:
-                # obs_next is the post-auto-reset obs, so any wrapper diag
-                # (gamma_t, z_pred, …) at that step compares against the
-                # wrong reference and is spurious.
-                if capture_per_step and not bool(dones[i]):
+                # Always append the post-step obs. In gymnasium 1.x
+                # SyncVectorEnv with NEXT_STEP auto-reset (the default), the
+                # obs returned at the done step IS the terminal observation
+                # (the env auto-resets only on the *next* step call, which we
+                # never reach because we ``continue`` once done_flags[i] is
+                # True). This is exactly what data/gather_data.py records and
+                # what inverted_pendulum_check_success expects:
+                # ``len(states) >= max_steps + 1`` requires the final obs.
+                states[i].append(obs_batch[i].copy())
+
+                if capture_per_step:
                     for k, batch_arr in info_np.items():
                         info_bufs[i].setdefault(k, []).append(np.asarray(batch_arr[i]))
 
                 if dones[i]:
                     done_flags[i] = True
                     success_flags[i] = check_success(states[i], success_cfg)
-                else:
-                    states[i].append(obs_batch[i].copy())
-                    if check_success(states[i], success_cfg):
-                        success_flags[i] = True
-                        done_flags[i] = True
+                elif check_success(states[i], success_cfg):
+                    success_flags[i] = True
+                    done_flags[i] = True
 
             if all(done_flags[:active]):
                 break

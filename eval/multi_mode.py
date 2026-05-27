@@ -11,12 +11,18 @@ which artifacts the caller passes in:
 
 For every mode it builds the appropriate residual-wrapper env stack via
 :func:`eval.rollout.build_residual_eval_env`, vectorizes the policy, and
-calls :func:`eval.rollout.do_rollout`. Results land in:
+calls :func:`eval.rollout.do_rollout`. Because every eval mode is
+controller-dependent (gamma_t is meaningful only relative to that LQR's
+``gamma_max``), results live under the LQR controller directory:
 
-    out_dir/
-      {mode}_eval_stats.yaml      # task metrics + gamma summary
-      {mode}_eval_traj.npz        # per-trajectory states/actions/gamma
-      gamma_metrics_summary.yaml  # base/lqr/residual side-by-side
+    lqr_dir/
+      eval_base_only/{stats.yaml,traj.npz}
+      eval_lqr/{stats.yaml,traj.npz}
+      eval_residual/{stats.yaml,traj.npz}     # only when residual_actor given
+      eval_gamma_metrics_summary.yaml              # base/lqr/residual side-by-side
+
+The pre-LQR fallback (no controller available) writes only base-mode
+results to ``koopman_dir/eval_base_only/``.
 """
 
 from __future__ import annotations
@@ -32,7 +38,6 @@ import yaml
 from eval.gamma_metrics import compare_modes, summarize_gammas
 from eval.rollout import (
     build_residual_eval_env,
-    concat_valid_per_step,
     do_rollout,
     save_trajectories_npz,
     success_cfg_from_eval_cfg,
@@ -76,10 +81,17 @@ def _residual_actor_policy(actor, device: torch.device) -> Callable[[np.ndarray]
 # per-mode runner
 # ----------------------------------------------------------------------
 
+_MODE_SUBDIR = {
+    "base": "eval_base_only",
+    "lqr": "eval_lqr",
+    "residual": "eval_residual",
+}
+
+
 def _run_mode(
     mode: str,
     *,
-    out_dir: Path,
+    parent_dir: Path,
     eval_cfg,
     make_single_env_fn,
     env_name: str,
@@ -92,7 +104,12 @@ def _run_mode(
     z_ref_max_mode: str,
     obs_augmentation_override: Optional[str],
     gamma_worst_case: float,
+    obs_scale=None,
+    act_scale=None,
+    aug_cfg=None,
 ) -> dict:
+    out_dir = parent_dir / _MODE_SUBDIR[mode]
+    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n=== Eval mode: {mode} ===")
     env = build_residual_eval_env(
         mode=mode,
@@ -102,10 +119,14 @@ def _run_mode(
         lqr=lqr,
         gamma_max=gamma_max,
         device=device,
+        env_name=env_name,
         pred_error_space=pred_error_space,
         z_ref_max_mode=z_ref_max_mode,
         gamma_worst_case=gamma_worst_case,
         obs_augmentation_override=obs_augmentation_override,
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
     )
     try:
         results, per_trajectory = do_rollout(
@@ -121,16 +142,13 @@ def _run_mode(
     finally:
         env.close()
 
-    flat = concat_valid_per_step(per_trajectory, ("gamma_t", "eta_t", "stability_term"))
     gamma_summary = summarize_gammas(
-        gamma=flat["gamma_t"],
-        eta=flat["eta_t"],
-        stability_term=flat["stability_term"],
+        per_trajectory=per_trajectory,
         gamma_max=gamma_max,
     )
     applied_action_summary = _applied_action_summary(per_trajectory)
 
-    stats_path = out_dir / f"{mode}_eval_stats.yaml"
+    stats_path = out_dir / "stats.yaml"
     with stats_path.open("w") as f:
         yaml.dump(
             {
@@ -143,7 +161,7 @@ def _run_mode(
             default_flow_style=False,
             sort_keys=False,
         )
-    save_trajectories_npz(out_dir / f"{mode}_eval_traj.npz", per_trajectory)
+    save_trajectories_npz(out_dir / "traj.npz", per_trajectory)
     _print_gamma_summary(mode, gamma_summary)
     print(f"  {mode} stats saved to {stats_path}")
     # Fold wrapper_state + applied_action into the gamma summary so the
@@ -152,17 +170,58 @@ def _run_mode(
             "wrapper_state": wrapper_state}
 
 
-def _print_gamma_summary(mode: str, g: dict) -> None:
-    print(
-        f"  [gamma] mode={mode}  "
-        f"violation_rate={g['violation_rate']:.3f}  "
-        f"mean_normalized_gamma={g['mean_normalized_gamma']:.4f}  "
-        f"mean_gamma_reward={g['mean_gamma_reward']:.4f}  "
-        f"max_gamma={g['max_gamma']:.4f}  "
-        f"p95_gamma={g['p95_gamma']:.4f}  "
-        f"mean_eta={g['mean_eta']:.4f}  "
-        f"(gamma_max={g['gamma_max']:.4f}, valid_steps={g['num_valid_steps']})"
+_GAMMA_MEANSTD_KEYS = (
+    "violation_rate",
+    "mean_pred_error",
+    "avg_max_pred_error",
+    "frac_used_cert",
+    "gamma_reward",
+    "mean_eta",
+)
+_GAMMA_SCALAR_KEYS = ("max_pred_error",)
+_GAMMA_CELL_W = 22
+
+
+def _print_gamma_summary(mode: str, summary: dict) -> None:
+    """Print combined/success/failure gamma table.
+
+    ``summary`` is the dict returned by ``summarize_gammas`` — three blocks
+    (combined / success / failure), each with ``{mean, std}`` entries for
+    the per-trajectory metrics and plain scalars for true-max / counts.
+    """
+    print(f"\nGamma metrics ({mode}, gamma_max={summary['combined']['gamma_max']:.4f}):")
+    counts = (
+        f"Trajectories: combined={summary['combined']['num_trajectories']}  "
+        f"success={summary['success']['num_trajectories']}  "
+        f"failure={summary['failure']['num_trajectories']}    "
+        f"Total steps: combined={summary['combined']['total_steps']}  "
+        f"success={summary['success']['total_steps']}  "
+        f"failure={summary['failure']['total_steps']}"
     )
+    print(counts)
+    header = f"{'Metric':<24} {'Combined':>22} {'Success':>22} {'Failure':>22}"
+    print(header)
+    print("-" * len(header))
+    for key in _GAMMA_MEANSTD_KEYS:
+        cells = []
+        for group in ("combined", "success", "failure"):
+            ms = summary[group][key]
+            if ms is None:
+                cells.append("no bound (gamma_max<=0)".rjust(_GAMMA_CELL_W))
+            elif isinstance(ms, dict):
+                m = ms.get("mean", float("nan"))
+                s = ms.get("std", float("nan"))
+                cells.append(f"{m:10.5f} +/- {s:8.5f}")
+            else:
+                cells.append(f"{float(ms):10.5f}")
+        print(f"{key:<24} {cells[0]:>22} {cells[1]:>22} {cells[2]:>22}")
+    for key in _GAMMA_SCALAR_KEYS:
+        cells = [
+            f"{float(summary[group][key]):10.5f}"
+            for group in ("combined", "success", "failure")
+        ]
+        print(f"{key:<24} {cells[0]:>22} {cells[1]:>22} {cells[2]:>22}")
+    print()
 
 
 def _wrapper_state_snapshot(env, *, mode: str) -> dict:
@@ -212,7 +271,8 @@ def _applied_action_summary(per_trajectory: list[dict]) -> dict:
 
 def run_multi_mode(
     *,
-    out_dir: str | Path,
+    koopman_dir: str | Path,
+    lqr_dir: Optional[str | Path] = None,
     eval_cfg,
     env_name: str,
     env_kwargs: dict,
@@ -226,6 +286,9 @@ def run_multi_mode(
     residual_pred_error_space: str = "latent",
     residual_z_ref_max_mode: str = "action_bound",
     residual_gamma_worst_case: float = 0.0,
+    obs_scale=None,
+    act_scale=None,
+    aug_cfg=None,
 ) -> dict:
     """Run the three eval modes that apply and write all output files.
 
@@ -233,38 +296,73 @@ def run_multi_mode(
     ``residual_actor`` is the loaded ``StochasticActor`` (with state_dict
     already applied) or ``None``.
 
+    Output layout:
+
+    * When ``lqr`` is provided (the normal case) all results land under
+      ``lqr_dir`` (required): per-mode subfolders ``eval_base_only/`` /
+      ``eval_lqr/`` / ``eval_residual/`` each holding ``stats.yaml`` and
+      ``traj.npz``, plus a top-level ``eval_gamma_metrics_summary.yaml``.
+    * When ``lqr is None`` (pre-LQR gather/koopman context) the base
+      policy is rolled out on a plain SyncVectorEnv and written to
+      ``koopman_dir/eval_base_only/``.
+
+    ``obs_scale`` / ``act_scale`` / ``aug_cfg`` are the koopman model's
+    training-time normalization — required so the wrapper feeds the
+    koopman model the same normalized inputs the LQR was fit against.
+
     Returns the gamma metrics summary dict (also written to
-    ``gamma_metrics_summary.yaml`` on disk).
+    ``eval_gamma_metrics_summary.yaml`` on disk in ``lqr_dir``).
     """
     from data.env_builder import make_single_env
 
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    koopman_dir = Path(koopman_dir)
+    koopman_dir.mkdir(parents=True, exist_ok=True)
+    if lqr_dir is not None:
+        lqr_dir = Path(lqr_dir)
+        lqr_dir.mkdir(parents=True, exist_ok=True)
 
     def make_single():
         return make_single_env(env_name=env_name, env_kwargs=env_kwargs)
 
+    # ``gamma_max`` from ``ctrl_performance.yaml`` is computed against
+    # state-space prediction error when the koopman model uses prepended state
+    # (the bound is α-bound branch in ``lqr_analysisv2``), and latent-space
+    # otherwise. The eval has to use the same space or violation_rate is
+    # incomparable with the LQR coverage report. Always derive from the model
+    # for base/lqr; residual mode uses whatever the residual was trained with.
+    bound_space = "state_decoded" if bool(getattr(koopman_model, "prepend_state", False)) else "latent"
+    if residual_pred_error_space != bound_space:
+        print(
+            f"  [multi_mode] WARNING: residual_pred_error_space={residual_pred_error_space!r} "
+            f"differs from gamma_max bound space {bound_space!r}; base/lqr modes will use "
+            f"{bound_space!r} so their violation_rate is comparable to the LQR coverage report."
+        )
+
     base_policy_name = getattr(base_policy, "__class__", type(base_policy)).__name__
     print(
         "\n[multi_mode] env={env}  base_policy={pol}  "
-        "gamma_max={gm}  residual={res}  out_dir={out}".format(
+        "gamma_max={gm}  pred_error_space={sp}  residual={res}\n"
+        "             koopman_dir={kd}\n"
+        "             lqr_dir={ld}".format(
             env=env_name,
             pol=base_policy_name,
             gm=("none" if gamma_max is None else f"{gamma_max:.6g}"),
+            sp=bound_space,
             res=("loaded" if residual_actor is not None else "none"),
-            out=str(out_dir),
+            kd=str(koopman_dir),
+            ld=("-" if lqr_dir is None else str(lqr_dir)),
         )
     )
 
     per_mode_gamma: dict[str, dict] = {}
 
     # ---- base mode ----
-    # Requires LQR to instantiate the wrapper (gamma_max is a non-optional
-    # field). In the pre-LQR gather context we just run the base policy on
-    # a plain vec env without gamma capture.
+    # The wrapper needs ``gamma_max`` (it's a required field), so without an
+    # LQR we fall back to a plain SyncVectorEnv + base policy and write to
+    # ``koopman_dir/eval_base_only/``.
     if lqr is None or gamma_max is None:
         _run_base_only(
-            out_dir=out_dir,
+            koopman_dir=koopman_dir,
             eval_cfg=eval_cfg,
             env_name=env_name,
             env_kwargs=env_kwargs,
@@ -272,10 +370,14 @@ def run_multi_mode(
         )
         return {}
 
-    base_batch = _vectorize_single_step(base_policy, eval_cfg.num_parallel_evals)
-    per_mode_gamma["base"] = _run_mode(
-        "base",
-        out_dir=out_dir,
+    if lqr_dir is None:
+        raise ValueError(
+            "run_multi_mode: lqr_dir is required when lqr is provided "
+            "(it's where all eval results land)."
+        )
+
+    bound_common = dict(
+        parent_dir=lqr_dir,
         eval_cfg=eval_cfg,
         make_single_env_fn=make_single,
         env_name=env_name,
@@ -283,54 +385,47 @@ def run_multi_mode(
         lqr=lqr,
         gamma_max=gamma_max,
         device=device,
-        policy_batch=base_batch,
-        pred_error_space=residual_pred_error_space,
+        # base / lqr always use the bound's native space so they match the
+        # LQR coverage report. residual mode below uses the training-time
+        # value so the actor sees the gamma values it was reward-shaped on.
+        pred_error_space=bound_space,
         z_ref_max_mode=residual_z_ref_max_mode,
-        obs_augmentation_override=None,
         gamma_worst_case=residual_gamma_worst_case,
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
+    )
+
+    base_batch = _vectorize_single_step(base_policy, eval_cfg.num_parallel_evals)
+    per_mode_gamma["base"] = _run_mode(
+        "base",
+        policy_batch=base_batch,
+        obs_augmentation_override=None,
+        **bound_common,
     )
 
     # ---- lqr mode ----
     latent_dim = int(koopman_model.encoder_latent_dim) + int(koopman_model.prepend_dim)
     per_mode_gamma["lqr"] = _run_mode(
         "lqr",
-        out_dir=out_dir,
-        eval_cfg=eval_cfg,
-        make_single_env_fn=make_single,
-        env_name=env_name,
-        koopman_model=koopman_model,
-        lqr=lqr,
-        gamma_max=gamma_max,
-        device=device,
         policy_batch=_zero_z_ref_policy(latent_dim),
-        pred_error_space=residual_pred_error_space,
-        z_ref_max_mode=residual_z_ref_max_mode,
         obs_augmentation_override=None,
-        gamma_worst_case=residual_gamma_worst_case,
+        **bound_common,
     )
 
     # ---- residual mode ----
     if residual_actor is not None:
+        residual_common = {**bound_common, "pred_error_space": residual_pred_error_space}
         per_mode_gamma["residual"] = _run_mode(
             "residual",
-            out_dir=out_dir,
-            eval_cfg=eval_cfg,
-            make_single_env_fn=make_single,
-            env_name=env_name,
-            koopman_model=koopman_model,
-            lqr=lqr,
-            gamma_max=gamma_max,
-            device=device,
             policy_batch=_residual_actor_policy(residual_actor, device),
-            pred_error_space=residual_pred_error_space,
-            z_ref_max_mode=residual_z_ref_max_mode,
             obs_augmentation_override=residual_obs_augmentation,
-            gamma_worst_case=residual_gamma_worst_case,
+            **residual_common,
         )
 
     # ---- summary ----
     summary = compare_modes(per_mode_gamma)
-    summary_path = out_dir / "gamma_metrics_summary.yaml"
+    summary_path = lqr_dir / "eval_gamma_metrics_summary.yaml"
     with summary_path.open("w") as f:
         yaml.dump(summary, f, default_flow_style=False, sort_keys=False)
     print(f"\nGamma metrics summary saved to {summary_path}")
@@ -339,16 +434,19 @@ def run_multi_mode(
 
 def _run_base_only(
     *,
-    out_dir: Path,
+    koopman_dir: Path,
     eval_cfg,
     env_name: str,
     env_kwargs: dict,
     base_policy,
 ) -> None:
     """Pre-LQR gather/koopman context: roll out the base policy on a plain
-    ``SyncVectorEnv``. No gamma capture; writes only ``base_eval_stats.yaml``
-    and ``base_eval_traj.npz``."""
+    ``SyncVectorEnv``. No gamma capture; writes only ``stats.yaml`` +
+    ``traj.npz`` under ``koopman_dir/eval_base_only/``."""
     from data.env_builder import make_single_env
+
+    out_dir = koopman_dir / _MODE_SUBDIR["base"]
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     def make_single():
         return make_single_env(env_name=env_name, env_kwargs=env_kwargs)
@@ -370,7 +468,7 @@ def _run_base_only(
     finally:
         env.close()
 
-    with (out_dir / "base_eval_stats.yaml").open("w") as f:
+    with (out_dir / "stats.yaml").open("w") as f:
         yaml.dump({"task_metrics": results}, f, default_flow_style=False, sort_keys=False)
-    save_trajectories_npz(out_dir / "base_eval_traj.npz", per_trajectory)
-    print(f"\nBase-policy eval (no LQR / no gamma) saved to {out_dir}/base_eval_stats.yaml")
+    save_trajectories_npz(out_dir / "traj.npz", per_trajectory)
+    print(f"\nBase-policy eval (no LQR / no gamma) saved to {out_dir}/stats.yaml")

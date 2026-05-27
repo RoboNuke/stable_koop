@@ -131,15 +131,19 @@ train_koopman_cfg:
 
 
 lqr_controller_cfg:
-  q_scale: 1.0
-  q_epsilon_scale: 0.0
-  r_scale: 1.0
+  # prepend_state=false → actual_latent = latent_dim = 8.
+  # Pendulum-v1 obs (cos θ, sin θ, θ̇) so real_state_dim = 3.
+  # Old: q_scale=1, q_epsilon_scale=0 → first 3 latent rows penalized, rest zero.
+  Q_diag: [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  R_diag: [1.0]
+  C_mask: [1, 1, 1, 0, 0, 0, 0, 0]    # output = first 3 latent dims (matches real obs)
   scale_B: false
 
   stability_analysis:
     # epsilon_x: 0.3 in x-space (legacy max_tracking_error_x).
     epsilon_x: 0.3
-    use_optimization: true          # legacy optimize_lyapunov_P: true
+    optimizer: "matching"    # "none" | "matching" | "beta"  (legacy: optimize_lyapunov_P)
+    beta_rho_target: 0.0     # PBH detectability threshold (only used for "beta")
 
   eval_cfg_path: "config/exp_cfgs/eval/prior_best.yaml"
 

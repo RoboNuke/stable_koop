@@ -41,7 +41,13 @@ def transient_constant(M):
     return cond
 
 
-def control_analysis(A, B_mat, *, verbose: bool = True):
+def control_analysis(
+    A,
+    B_mat,
+    *,
+    verbose: bool = True,
+    mode_projection_groups: dict | None = None,
+):
     """Controllability diagnostics for ``(A, B)``.
 
     Returns ``(ctrl_rank, mode_info, B_singular_values)``:
@@ -55,12 +61,21 @@ def control_analysis(A, B_mat, *, verbose: bool = True):
               "magnitude":       |λ|,
               "pbh_projection":  ||wᵀ B||  (PBH controllability test),
               "controllable":    bool (pbh_projection > tol · ||w||),
+              "mode_projections": {group_name: ||v[idx]||/||v||, ...}
+                  (only when ``mode_projection_groups`` is set; ``v`` is
+                  the right eigenvector of A — shows Koopman mode
+                  structure).
           }
 
       Per the PBH test, mode ``i`` is uncontrollable iff its left eigenvector
       ``w_i`` (satisfying ``w_iᵀ A = λ_i w_iᵀ``) annihilates ``B``.
     * ``B_singular_values`` — full SVD of B (the input-coupling "modes";
       B is rectangular so it doesn't have eigenvalues directly).
+
+    ``mode_projection_groups``: optional ``{name: [indices]}`` map. When
+    provided, the right-eigenvector projection ``||v[indices]|| / ||v||``
+    is computed for each group and stored under ``mode_projections``; the
+    near-unit-circle block also prints the breakdown.
 
     When ``verbose``, prints rank, every eigenvalue with its controllability
     flag, and the B singular values.
@@ -76,8 +91,9 @@ def control_analysis(A, B_mat, *, verbose: bool = True):
     )
     ctrl_rank = int(np.linalg.matrix_rank(C_mat))
 
-    # PBH test per eigenvalue
-    eigvals, V_left, _V_right = scipy_eig(A_np, left=True, right=True)
+    # PBH test per eigenvalue; keep right eigenvectors for the Koopman
+    # mode-projection breakdown.
+    eigvals, V_left, V_right = scipy_eig(A_np, left=True, right=True)
     mode_info = []
     for i, lam in enumerate(eigvals):
         w = V_left[:, i].conj()                       # left eigenvector (row)
@@ -86,12 +102,22 @@ def control_analysis(A, B_mat, *, verbose: bool = True):
         # Relative threshold guards against scale of w (eigenvectors aren't
         # unique up to scale, but scipy normalizes; 1e-8 · ||w|| is generous).
         controllable = proj_norm > 1e-8 * max(w_norm, 1.0)
-        mode_info.append({
+        entry = {
             "eigenvalue": [float(lam.real), float(lam.imag)],
             "magnitude": float(abs(lam)),
             "pbh_projection": proj_norm,
             "controllable": bool(controllable),
-        })
+        }
+        if mode_projection_groups:
+            v = V_right[:, i]
+            v_norm = float(np.linalg.norm(v))
+            projections = {}
+            for name, idx in mode_projection_groups.items():
+                projections[str(name)] = (
+                    float(np.linalg.norm(v[idx]) / v_norm) if v_norm > 0 else float("nan")
+                )
+            entry["mode_projections"] = projections
+        mode_info.append(entry)
 
     B_singular_values = [float(s) for s in np.linalg.svd(B_np, compute_uv=False)]
 
@@ -107,6 +133,28 @@ def control_analysis(A, B_mat, *, verbose: bool = True):
                 f"    λ_{i:02d} = {re:+.4f}{im:+.4f}j  "
                 f"|λ|={mag:.4f}  |wᵀB|={proj:.2e}  [{tag}]"
             )
+        slow = [(i, m) for i, m in enumerate(mode_info) if m["magnitude"] > 0.9]
+        if slow:
+            print("  --- Near-unit-circle modes (|λ| > 0.9) ---")
+            for i, m in slow:
+                re, im = m["eigenvalue"]
+                print(
+                    f"    λ_{i:02d} = {re:+.4f}{im:+.4f}j  "
+                    f"|λ|={m['magnitude']:.4f}  |wᵀB|={m['pbh_projection']:.2e}"
+                )
+            if mode_projection_groups:
+                print(
+                    "  --- Near-unit-circle A modes (|λ| > 0.9): "
+                    "Koopman mode projections ---"
+                )
+                for i, m in slow:
+                    re, im = m["eigenvalue"]
+                    parts = "  ".join(
+                        f"{name}={val:.3f}" for name, val in m["mode_projections"].items()
+                    )
+                    print(
+                        f"    λ_{i:02d} = {re:+.4f}{im:+.4f}j  |λ|={m['magnitude']:.4f}  {parts}"
+                    )
         print("  --- Singular values of B ---")
         for i, s in enumerate(B_singular_values):
             print(f"    σ_{i}(B) = {s:.4e}")

@@ -11,11 +11,11 @@ train_koopman_cfg:
   encoder_type: "linear"                # learned encoder (no env-specific trig lift)
 
   latent_dim: 4
-  rho: 0.05
+  rho: 1.2
   encoder_spec_norm: false
   encoder_latent: 80
   init_b_in_a: true
-  prepend_state: true
+  prepend_state: false
   prepend_control: false
 
   augmentation:
@@ -36,7 +36,7 @@ train_koopman_cfg:
   num_workers: 4
   lr: 1.0e-2
   weight_decay: 1.0e-5
-  num_epochs: 1000
+  num_epochs: 30
 
   recon_pretrain_epochs: 5
   recon_pretrain_lr: 1.0e-3
@@ -127,22 +127,41 @@ train_koopman_cfg:
 
   seed: 42
   log_interval: 1
-  experiment_name: "okay_schur_a0-8"
+  experiment_name: "okay_schur_a1-2_noPend"
   dataset_name: "okay_inverse_pendulumv2"
 
 
 lqr_controller_cfg:
-  q_scale: 100.0
-  q_epsilon_scale: 100.0
-  r_scale: 0.001
+  # ---- prepend_state=false: actual_latent = latent_dim = 4 ----
+  Q_diag: [1, 1, 1, 1]
+  R_diag: [1]                # action_dim = 1
+  C_mask: [1, 1, 1, 1]       # output = all 4 learned latent dims
+                             # (no real-state slice exists in the latent when
+                             #  prepend_state=false — pick whichever subset of
+                             #  learned dims you want the β-bound to certify)
+
+  # ---- prepend_state=true (original): actual_latent = 4 + 4 = 8 ----
+  # Uncomment the block below (and re-comment the one above) to switch back.
+  Q_diag: [1, 1, 1, 1, 1, 1, 1, 1]
+  R_diag: [1]
+  C_mask: [0, 0, 1, 1, 0, 0, 0, 0]    # pole slice of prepended state
   scale_B: false
 
   stability_analysis:
     epsilon_x: 0.346  # <5deg <11.5deg/sec (.2 rad/sec) <1 cm/s < 1cm
-    ctrl_percentages: [0.0, 0.05, 0.1, 0.25, 1.0]
-    use_optimization: true
+    ctrl_percentages: [0.0] #, 0.1, 0.2, 0.30, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    optimizer: "beta"       # "none" | "matching" | "beta"
+    beta_rho_target: 0.0    # PBH detectability threshold (only used for "beta")
+    # No physical cart/pole/enc partition with prepend_state=false (the
+    # latent is entirely learned features). For the prepend_state=true
+    # variant, uncomment the block below.
+    #mode_projection_groups: null
+    mode_projection_groups:
+      cart: [0, 1]          # x, x_dot
+      pole: [2, 3]          # θ, θ_dot
+      enc:  [4, 5, 6, 7]    # learned encoder dims
 
   eval_cfg_path: "config/exp_cfgs/eval/inverted_pendulum.yaml"
 
-  koopman_experiment_name: "okay_schur_a0-8"
-  output_name: "okay_schur_a0-8"
+  koopman_experiment_name: "okay_schur"
+  output_name: "okay_schur_a1-2_noPend" #"okay_schur"

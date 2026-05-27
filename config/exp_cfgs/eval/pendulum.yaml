@@ -15,4 +15,3 @@ eval_cfg:
 
   koopman_experiment_name: "pendulum_baseline"
   residual_experiment_name: null
-  results_name: "pendulum_baseline"

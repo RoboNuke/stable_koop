@@ -14,6 +14,7 @@ import yaml
 from config.manager import TrainKoopmanCfg
 from controller.lqr.lqr_analysisv2 import (
     controllability_fit_report,
+    dataset_identifiability_report,
     one_step_pred_error_report,
 )
 
@@ -54,6 +55,10 @@ def save_model_performance(
     print("\n" + "=" * 50)
     print("  Model Performance Summary")
     print("=" * 50)
+    identifiability_stats = dataset_identifiability_report(
+        model, aug_trajectories, device,
+    )
+    print()
     pred_stats = one_step_pred_error_report(model, aug_trajectories, device)
     print()
     ctrl_stats = controllability_fit_report(
@@ -63,6 +68,7 @@ def save_model_performance(
 
     performance: dict = {
         "training_summary": training_stats,
+        "dataset_identifiability": identifiability_stats,
         "one_step_pred_error": pred_stats,
         "controllability_fit": ctrl_stats,
     }

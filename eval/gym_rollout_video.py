@@ -36,6 +36,7 @@ from PIL import Image, ImageDraw, ImageFont
 import gymnasium as gym
 
 from config.manager import ConfigManager, EvalCfg, TrainResidualCfg
+from data.augmentation import compute_act_scale, compute_obs_scale
 from data.dataloader import load_dataset
 from data.env_builder import make_single_env
 from models.residual_policy import StochasticActor
@@ -236,19 +237,21 @@ def _make_gather_base_policy(base_policy_callable, device: torch.device):
     return policy
 
 
-def _make_koopman_lqr_policy(model, F: torch.Tensor):
-    """Return ``obs_t (1, O) -> action_t (1, A)`` applying ``u = F · encode(obs)``.
+def _make_zero_residual_policy(latent_dim: int, device: torch.device):
+    """Return a constant-zero policy in residual (latent) action space.
 
-    Matches the no-residual branch documented in ``wrappers/residual.py``
-    so base-mode rollouts show the Koopman LQR controller (not the
-    gather-time base policy). The :class:`ResidualPolicyEnv` clamps
-    the result to the env action bounds itself.
+    Used for "pure Koopman LQR" mode: the wrapper is configured with
+    ``disable_action_augmentation=False`` so it applies
+    ``u = -F · (z_t - z_ref_base - z_ref_res)`` itself (with the env's
+    registered ``base_goal_fn`` providing ``z_ref_base`` and the proper
+    obs/act scaling). Passing ``z_ref_res = 0`` makes the policy a pure
+    LQR drive toward ``x_base``. Mirrors the ``"lqr"`` mode in
+    :mod:`eval.rollout` (``_MODE_KWARGS["lqr"]``).
     """
+    zeros = torch.zeros((1, latent_dim), device=device, dtype=torch.float32)
 
-    @torch.no_grad()
-    def policy(obs_t: torch.Tensor) -> torch.Tensor:
-        z = model.encode(obs_t)  # (1, L)
-        return z @ F.T            # (1, A)
+    def policy(_obs_t: torch.Tensor) -> torch.Tensor:
+        return zeros
 
     return policy
 
@@ -354,16 +357,45 @@ def run(cfg: EvalCfg) -> str:
     for fmt in cfg.video.formats:
         if fmt not in ("gif", "mp4"):
             raise ValueError(f"Unknown video format {fmt!r}; expected 'gif' or 'mp4'.")
+
+    mode = cfg.video.mode
+    if mode not in ("base_only", "lqr", "residual"):
+        raise ValueError(
+            f"video.mode must be 'base_only', 'lqr', or 'residual'; got {mode!r}."
+        )
     if not cfg.lqr_output_name:
         raise ValueError(
-            "eval_cfg.lqr_output_name is empty; required to locate lqr.pt + "
-            "ctrl_performance.yaml under results/<koopman_experiment_name>/lqr/."
+            "eval_cfg.lqr_output_name is empty; required for all modes to locate "
+            "lqr.pt + ctrl_performance.yaml (γmax + F drive the overlay)."
         )
+    if mode == "residual":
+        if not cfg.residual_experiment_name:
+            raise ValueError(
+                "video.mode='residual' but residual_experiment_name is unset."
+            )
+        if not cfg.residual_train_cfg_path:
+            raise ValueError(
+                "video.mode='residual' but residual_train_cfg_path is unset; "
+                "needed to mirror the wrapper kwargs the actor was trained with."
+            )
 
     device = make_device()
-    out_dir = Path("eval") / "results" / cfg.results_name
+    # Per-mode output dirs all live under the LQR control folder, since
+    # γmax (the overlay's reference) comes from this LQR fit even when the
+    # rollout is driven by the gather-snap base policy or a residual actor.
+    # Side-by-side ``videos_*`` subdirs keep modes separate without scattering
+    # results across multiple experiment folders:
+    #   * base_only → results/<koopman>/lqr/<lqr_output>/videos_base_only/
+    #   * lqr       → results/<koopman>/lqr/<lqr_output>/videos_lqr/
+    #   * residual  → results/<koopman>/lqr/<lqr_output>/videos_residual/
+    ctrl_dir = (
+        Path("results") / cfg.koopman_experiment_name
+        / "lqr" / cfg.lqr_output_name
+    )
+    out_dir = ctrl_dir / f"videos_{mode}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"[gym_rollout_video] mode={mode!r}; outputs → {out_dir}")
     print(f"[gym_rollout_video] loading koopman experiment {cfg.koopman_experiment_name!r}")
     model, train_cfg, _state_dim, _action_dim = load_koopman_experiment(
         cfg.koopman_experiment_name, device
@@ -373,20 +405,25 @@ def run(cfg: EvalCfg) -> str:
     env_name = gather_snap["env_name"]
     env_kwargs = gather_snap.get("env_kwargs", {}) or {}
 
+    # Normalization scales matching the koopman's training-time augmentation.
+    # Required so the residual wrapper feeds the encoder + predict step the
+    # same normalized inputs as training (and γ_t lands in the same space as
+    # the LQR's coverage report). Mirrors train_residual/__main__.py.
+    obs_scale_np = compute_obs_scale(train_cfg.augmentation, ds)
+    act_scale_np = compute_act_scale(train_cfg.augmentation, ds)
+    print(
+        f"[gym_rollout_video] obs_scale_source={train_cfg.augmentation.obs_scale_source!r}, "
+        f"act_scale_source={train_cfg.augmentation.act_scale_source!r}"
+    )
+
     print(f"[gym_rollout_video] loading LQR + γmax from results/{cfg.koopman_experiment_name}/lqr/{cfg.lqr_output_name}/")
     lqr, gamma_max = _load_lqr_and_gamma(cfg.koopman_experiment_name, cfg.lqr_output_name)
 
-    # Wrapper kwargs:
-    #   * residual mode: replay them from the train_residual cfg used.
-    #   * base mode: disable LQR action computation + obs augmentation.
-    is_residual = cfg.residual_experiment_name is not None
-    if is_residual:
-        if not cfg.residual_train_cfg_path:
-            raise ValueError(
-                "residual_experiment_name is set but residual_train_cfg_path is "
-                "empty; supply the train_residual YAML used to train it so the "
-                "wrapper kwargs can match training."
-            )
+    # Mirror eval.rollout._MODE_KWARGS so all three eval modes assemble the
+    # wrapper the same way. residual mode replays the wrapper kwargs the
+    # actor was trained with; the other two are pure visualization runs with
+    # ``reward_weight = 0``.
+    if mode == "residual":
         tr_cfg = ConfigManager.load_stage(cfg.residual_train_cfg_path, "train_residual_cfg")
         wrapper_kwargs = dict(
             gamma_max=gamma_max,
@@ -399,6 +436,9 @@ def run(cfg: EvalCfg) -> str:
         )
     else:
         tr_cfg = None
+        # base_only → passthrough (policy provides env-space action).
+        # lqr       → wrapper applies u = -F·(z - z_ref_base) itself.
+        disable_action_aug = (mode == "base_only")
         wrapper_kwargs = dict(
             gamma_max=gamma_max,
             gamma_worst_case=0.0,
@@ -406,7 +446,7 @@ def run(cfg: EvalCfg) -> str:
             pred_error_space="latent",
             z_ref_max_mode="action_bound",
             obs_augmentation="none",
-            disable_action_augmentation=True,
+            disable_action_augmentation=disable_action_aug,
         )
 
     print(f"[gym_rollout_video] building env {env_name!r} (render_mode='rgb_array')")
@@ -419,22 +459,27 @@ def run(cfg: EvalCfg) -> str:
 
     vec_env = gym.vector.SyncVectorEnv([_make_raw_env])
     adapter = GymVectorAdapter(vec_env, device=device)
+    from data.env_builder import get_base_goal_fn
     env = ResidualPolicyEnv(
         adapter,
         koopman_model=model,
         lqr=lqr,
         device=device,
+        base_goal_fn=get_base_goal_fn(env_name),
+        obs_scale=obs_scale_np,
+        act_scale=act_scale_np,
+        aug_cfg=train_cfg.augmentation,
         **wrapper_kwargs,
     )
 
-    if is_residual:
+    if mode == "residual":
         print(f"[gym_rollout_video] loading residual actor for {cfg.residual_experiment_name!r}")
         actor = _load_residual_actor(
             cfg.residual_experiment_name, tr_cfg,
             env.observation_space, env.action_space, device,
         )
         policy = _make_residual_policy(actor)
-    elif cfg.video.use_gather_base_policy:
+    elif mode == "base_only":
         base_snap = gather_snap["base_policy"]
         params = base_snap.get("params", {}) or {}
         print(
@@ -443,9 +488,12 @@ def run(cfg: EvalCfg) -> str:
         )
         base_callable = make_policy(base_snap["name"], **params)
         policy = _make_gather_base_policy(base_callable, device)
-    else:
-        print("[gym_rollout_video] using Koopman LQR controller (u = F · encode(obs))")
-        policy = _make_koopman_lqr_policy(model, env.F)
+    else:  # lqr
+        print(
+            "[gym_rollout_video] using Koopman LQR controller "
+            "(wrapper applies u = -F · (z - z_ref_base), residual z_ref = 0)"
+        )
+        policy = _make_zero_residual_policy(env.latent_dim, device)
 
     max_steps = cfg.video.max_steps if cfg.video.max_steps is not None else cfg.eval_max_steps
     base_seed = cfg.video.seed if cfg.video.seed is not None else cfg.eval_seed

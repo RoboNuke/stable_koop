@@ -19,7 +19,7 @@ import torch.nn as nn
 
 from config.manager import LQRControllerCfg
 from controller.lqr.lqr import LQR
-from controller.lqr.lqr_analysis import setup_lqr
+from controller.lqr.lqr_analysis import build_C, setup_lqr
 from controller.lqr.lqr_analysisv2 import run_stability_report
 
 
@@ -96,10 +96,14 @@ def _run_branch(*, prepend_state: bool) -> None:
 
     A = model.A.detach().cpu()
     B_mat = model.B_matrix.detach().cpu()
+    # Q regularized to full rank (ρ² < 1) by giving every latent dim a positive
+    # weight; R is a 0.1 diagonal on a 1-D action. C_mask picks the first
+    # state_dim latent dims as the output (= the "real" state slice).
+    c_mask = [1] * state_dim + [0] * (latent_dim - state_dim)
     lqr_cfg = LQRControllerCfg(
-        q_scale=1.0,
-        q_epsilon_scale=1.0,  # regularize so Q is full rank → ρ² < 1
-        r_scale=0.1,
+        Q_diag=[1.0] * latent_dim,
+        R_diag=[0.1] * action_dim,
+        C_mask=c_mask,
         scale_B=False,
     )
 
@@ -109,8 +113,9 @@ def _run_branch(*, prepend_state: bool) -> None:
     print("#" * 70)
 
     lqr, Q, R_cost, B_scale = setup_lqr(
-        A, B_mat, lqr_cfg, state_dim=state_dim, action_dim=action_dim
+        A, B_mat, lqr_cfg, action_dim=action_dim
     )
+    C_np = build_C(lqr_cfg.C_mask, latent_dim=A.shape[0])
 
     run_stability_report(
         model=model,
@@ -119,15 +124,13 @@ def _run_branch(*, prepend_state: bool) -> None:
         B_mat=B_mat,
         Q=Q,
         R_cost=R_cost,
-        real_state_dim=state_dim,
+        C=C_np,
         u_max=2.0,
         aug_trajectories=aug_trajectories,
         device=device,
         epsilon_x=5.0,   # generous so γ_max comes out positive for the toy
         ctrl_percentages=[0.0, 0.5, 1.0],
-        q_scale=1.0,
-        r_scale=0.1,
-        use_optimization=False,
+        optimizer="none",
     )
 
 

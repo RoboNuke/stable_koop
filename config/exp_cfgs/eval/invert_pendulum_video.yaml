@@ -1,0 +1,34 @@
+# Rollout-video config for ``python -m eval.gym_rollout_video``.
+#
+# Set ``video.mode`` to pick the controller; outputs land under
+# ``results/<koopman_experiment_name>/lqr/<lqr_output_name>/videos_<mode>/``.
+#
+#   * "base_only" — gather-snap base policy (e.g. PD_policy / LQR_policy)
+#   * "lqr"       — Koopman LQR (u = -F·(z - z_ref_base))
+#   * "residual"  — SAC actor on top of the LQR (needs residual_experiment_name
+#                   and residual_train_cfg_path)
+
+eval_cfg:
+    num_parallel_evals: 1
+    eval_num_trajectories: 1
+    eval_max_steps: 1000
+    eval_seed: 0
+    success_angle_deg: 5.0
+    success_max_thdot: 0.5
+    success_max_cart_vel: 0.5
+    success_hold_steps: 10
+    eval_koopman_accuracy: false
+    eval_policy_rollout: false
+    koopman_experiment_name: "okay_schur"
+    lqr_output_name: "okay_schur"
+    residual_experiment_name: null
+    residual_train_cfg_path: null
+    video:
+      enabled: true
+      mode: "base_only"
+      formats: ["gif"]
+      fps: 100
+      num_videos: 25
+      max_steps: 1000
+      seed: 0
+      bar_pct_cap: 1.5

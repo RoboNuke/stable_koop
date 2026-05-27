@@ -20,8 +20,12 @@ from controller.controller_analysis import (
 from controller.lqr.lqr_analysis import (
     compute_lyapunov_params,
     optimize_alpha_P,
+    optimize_level2_P,
     optimize_lyapunov_P,
 )
+
+
+_VALID_OPTIMIZERS = ("none", "matching", "beta")
 
 
 _GREEN = "\033[92m"
@@ -74,6 +78,90 @@ def _print_stats_block(title: str, stats: dict) -> None:
     print(f"  pct <= R:         {100.0 * stats['pct_under_R']:.2f}%")
 
 
+def _print_identifiability_block(stats: dict) -> None:
+    """Pretty-print the dataset-identifiability section from a stats dict."""
+    print("--- Dataset identifiability ([Z; U_base] regression matrix) ---")
+    print(f"  n_z (latent dim):                      {int(stats['n_z'])}")
+    print(f"  n_u (input dim):                       {int(stats['n_u'])}")
+    print(f"  T (total transitions):                 {int(stats['T'])}")
+    rank = int(stats["rank"])
+    expected = int(stats["expected_rank"])
+    color = _GREEN if rank == expected else _RED
+    tag = "identifiable" if rank == expected else "NOT identifiable — B is arbitrary"
+    print(
+        f"{color}  rank([Z; U_base]):                     "
+        f"{rank} / {expected}  [{tag}]{_RESET}"
+    )
+    print(f"  largest  σ([Z; U_base]):               {float(stats['largest_singular_value']):.4e}")
+    print(f"  smallest σ([Z; U_base]):               {float(stats['smallest_singular_value']):.4e}")
+    cond = stats.get("condition_number")
+    if cond is not None:
+        print(f"  condition number σ_max / σ_min:        {float(cond):.4e}")
+
+
+def dataset_identifiability_report(
+    model, aug_trajectories, device, *, verbose: bool = True,
+) -> dict:
+    """Rank / smallest-σ check on the regression matrix ``M = [Z; U_base]``.
+
+    ``Z`` is the encoded state at each transition and ``U_base`` is the
+    Koopman input at that transition (the ``u`` that goes through ``B``
+    in the regression ``z_{t+1} = A z_t + B u_t``). Stacked column-wise
+    over every transition in ``aug_trajectories`` we get
+
+        M = [Z; U_base] ∈ R^((n_z + n_u) × T).
+
+    ``B`` is identifiable iff ``M`` has full row rank ``n_z + n_u``;
+    equivalently iff the smallest singular value of ``M`` is bounded away
+    from zero. When ``smallest σ ≈ 0``, ``u_base`` is (nearly) a linear
+    function of ``z`` over the dataset and ``B`` is not uniquely
+    determined by least squares.
+    """
+    model.to(device)
+    model.eval()
+    Z_cols: list = []
+    U_cols: list = []
+    with torch.no_grad():
+        for states, actions in aug_trajectories:
+            if len(actions) == 0:
+                continue
+            states_t = torch.tensor(states, dtype=torch.float32, device=device)
+            actions_t = torch.tensor(actions, dtype=torch.float32, device=device)
+            T_act = len(actions)
+            z = model.encode(states_t[:T_act])                # (T_act, n_z)
+            Z_cols.append(z.detach().cpu().numpy().T)         # (n_z, T_act)
+            U_cols.append(actions_t.detach().cpu().numpy().T) # (n_u, T_act)
+    Z = np.concatenate(Z_cols, axis=1)
+    U = np.concatenate(U_cols, axis=1)
+    M = np.vstack([Z, U])  # (n_z + n_u, T)
+
+    n_z, n_u = int(Z.shape[0]), int(U.shape[0])
+    expected_rank = n_z + n_u
+    rank = int(np.linalg.matrix_rank(M))
+    svs = np.linalg.svd(M, compute_uv=False)
+    largest_sv = float(svs[0])
+    smallest_sv = float(svs[-1])
+    cond = (largest_sv / smallest_sv) if smallest_sv > 0 else float("inf")
+
+    stats = {
+        "n_z": n_z,
+        "n_u": n_u,
+        "T": int(M.shape[1]),
+        "rank": rank,
+        "expected_rank": int(expected_rank),
+        "identifiable": bool(rank == expected_rank),
+        "largest_singular_value": largest_sv,
+        "smallest_singular_value": smallest_sv,
+        "condition_number": float(cond),
+        "singular_values": [float(s) for s in svs],
+    }
+
+    if verbose:
+        _print_identifiability_block(stats)
+
+    return stats
+
+
 def _render_pred_error_report(pred_stats: dict) -> None:
     """Print the same body that :func:`one_step_pred_error_report` would, from a stats dict."""
     _print_stats_block("One-step latent prediction error (training data)", pred_stats["latent"])
@@ -104,6 +192,34 @@ def _render_controllability_fit_report(ctrl_stats: dict) -> None:
                 f"    λ_{i:02d} = {float(re):+.4f}{float(im):+.4f}j  "
                 f"|λ|={float(mag):.4f}  |wᵀB|={float(proj):.2e}  [{tag}]"
             )
+        slow = [(i, mi) for i, mi in enumerate(mode_info) if float(mi["magnitude"]) > 0.9]
+        if slow:
+            print("  --- Near-unit-circle modes (|λ| > 0.9) ---")
+            for i, mi in slow:
+                re, im = mi["eigenvalue"]
+                print(
+                    f"    λ_{i:02d} = {float(re):+.4f}{float(im):+.4f}j  "
+                    f"|λ|={float(mi['magnitude']):.4f}  "
+                    f"|wᵀB|={float(mi['pbh_projection']):.2e}"
+                )
+            if any("mode_projections" in mi for _, mi in slow):
+                print(
+                    "  --- Near-unit-circle A modes (|λ| > 0.9): "
+                    "Koopman mode projections ---"
+                )
+                for i, mi in slow:
+                    projections = mi.get("mode_projections")
+                    if not projections:
+                        continue
+                    re, im = mi["eigenvalue"]
+                    parts = "  ".join(
+                        f"{name}={float(val):.3f}"
+                        for name, val in projections.items()
+                    )
+                    print(
+                        f"    λ_{i:02d} = {float(re):+.4f}{float(im):+.4f}j  "
+                        f"|λ|={float(mi['magnitude']):.4f}  {parts}"
+                    )
     else:
         # Legacy YAML without PBH info — fall back to the |λ| extrema.
         evs = ctrl_stats.get("open_loop_eigvals") or []
@@ -164,6 +280,7 @@ def one_step_pred_error_report(model, aug_trajectories, device, *, verbose: bool
 def controllability_fit_report(
     model, A, B_mat, aug_trajectories, device,
     *, verbose: bool = True, encoder_lipschitz_batch_size: int = 4096,
+    mode_projection_groups: dict | None = None,
 ) -> dict:
     """Koopman controllability-fit diagnostics.
 
@@ -192,7 +309,7 @@ def controllability_fit_report(
             print(f"  m (encoder lower Lipschitz):           {m:.2e}")
 
     ctrl_rank, mode_info, B_singular_values = control_analysis(
-        A, B_mat, verbose=verbose
+        A, B_mat, verbose=verbose, mode_projection_groups=mode_projection_groups,
     )
 
     A_norm = torch.linalg.norm(A, ord=2).item()
@@ -219,8 +336,9 @@ def lqr_fit_report(
     *,
     P,
     F,
-    q_scale: float,
-    r_scale: float,
+    A_cl,
+    Q,
+    R_cost,
     rho_sq: float,
     alpha: float | None = None,
 ) -> dict:
@@ -232,8 +350,9 @@ def lqr_fit_report(
 
     Accepts the already-computed quantities directly so the caller controls
     how ``rho_sq`` and ``P`` were derived (e.g. DARE-based vs SDP-optimized).
-    ``q_scale`` / ``r_scale`` are the cost-matrix scales straight from
-    config (``Q = q_scale * I``, ``R = r_scale * I``).
+    ``A_cl``, ``Q``, and ``R_cost`` are used to print the closed-loop
+    spectral radius and the two ρ estimates (true P-norm contraction vs
+    DARE Rayleigh bound).
     """
     P_t = torch.as_tensor(P, dtype=torch.float64)
     F_t = torch.as_tensor(F, dtype=torch.float64)
@@ -244,16 +363,39 @@ def lqr_fit_report(
     kappa_P = lam_max_P / lam_min_P
     F_norm = torch.linalg.norm(F_t, ord=2).item()
 
+    P_np = P_t.detach().cpu().numpy()
+    A_cl_np = A_cl.detach().cpu().numpy() if hasattr(A_cl, "detach") else np.asarray(A_cl)
+    Q_np = Q.detach().cpu().numpy() if hasattr(Q, "detach") else np.asarray(Q)
+    R_np = R_cost.detach().cpu().numpy() if hasattr(R_cost, "detach") else np.asarray(R_cost)
+    F_np = F_t.detach().cpu().numpy()
+
+    sigma_A_cl = float(np.max(np.abs(np.linalg.eigvals(A_cl_np))))
+    M = np.linalg.solve(P_np, A_cl_np.T @ P_np @ A_cl_np)
+    rho_true = float(math.sqrt(max(np.max(np.abs(np.linalg.eigvals(M))), 0.0)))
+    Q_plus_FRF = Q_np + F_np.T @ R_np @ F_np
+    rayleigh_inner = 1.0 - float(np.linalg.eigvalsh(Q_plus_FRF).min()) / lam_max_P
+    rho_rayleigh = float(math.sqrt(max(rayleigh_inner, 0.0)))
+
+    # DARE residual: ||AᵀPA − P + Q + FᵀRF||_2 / ||P||_2. Should be at the
+    # solver's float64 floor for a DARE-produced P; the Rayleigh bound is
+    # only valid in that regime.
+    dare_resid = A_cl_np.T @ P_np @ A_cl_np - P_np + Q_plus_FRF
+    P_norm = float(np.linalg.norm(P_np, ord=2))
+    dare_test = float(np.linalg.norm(dare_resid, ord=2)) / P_norm if P_norm > 0 else float("inf")
+    rayleigh_color = _GREEN if dare_test < 1e-6 else _RED
+
     print(f"--- LQR fit ({label}) ---")
     print(f"  ρ²:                                    {float(rho_sq):.2f}")
     print(f"  κ(P) = λ_max(P)/λ_min(P):              {kappa_P:.2f}")
     print(f"  λ_min(P):                              {lam_min_P:.2e}")
     print(f"  λ_max(P):                              {lam_max_P:.2e}")
     print(f"  ||F||_2 (LQR gain norm):               {F_norm:.2e}")
-    print(f"  q_scale:                               {float(q_scale):.2g}")
-    print(f"  r_scale:                               {float(r_scale):.2g}")
     if alpha is not None:
         print(f"  α = λ_max(P⁻¹CᵀC):                     {float(alpha):.2e}")
+    print(f"  σ(A_cl) (spectral radius):             {sigma_A_cl:.4f}")
+    print(f"  ρ_true (P-norm contraction):           {rho_true:.4f}")
+    print(f"  DARE Test ||resid||_2 / ||P||_2:       {dare_test:.2e}")
+    print(f"{rayleigh_color}  ρ_Rayleigh (DARE bound):               {rho_rayleigh:.4f}{_RESET}")
 
     result = {
         "label": label,
@@ -262,8 +404,10 @@ def lqr_fit_report(
         "lambda_min_P": float(lam_min_P),
         "lambda_max_P": float(lam_max_P),
         "F_norm": float(F_norm),
-        "q_scale": float(q_scale),
-        "r_scale": float(r_scale),
+        "sigma_A_cl": sigma_A_cl,
+        "rho_true": rho_true,
+        "rho_rayleigh": rho_rayleigh,
+        "dare_test": dare_test,
     }
     if alpha is not None:
         result["alpha"] = float(alpha)
@@ -380,13 +524,27 @@ def action_budget_report(*, F, B_mat, u_max: float) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _alpha_from_P(P_np: np.ndarray, real_state_dim: int) -> float:
-    """α = λ_max(P⁻¹ CᵀC) with C = [I_p | 0]."""
-    n = P_np.shape[0]
-    C = np.zeros((real_state_dim, n), dtype=np.float64)
-    C[: real_state_dim, : real_state_dim] = np.eye(real_state_dim)
+def _print_cost_matrices(Q, R_cost, C: np.ndarray) -> None:
+    """Pretty-print Q, R, and C as they enter the LQR fit."""
+    Q_np = Q.detach().cpu().numpy() if hasattr(Q, "detach") else np.asarray(Q)
+    R_np = R_cost.detach().cpu().numpy() if hasattr(R_cost, "detach") else np.asarray(R_cost)
+    with np.printoptions(precision=4, suppress=True, linewidth=120):
+        print("--- LQR cost matrices ---")
+        print(f"  Q ({Q_np.shape[0]}×{Q_np.shape[1]}):")
+        for row in Q_np:
+            print("    " + np.array2string(row))
+        print(f"  R ({R_np.shape[0]}×{R_np.shape[1]}):")
+        for row in R_np:
+            print("    " + np.array2string(row))
+        print(f"  C ({C.shape[0]}×{C.shape[1]}):")
+        for row in C:
+            print("    " + np.array2string(row))
+
+
+def _alpha_from_P(P_np: np.ndarray, C: np.ndarray) -> float:
+    """α = λ_max(P⁻¹ CᵀC)."""
     CtC = C.T @ C
-    return float(np.max(np.linalg.eigvalsh(np.linalg.solve(P_np.astype(np.float64), CtC))))
+    return float(np.max(np.linalg.eigvalsh(np.linalg.solve(P_np, CtC))))
 
 
 def _gamma_no_prepend(epsilon_x, eta, m, rho_sq, kappa_P) -> tuple[float, float]:
@@ -418,22 +576,33 @@ def generate_P_and_bound(
     lqr,
     Q,
     R_cost,
-    real_state_dim: int,
+    C: np.ndarray,
     epsilon_x: float,
     eta: float,
     m: float,
-    use_optimization: bool,
+    optimizer: str,
+    beta_rho_target: float = 0.0,
 ) -> dict:
     """Compute the LQR P and γ_max bound, branching on ``model.prepend_state``.
 
-    Always reports the raw DARE-derived P. When ``use_optimization`` is set,
-    additionally runs the optimizer matching the active branch (SDP for
-    no-prepend, L-BFGS α-optimizer for prepend) and reports those results.
+    Always reports the raw DARE-derived P. ``optimizer`` selects the
+    P-optimizer to run on top:
+
+    * ``"none"`` — raw P only.
+    * ``"matching"`` — branch-matched optimizer (SDP-Lyapunov for no-prepend,
+      L-BFGS α-bound for prepend).
+    * ``"beta"`` — level-2 SDP β-bound (both branches; ``γ = ε_x(1-ρ)/√λ_max(P) − η``
+      via ``P ⪰ CᵀC``). ``beta_rho_target`` parameterizes the PBH
+      detectability pre-check.
 
     Returns a dict with keys ``raw`` (dict), ``optimized`` (dict or None),
-    ``gamma_max`` (float — from optimized if available, else raw), and
-    ``prepend_state`` (bool).
+    ``gamma_max`` (float — from optimized if available, else raw),
+    ``prepend_state`` (bool), and ``optimizer`` (the active mode).
     """
+    if optimizer not in _VALID_OPTIMIZERS:
+        raise ValueError(
+            f"optimizer={optimizer!r} not in {_VALID_OPTIMIZERS}"
+        )
     prepend = bool(getattr(model, "prepend_state", False))
 
     # --- raw LQR P (DARE) ---
@@ -449,7 +618,7 @@ def generate_P_and_bound(
     }
 
     if prepend:
-        alpha_raw = _alpha_from_P(P_raw_np, real_state_dim)
+        alpha_raw = _alpha_from_P(P_raw_np, C)
         gamma_raw_no_eta, gamma_raw = _gamma_prepend(
             epsilon_x, eta, rho_sq_raw, alpha_raw, lam_max_P_raw
         )
@@ -465,44 +634,70 @@ def generate_P_and_bound(
     gamma_max = gamma_raw
     gamma_max_no_eta = gamma_raw_no_eta
 
-    if use_optimization:
-        A_cl_np = lqr.closed_loop.detach().cpu().numpy().astype(np.float64)
-        if prepend:
-            n = A_cl_np.shape[0]
-            C = np.zeros((real_state_dim, n), dtype=np.float64)
-            C[: real_state_dim, : real_state_dim] = np.eye(real_state_dim)
-            P_opt, rho_opt, alpha_opt, lam_max_P_opt, gamma_opt = optimize_alpha_P(
-                A_cl_np, C, epsilon_x, eta, P_raw_np.astype(np.float64)
+    if optimizer != "none":
+        A_cl_np = lqr.closed_loop.detach().cpu().numpy()
+        if optimizer == "matching":
+            if prepend:
+                P_opt, rho_opt, alpha_opt, lam_max_P_opt, gamma_opt = optimize_alpha_P(
+                    A_cl_np, C, epsilon_x, eta, P_raw_np
+                )
+                if P_opt is not None:
+                    P_opt_eigs = np.linalg.eigvalsh(P_opt)
+                    kappa_P_opt = float(P_opt_eigs.max() / P_opt_eigs.min())
+                    gamma_opt_no_eta = float(gamma_opt) + float(eta)
+                    optimized = {
+                        "P": P_opt.tolist(),
+                        "rho_sq": float(rho_opt ** 2),
+                        "kappa_P": kappa_P_opt,
+                        "lambda_max_P": float(lam_max_P_opt),
+                        "alpha": float(alpha_opt),
+                        "gamma_max_no_eta": gamma_opt_no_eta,
+                        "gamma_max": float(gamma_opt),
+                    }
+                    gamma_max = float(gamma_opt)
+                    gamma_max_no_eta = gamma_opt_no_eta
+            else:
+                # No-prepend: SDP optimizes over P. ε passed to the optimizer
+                # must be in latent space, so apply the m-scaling here.
+                P_opt, rho_opt, kappa_P_opt, gamma_opt = optimize_lyapunov_P(
+                    A_cl_np, m * epsilon_x, eta
+                )
+                if P_opt is not None:
+                    P_opt_eigs = np.linalg.eigvalsh(P_opt)
+                    gamma_opt_no_eta = float(gamma_opt) + float(eta)
+                    optimized = {
+                        "P": P_opt.tolist(),
+                        "rho_sq": float(rho_opt ** 2),
+                        "kappa_P": float(kappa_P_opt),
+                        "lambda_max_P": float(P_opt_eigs.max()),
+                        "gamma_max_no_eta": gamma_opt_no_eta,
+                        "gamma_max": float(gamma_opt),
+                    }
+                    gamma_max = float(gamma_opt)
+                    gamma_max_no_eta = gamma_opt_no_eta
+        elif optimizer == "beta":
+            # Level-2 β-bound: works in both branches. ``epsilon_x`` is
+            # treated as output-space (||Ce||) directly; the level-2 bound
+            # is ``γ = ε_x(1-ρ)/√λ_max(P) - η`` after β-normalization
+            # (P ⪰ CᵀC pins β=1). The detectability pre-check inside
+            # optimize_level2_P will raise if any A_cl mode with
+            # |λ| > beta_rho_target is not detectable through C.
+            P_opt, rho_opt, lam_max_P_opt, gamma_opt = optimize_level2_P(
+                A_cl_np, C, epsilon_x, eta, rho_target=beta_rho_target,
             )
             if P_opt is not None:
                 P_opt_eigs = np.linalg.eigvalsh(P_opt)
-                kappa_P_opt = float(P_opt_eigs.max() / P_opt_eigs.min())
+                kappa_P_opt = (
+                    float(P_opt_eigs.max() / P_opt_eigs.min())
+                    if P_opt_eigs.min() > 0 else float("inf")
+                )
                 gamma_opt_no_eta = float(gamma_opt) + float(eta)
                 optimized = {
                     "P": P_opt.tolist(),
                     "rho_sq": float(rho_opt ** 2),
                     "kappa_P": kappa_P_opt,
                     "lambda_max_P": float(lam_max_P_opt),
-                    "alpha": float(alpha_opt),
-                    "gamma_max_no_eta": gamma_opt_no_eta,
-                    "gamma_max": float(gamma_opt),
-                }
-                gamma_max = float(gamma_opt)
-                gamma_max_no_eta = gamma_opt_no_eta
-        else:
-            # No-prepend: SDP optimizes over P. ε passed to the optimizer
-            # must be in latent space, so apply the m-scaling here.
-            P_opt, rho_opt, kappa_P_opt, gamma_opt = optimize_lyapunov_P(
-                A_cl_np, m * epsilon_x, eta
-            )
-            if P_opt is not None:
-                P_opt_eigs = np.linalg.eigvalsh(P_opt)
-                gamma_opt_no_eta = float(gamma_opt) + float(eta)
-                optimized = {
-                    "P": P_opt.tolist(),
-                    "rho_sq": float(rho_opt ** 2),
-                    "kappa_P": float(kappa_P_opt),
-                    "lambda_max_P": float(P_opt_eigs.max()),
+                    "alpha": 1.0,  # β-normalized: α_eff = 1/β = 1
                     "gamma_max_no_eta": gamma_opt_no_eta,
                     "gamma_max": float(gamma_opt),
                 }
@@ -511,6 +706,7 @@ def generate_P_and_bound(
 
     return {
         "prepend_state": prepend,
+        "optimizer": optimizer,
         "raw": raw,
         "optimized": optimized,
         "gamma_max": float(gamma_max),
@@ -531,20 +727,21 @@ def run_stability_report(
     B_mat,
     Q,
     R_cost,
-    real_state_dim: int,
+    C: np.ndarray,
     u_max: float,
     aug_trajectories,
     device,
     epsilon_x: float,
     ctrl_percentages: list[float],
-    q_scale: float,
-    r_scale: float,
-    use_optimization: bool,
+    optimizer: str,
+    beta_rho_target: float = 0.0,
     quiet_diagnostics: bool = False,
     encoder_lipschitz_batch_size: int = 4096,
     cached_pred_stats: dict | None = None,
     cached_ctrl_stats: dict | None = None,
+    cached_identifiability: dict | None = None,
     n_dense_sweep_points: int = 100,
+    mode_projection_groups: dict | None = None,
 ) -> dict:
     """Full LQR stability + bound report.
 
@@ -558,6 +755,25 @@ def run_stability_report(
       directly. Used by the controller-fit step to reuse the dicts
       already saved into ``model_performance.yaml`` during training.
     """
+    # Dataset identifiability — purely a function of the dataset + encoder,
+    # so it's reused from the koopman-level YAML when present and computed
+    # otherwise. Printed before the one-step error block.
+    if cached_identifiability is not None:
+        if not quiet_diagnostics:
+            print("\n" + "=" * 50)
+            print("  Dataset identifiability (loaded from model_performance.yaml)")
+            print("=" * 50)
+            _print_identifiability_block(cached_identifiability)
+        identifiability_stats = cached_identifiability
+    else:
+        if not quiet_diagnostics:
+            print("\n" + "=" * 50)
+            print("  Dataset identifiability")
+            print("=" * 50)
+        identifiability_stats = dataset_identifiability_report(
+            model, aug_trajectories, device, verbose=not quiet_diagnostics,
+        )
+
     if cached_pred_stats is not None:
         if not quiet_diagnostics:
             print("\n" + "=" * 50)
@@ -575,6 +791,22 @@ def run_stability_report(
         )
 
     if cached_ctrl_stats is not None:
+        need_recompute = "mode_controllability" not in cached_ctrl_stats or (
+            mode_projection_groups is not None
+            and not any(
+                "mode_projections" in mi
+                for mi in cached_ctrl_stats.get("mode_controllability", [])
+            )
+        )
+        if need_recompute:
+            # Recompute PBH per-mode info (also picks up the new
+            # ``mode_projections`` field when groups are configured).
+            _, mode_info, B_singular_values = control_analysis(
+                A, B_mat, verbose=False,
+                mode_projection_groups=mode_projection_groups,
+            )
+            cached_ctrl_stats["mode_controllability"] = mode_info
+            cached_ctrl_stats.setdefault("B_singular_values", B_singular_values)
         if not quiet_diagnostics:
             print("\n" + "=" * 50)
             print("  Controllability fit (loaded from model_performance.yaml)")
@@ -590,6 +822,7 @@ def run_stability_report(
             model, A, B_mat, aug_trajectories, device,
             verbose=not quiet_diagnostics,
             encoder_lipschitz_batch_size=encoder_lipschitz_batch_size,
+            mode_projection_groups=mode_projection_groups,
         )
     m = ctrl_stats["m"] if ctrl_stats["m"] is not None else 1.0
 
@@ -613,20 +846,24 @@ def run_stability_report(
         lqr=lqr,
         Q=Q,
         R_cost=R_cost,
-        real_state_dim=real_state_dim,
+        C=C,
         epsilon_x=epsilon_x,
         eta=0.0,
         m=m,
-        use_optimization=use_optimization,
+        optimizer=optimizer,
+        beta_rho_target=beta_rho_target,
     )
 
+    print()
+    _print_cost_matrices(Q, R_cost, C)
     print()
     lqr_fit_report(
         "raw",
         P=bound["raw"]["P"],
         F=lqr.F,
-        q_scale=q_scale,
-        r_scale=r_scale,
+        A_cl=lqr.closed_loop,
+        Q=Q,
+        R_cost=R_cost,
         rho_sq=bound["raw"]["rho_sq"],
         alpha=bound["raw"].get("alpha"),
     )
@@ -636,8 +873,9 @@ def run_stability_report(
             "optimized",
             P=bound["optimized"]["P"],
             F=lqr.F,
-            q_scale=q_scale,
-            r_scale=r_scale,
+            A_cl=lqr.closed_loop,
+            Q=Q,
+            R_cost=R_cost,
             rho_sq=bound["optimized"]["rho_sq"],
             alpha=bound["optimized"].get("alpha"),
         )
@@ -691,6 +929,103 @@ def run_stability_report(
             "coverage": cov,
         })
 
+    # ---- Prepend models: also report the *latent-space* alternative bound.
+    # When the state is prepended both bounds apply: the standard α-bound
+    # already certifies real-state error (above), and γ_latent =
+    # ε_x(1−ρ)/√κ(P) certifies the full latent-vector error via the same
+    # Lyapunov certificate (m=1 since the prepended state slice is identity).
+    ctrl_pct_results_latent: list[dict] = []
+    latent_alt_sweep: dict | None = None
+    if prepend:
+        source = bound["optimized"] if bound["optimized"] is not None else bound["raw"]
+        source_label = "optimized" if bound["optimized"] is not None else "raw"
+        rho_sq_alt = float(source["rho_sq"])
+        kappa_P_alt = float(source["kappa_P"])
+        gamma_latent_no_eta, _ = _gamma_no_prepend(
+            epsilon_x, 0.0, 1.0, rho_sq_alt, kappa_P_alt
+        )
+
+        print()
+        print("=" * 50)
+        print("  Latent-space alternative bound (prepend models)")
+        print("=" * 50)
+        print(
+            "  Using ε_x as a latent-vector target with the no-prepend "
+            "formula γ_latent = ε_x(1−ρ)/√κ(P) (m=1 because the prepended "
+            "state slice is identity)."
+        )
+        print(f"  source P:                              {source_label}")
+        print(f"  ρ² (from {source_label}):              {rho_sq_alt:.4f}")
+        print(f"  κ(P) (from {source_label}):            {kappa_P_alt:.4e}")
+        print(f"  γ_latent (η=0):                        {gamma_latent_no_eta:.4e}")
+
+        # Precompute latent prediction errors and the latent R for coverage.
+        latent_errors = _precompute_one_step_errors(
+            model, aug_trajectories, device, space="latent"
+        )
+        latent_stats = pred_stats["latent"]
+        R_latent = float(latent_stats["R"])
+        max_latent = float(latent_stats["max"])
+
+        for pct in ctrl_percentages:
+            eta_at = float(pct) * float(eta_max)
+            gamma_at = float(gamma_latent_no_eta) - eta_at
+            print()
+            print(
+                f"=== [latent alt] ctrl_pct = {float(pct):.2f}  →  "
+                f"η = {eta_at:.2e}  ===  γ_latent = {gamma_at:.2e}"
+            )
+            cov_lat = _coverage_from_errors(
+                f"γ_latent_ctrl_pct={float(pct):.2f}",
+                latent_errors,
+                gamma=gamma_at,
+                R=R_latent,
+                max_err=max_latent,
+                space="latent",
+            )
+            ctrl_pct_results_latent.append({
+                "ctrl_percentage": float(pct),
+                "eta": eta_at,
+                "gamma_max": gamma_at,
+                "coverage": cov_lat,
+            })
+
+        # Dense latent sweep — mirrors the main sweep below but in latent space.
+        sweep_pcts_lat = np.linspace(0.0, 1.0, n_dense_sweep_points)
+        sweep_etas_lat: list[float] = []
+        sweep_gammas_lat: list[float] = []
+        sweep_fracs_lat: list[float] = []
+        sweep_ratios_lat: list[float] = []
+        total_n_lat = int(latent_errors.numel())
+        for pct in sweep_pcts_lat:
+            eta_at = float(pct) * float(eta_max)
+            gamma_at = float(gamma_latent_no_eta) - eta_at
+            count_under = (
+                int((latent_errors < gamma_at).sum().item()) if gamma_at > 0 else 0
+            )
+            frac = count_under / total_n_lat if total_n_lat > 0 else 0.0
+            ratio = gamma_at / R_latent if R_latent > 0 else float("inf")
+            sweep_etas_lat.append(eta_at)
+            sweep_gammas_lat.append(gamma_at)
+            sweep_fracs_lat.append(frac)
+            sweep_ratios_lat.append(ratio)
+        latent_alt_sweep = {
+            "ctrl_percentages": [float(p) for p in sweep_pcts_lat],
+            "etas": sweep_etas_lat,
+            "gamma_max_values": sweep_gammas_lat,
+            "frac_transitions_covered": sweep_fracs_lat,
+            "gamma_over_R": sweep_ratios_lat,
+            "R": R_latent,
+            "max_error": max_latent,
+            "u_max": float(u_max),
+            "eta_max": float(eta_max),
+            "space": "latent",
+            "source_P": source_label,
+            "rho_sq": rho_sq_alt,
+            "kappa_P": kappa_P_alt,
+            "gamma_max_no_eta": float(gamma_latent_no_eta),
+        }
+
     # Dense sweep for the summary plot — 100 points across the full
     # control-budget range. Uses precomputed errors (no extra iteration).
     sweep_pcts = np.linspace(0.0, 1.0, n_dense_sweep_points)
@@ -722,20 +1057,34 @@ def run_stability_report(
         "space": coverage_space,
     }
 
+    Q_list = (
+        Q.detach().cpu().numpy() if hasattr(Q, "detach") else np.asarray(Q)
+    ).astype(float).tolist()
+    R_list = (
+        R_cost.detach().cpu().numpy() if hasattr(R_cost, "detach") else np.asarray(R_cost)
+    ).astype(float).tolist()
+    C_list = C.astype(float).tolist()
+
     return {
+        "dataset_identifiability": identifiability_stats,
         "pred_error_stats": pred_stats,
         "controllability_fit": ctrl_stats,
         "bound": bound,
         "action_budget": action_stats,
         "ctrl_pct_results": ctrl_pct_results,
         "ctrl_pct_sweep": sweep,
+        "ctrl_pct_results_latent_alt": ctrl_pct_results_latent if prepend else None,
+        "ctrl_pct_sweep_latent_alt": latent_alt_sweep,
         "epsilon_x": float(epsilon_x),
         "m": float(m),
-        "use_optimization": bool(use_optimization),
+        "optimizer": str(optimizer),
         "prepend_state": bound["prepend_state"],
         "F": lqr.F.detach().cpu().numpy().tolist(),
         "A": A.detach().cpu().numpy().tolist(),
         "B": B_mat.detach().cpu().numpy().tolist(),
+        "Q": Q_list,
+        "R": R_list,
+        "C": C_list,
     }
 
 

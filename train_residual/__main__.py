@@ -18,7 +18,7 @@ import yaml
 
 from config.manager import ConfigManager, TrainResidualCfg
 from data.dataloader import load_dataset
-from data.env_builder import make_eval_env, make_single_env
+from data.env_builder import get_base_goal_fn, make_eval_env, make_single_env
 from train_koopman.checkpointing import load_koopman_experiment, make_device
 
 
@@ -75,6 +75,8 @@ def _env_info_from_dataset(dataset_name: str):
 
 
 def run(cfg: TrainResidualCfg, *, run_post_eval: bool = True) -> str:
+    from data.augmentation import compute_act_scale, compute_obs_scale
+
     device = make_device()
     koopman_dir = _resolve_koopman_dir(cfg.koopman_path)
     model, train_cfg, _state_dim, _action_dim = load_koopman_experiment(
@@ -82,6 +84,15 @@ def run(cfg: TrainResidualCfg, *, run_post_eval: bool = True) -> str:
     )
     lqr, gamma_max = _load_lqr(cfg.controller_path)
     env_name, env_kwargs, base_policy_snap = _env_info_from_dataset(train_cfg.dataset_name)
+    base_goal_fn = get_base_goal_fn(env_name)
+
+    # Normalization scales matching the koopman's training-time augmentation.
+    # Required so the residual wrapper feeds the encoder + predict step the
+    # same normalized inputs (same gamma space as the LQR coverage report).
+    ds_for_scales = load_dataset(train_cfg.dataset_name)
+    aug_cfg = train_cfg.augmentation
+    obs_scale = compute_obs_scale(aug_cfg, ds_for_scales)
+    act_scale = compute_act_scale(aug_cfg, ds_for_scales)
 
     def make_env_fn():
         return make_single_env(env_name=env_name, env_kwargs=env_kwargs)
@@ -179,12 +190,16 @@ def run(cfg: TrainResidualCfg, *, run_post_eval: bool = True) -> str:
         z_ref_max_mode=cfg.z_ref_max_mode,
         obs_augmentation=cfg.obs_augmentation,
         disable_action_augmentation=cfg.disable_action_augmentation,
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
         cfg=flat,
         run_dir=str(out_dir),
         make_env_fn=make_env_fn,
         make_eval_env_fn=make_eval_env_fn,
         evaluate_fn=evaluate_for_env,
         device=device,
+        base_goal_fn=base_goal_fn,
     )
 
     if run_post_eval:
@@ -198,6 +213,9 @@ def run(cfg: TrainResidualCfg, *, run_post_eval: bool = True) -> str:
             gamma_max=gamma_max,
             phase_dir=phase_dir,
             device=device,
+            obs_scale=obs_scale,
+            act_scale=act_scale,
+            aug_cfg=aug_cfg,
         )
 
     return str(out_dir)
@@ -214,6 +232,9 @@ def _run_post_train_eval(
     gamma_max: float,
     phase_dir: Path,
     device: torch.device,
+    obs_scale=None,
+    act_scale=None,
+    aug_cfg=None,
 ) -> None:
     """Run base + LQR + residual eval through :func:`eval.multi_mode.run_multi_mode`."""
     from eval.multi_mode import run_multi_mode
@@ -243,10 +264,14 @@ def _run_post_train_eval(
         lqr=lqr,
         gamma_max=gamma_max,
         device=device,
+        env_name=env_name,
         pred_error_space=cfg.pred_error_space,
         z_ref_max_mode=cfg.z_ref_max_mode,
         gamma_worst_case=cfg.gamma_worst_case,
         obs_augmentation_override=cfg.obs_augmentation,
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
     )
     obs_space = one_env.single_observation_space
     act_space = one_env.single_action_space
@@ -261,8 +286,13 @@ def _run_post_train_eval(
     )
     actor.load_state_dict(torch.load(best_path, map_location=device))
 
-    eval_out_dir = Path("eval") / "results" / cfg.experiment_name
-    eval_out_dir.mkdir(parents=True, exist_ok=True)
+    # Eval results live under the LQR controller dir (each mode in its own
+    # subfolder). The koopman dir is kept around for the no-LQR fallback in
+    # run_multi_mode but doesn't get used here since we always have the LQR.
+    koopman_dir = Path(cfg.koopman_path)
+    if koopman_dir.is_file():
+        koopman_dir = koopman_dir.parent
+    lqr_dir = Path(cfg.controller_path)
 
     # Minimal EvalCfg for the post-train rollouts. The koopman / lqr /
     # residual paths are already loaded; the cfg here only feeds the rollout
@@ -277,13 +307,13 @@ def _run_post_train_eval(
         koopman_experiment_name=Path(cfg.koopman_path).name,
         lqr_output_name=Path(cfg.controller_path).name,
         residual_experiment_name=cfg.experiment_name,
-        results_name=cfg.experiment_name,
         eval_koopman_accuracy=False,
         eval_policy_rollout=True,
     )
 
     run_multi_mode(
-        out_dir=eval_out_dir,
+        koopman_dir=koopman_dir,
+        lqr_dir=lqr_dir,
         eval_cfg=eval_cfg,
         env_name=env_name,
         env_kwargs=env_kwargs,
@@ -297,6 +327,9 @@ def _run_post_train_eval(
         residual_pred_error_space=cfg.pred_error_space,
         residual_z_ref_max_mode=cfg.z_ref_max_mode,
         residual_gamma_worst_case=float(cfg.gamma_worst_case),
+        obs_scale=obs_scale,
+        act_scale=act_scale,
+        aug_cfg=aug_cfg,
     )
 
 

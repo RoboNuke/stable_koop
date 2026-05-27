@@ -16,6 +16,21 @@ from wrappers.pendulum.theta_obs import ThetaObsWrapper
 from wrappers.pendulum.limited_spawn import LimitedSpawnWrapper
 
 
+def pendulum_base_goal(env: gym.Env) -> np.ndarray:
+    """Upright pendulum at rest, in the env's raw obs space.
+
+    The obs layout depends on the obs_type wrapper applied above:
+    ``cos_sin`` -> ``[cos(0), sin(0), thetadot=0] = [1, 0, 0]``;
+    ``theta``   -> ``[theta=0, thetadot=0]``.
+    """
+    obs_dim = int(env.observation_space.shape[-1])
+    if obs_dim == 3:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    if obs_dim == 2:
+        return np.array([0.0, 0.0], dtype=np.float32)
+    raise ValueError(f"Unexpected pendulum obs dim {obs_dim}")
+
+
 def apply_pendulum_wrappers(
     env: gym.Env,
     *,
@@ -46,4 +61,5 @@ __all__ = [
     "PendulumWrapper",
     "ThetaObsWrapper",
     "apply_pendulum_wrappers",
+    "pendulum_base_goal",
 ]
